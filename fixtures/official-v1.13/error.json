@@ -1,0 +1,6 @@
+{
+  "code": "fixture_fatal",
+  "fatal": true,
+  "message": "stop now",
+  "type": "error"
+}

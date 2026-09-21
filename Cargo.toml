@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/sentinel0-proto",
+  "crates/sentinel0-agent",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+http = "1"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tempfile = "3"
+tracing = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }

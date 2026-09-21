@@ -1,0 +1,8 @@
+{
+  "data": {
+    "job_id": "job_fixture"
+  },
+  "kind": "job_completed",
+  "timestamp": "2026-09-21T21:00:00Z",
+  "type": "event"
+}

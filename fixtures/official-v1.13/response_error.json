@@ -1,0 +1,13 @@
+{
+  "error": {
+    "code": "fixture_error",
+    "details": {
+      "retryable": false
+    },
+    "message": "fixture failure"
+  },
+  "id": "req_err",
+  "ok": false,
+  "result": null,
+  "type": "response"
+}

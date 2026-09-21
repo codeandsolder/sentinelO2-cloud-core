@@ -1,0 +1,343 @@
+[
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_ping",
+    "op": "ping",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "ping"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_capabilities",
+    "op": "capabilities",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "capabilities"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_help",
+    "op": "help",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "help"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_state",
+    "op": "state",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "state"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_exec",
+    "op": "exec",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "exec"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_script_run",
+    "op": "script_run",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "script_run"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_edit",
+    "op": "edit",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "edit"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_edit_upload_init",
+    "op": "edit_upload_init",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "edit_upload_init"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_edit_upload_file",
+    "op": "edit_upload_file",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "edit_upload_file"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_edit_upload_complete",
+    "op": "edit_upload_complete",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "edit_upload_complete"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_restart",
+    "op": "restart",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "restart"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_service",
+    "op": "service",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "service"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_upload_init",
+    "op": "upload_init",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "upload_init"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_upload_chunk",
+    "op": "upload_chunk",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "upload_chunk"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_upload_complete",
+    "op": "upload_complete",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "upload_complete"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_upload_file",
+    "op": "upload_file",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "upload_file"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_read",
+    "op": "read",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "read"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_list",
+    "op": "list",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "list"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_search",
+    "op": "search",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "search"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_project_snapshot",
+    "op": "project_snapshot",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "project_snapshot"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_read_audit",
+    "op": "read_audit",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "read_audit"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_move",
+    "op": "move",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "move"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_copy",
+    "op": "copy",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "copy"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_delete",
+    "op": "delete",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "delete"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_chmod",
+    "op": "chmod",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "chmod"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_chown",
+    "op": "chown",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "chown"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_git",
+    "op": "git",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "git"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_file_export_init",
+    "op": "file_export_init",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "file_export_init"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_file_export_chunk",
+    "op": "file_export_chunk",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "file_export_chunk"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_file_export_complete",
+    "op": "file_export_complete",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "file_export_complete"
+    },
+    "type": "request"
+  },
+  {
+    "deadline": "2026-09-21T21:00:00Z",
+    "id": "req_local_api",
+    "op": "local_api",
+    "opaque_ref": "fixture-ref",
+    "payload": {
+      "fixture": true,
+      "op": "local_api"
+    },
+    "type": "request"
+  }
+]

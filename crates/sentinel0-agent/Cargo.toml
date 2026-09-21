@@ -1,0 +1,24 @@
+[package]
+name = "sentinel0-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+http.workspace = true
+rand.workspace = true
+sentinel0-proto = { path = "../sentinel0-proto" }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

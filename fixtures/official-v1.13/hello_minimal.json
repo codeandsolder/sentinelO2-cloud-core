@@ -1,0 +1,22 @@
+{
+  "agent_name": null,
+  "agent_version": "1.0-test",
+  "capabilities": [],
+  "host": {
+    "arch": null,
+    "config_summary": null,
+    "cpu_cores": null,
+    "cpu_model": null,
+    "disk_total_bytes": null,
+    "distro": null,
+    "hostname": "min-host",
+    "id": "host_min",
+    "kernel": null,
+    "machine_type": null,
+    "mem_total_bytes": null,
+    "os": "linux"
+  },
+  "preferred_profile": null,
+  "protocol_version": "1.13.0",
+  "type": "hello"
+}

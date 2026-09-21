@@ -1,0 +1,12 @@
+{
+  "error": null,
+  "id": "req_ok",
+  "ok": true,
+  "result": {
+    "answer": 42,
+    "nested": {
+      "hello": "world"
+    }
+  },
+  "type": "response"
+}

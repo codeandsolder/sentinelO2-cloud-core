@@ -1,0 +1,11 @@
+{
+  "binary_header_bytes": 20,
+  "heartbeat_interval_seconds": 30,
+  "heartbeat_timeout_seconds": 90,
+  "max_binary_frame_bytes": 2097152,
+  "max_frame_bytes": 1048576,
+  "protocol_major": 1,
+  "protocol_version": "1.13.0",
+  "recommended_chunk_bytes": 262144,
+  "transfer_chunk_bytes": 1048576
+}
