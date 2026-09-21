@@ -689,3 +689,109 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
 
     assert!(pending_results::drain(&upload_base).is_empty());
 }
+
+#[tokio::test]
+async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let server_cancel = cancel.clone();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_agent(&listener).await;
+        welcome(&mut ws, "sess_app_heartbeat").await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(90);
+        while tokio::time::Instant::now() < deadline {
+            let item = tokio::time::timeout(Duration::from_millis(30), ws.next())
+                .await
+                .expect("agent stopped sending application heartbeats")
+                .unwrap()
+                .unwrap();
+            let WsMessage::Text(text) = item else {
+                continue;
+            };
+            if matches!(
+                serde_json::from_str::<Message>(&text).unwrap(),
+                Message::Ping { .. }
+            ) {
+                ws.send(WsMessage::Text(
+                    serde_json::to_string(&Message::Pong {
+                        timestamp: Utc::now(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            }
+        }
+
+        server_cancel.cancel();
+        let _ = ws.close(None).await;
+    });
+
+    let mut cfg = config(addr);
+    cfg.heartbeat_interval = Duration::from_millis(10);
+    cfg.heartbeat_timeout = Duration::from_millis(30);
+    let agent = Agent::new(cfg, UnsupportedDispatcher);
+
+    tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
+        .await
+        .expect("application pong heartbeat failed to keep the session alive")
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn unrelated_application_traffic_does_not_mask_missing_heartbeat_pong() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let server_cancel = cancel.clone();
+
+    let server = tokio::spawn(async move {
+        let mut first = accept_agent(&listener).await;
+        welcome(&mut first, "sess_no_pong").await;
+
+        // Keep sending valid application traffic while intentionally never
+        // answering the agent's heartbeat Ping. This must not count as the
+        // bidirectional liveness proof.
+        let sender = tokio::spawn(async move {
+            for _ in 0..8 {
+                let _ = first
+                    .send(WsMessage::Text(
+                        json!({
+                            "type": "event",
+                            "kind": "noise",
+                            "data": {},
+                            "timestamp": "2026-09-21T21:00:00Z"
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+        });
+
+        let mut second = tokio::time::timeout(Duration::from_millis(150), accept_agent(&listener))
+            .await
+            .expect("missing application pong did not force a reconnect");
+        welcome(&mut second, "sess_after_no_pong").await;
+        server_cancel.cancel();
+        let _ = second.close(None).await;
+        sender.abort();
+    });
+
+    let mut cfg = config(addr);
+    cfg.heartbeat_interval = Duration::from_millis(10);
+    cfg.heartbeat_timeout = Duration::from_millis(30);
+    let agent = Agent::new(cfg, UnsupportedDispatcher);
+
+    tokio::time::timeout(Duration::from_millis(250), agent.run(cancel.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+}

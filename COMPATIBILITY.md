@@ -46,8 +46,6 @@ Reference surfaces:
 
 ## Known compatibility work still required before replacing the live agent
 
-- Match the official native WebSocket ping/ping-timeout behavior in addition to
-  the application heartbeat.
 - Binary transfer receive/ack and file-export send path.
 - Identity/config loading and the full policy/config-summary behavior.
 - Machine/OS metadata gathering used in hello.
@@ -68,6 +66,13 @@ wire contract. Known examples include:
 - stale reconnect history causing an established session to inherit a long
   pre-welcome penalty;
 - connection/welcome operations without explicit bounded deadlines;
-- background completion disappearing when the request WebSocket dies.
+- background completion disappearing when the request WebSocket dies;
+- duplicate native WebSocket keepalive. The official Python client sends both
+  WebSocket protocol Ping/Pong and SentinelX application Ping/Pong because the
+  application heartbeat historically had no reply deadline. The Rust agent
+  intentionally sends only the SentinelX application heartbeat and requires a
+  real application `pong` within `heartbeat_timeout`. This retains half-open
+  detection while avoiding an independent proxy-sensitive control-frame timer.
+  Tungstenite still automatically answers inbound WebSocket Ping control frames.
 
 Every intentional deviation should get a regression test and be recorded here.

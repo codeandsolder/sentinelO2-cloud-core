@@ -271,7 +271,7 @@ impl<D: Dispatcher> Agent<D> {
 
         let mut heartbeat = interval(self.config.heartbeat_interval);
         heartbeat.tick().await;
-        let mut last_rx = Instant::now();
+        let mut last_pong = Instant::now();
         let (response_tx, mut response_rx) = mpsc::channel::<Outbound>(64);
 
         loop {
@@ -281,7 +281,7 @@ impl<D: Dispatcher> Agent<D> {
                     return Ok(SessionEnd::Clean);
                 }
                 _ = heartbeat.tick() => {
-                    if last_rx.elapsed() >= self.config.heartbeat_timeout {
+                    if last_pong.elapsed() >= self.config.heartbeat_timeout {
                         return Ok(SessionEnd::Lost(None));
                     }
                     let ping = Message::Ping { timestamp: Utc::now() };
@@ -316,7 +316,6 @@ impl<D: Dispatcher> Agent<D> {
                             });
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            last_rx = Instant::now();
                             let Ok(msg) = serde_json::from_str::<Message>(&text) else {
                                 continue;
                             };
@@ -436,15 +435,16 @@ impl<D: Dispatcher> Agent<D> {
                                         });
                                     }
                                 }
+                                Message::Pong { .. } => {
+                                    last_pong = Instant::now();
+                                }
                                 Message::Error { code, message, fatal: true } => {
                                     return Err(AgentError::Rejected { code, message });
                                 }
                                 _ => {}
                             }
                         }
-                        Some(Ok(_)) => {
-                            last_rx = Instant::now();
-                        }
+                        Some(Ok(_)) => {}
                     }
                 }
             }
