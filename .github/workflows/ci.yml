@@ -106,7 +106,7 @@ jobs:
       - name: Smoke
         run: ./target/release/sentinelx-core --help >/dev/null
       - name: Checksum
-        run: sha256sum target/release/sentinelx-core > target/release/sentinelx-core.sha256
+        run: (cd target/release && sha256sum sentinelx-core > sentinelx-core.sha256)
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: sentinelx-core-linux-x86_64
