@@ -9,9 +9,11 @@ Reference surfaces:
 - `pensados/sentinelx-cloud-core` 0.19.2 behavior at reviewed upstream commit
   `dbca7ebefa069ce6260b94de01d0afc6d7cd1edd`, with known bugs fixed rather
   than intentionally reproduced.
-- `.github/upstream-parity.json` is the durable reviewed-upstream baseline;
-  scheduled maintenance compares those SHAs to current upstream and prepares a
-  commit/file/changelog/test dossier whenever they diverge.
+- `.github/upstream-parity.json` is the durable reviewed-release baseline.
+  Scheduled maintenance ignores unreleased same-version commits; each upstream
+  core/protocol version bump gets its own immutable commit/file/release-note/test
+  dossier issue. The resolving SentinelO² update commit advances only that
+  component's version/SHA baseline and closes the corresponding issue.
 - Checked-in semantic fixtures under `fixtures/official-v1.13/`, generated
   from the official Python protocol by `tools/generate_official_fixtures.py`.
 

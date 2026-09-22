@@ -30,7 +30,36 @@ class UpstreamParityReportTests(unittest.TestCase):
         self.assertIn("upstream parity detector failed", stderr.getvalue())
         self.assertIn("boom", stderr.getvalue())
 
-    def test_changed_range_emits_single_dossier_and_meta(self):
+    def test_unreleased_commits_do_not_create_issue_dossiers(self):
+        cfg = {
+            "repo": "upstream/core",
+            "reviewed_sha": "a" * 40,
+            "reviewed_version": "1.0.0",
+        }
+        head = "c" * 40
+        overall = {
+            "status": "ahead",
+            "commits": [
+                {"sha": "b" * 40, "commit": {"message": "fix: unreleased"}},
+                {"sha": head, "commit": {"message": "docs: still unreleased"}},
+            ],
+            "files": [],
+        }
+
+        with (
+            mock.patch.object(MODULE, "compare", return_value=overall),
+            mock.patch.object(
+                MODULE,
+                "file_text",
+                return_value='name = "pkg"\nversion = "1.0.0"\n',
+            ),
+        ):
+            releases, count = MODULE.release_points("core", cfg, head)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(releases, [])
+
+    def test_multiple_version_bumps_become_distinct_release_dossiers(self):
         baseline = {
             "core": {
                 "repo": "upstream/core",
@@ -41,22 +70,25 @@ class UpstreamParityReportTests(unittest.TestCase):
             "protocol": {
                 "repo": "upstream/protocol",
                 "branch": "main",
-                "reviewed_sha": "b" * 40,
+                "reviewed_sha": "p" * 40,
                 "reviewed_version": "2.0.0",
             },
         }
-        heads = {
-            "upstream/core": {"sha": "c" * 40},
-            "upstream/protocol": {"sha": "b" * 40},
-        }
-        core_delta = {
+        b = "b" * 40
+        c = "c" * 40
+        d = "d" * 40
+        overall = {
             "status": "ahead",
             "commits": [
-                {
-                    "sha": "d" * 40,
-                    "commit": {"message": "fix(core): useful change\n\nbody"},
-                }
+                {"sha": b, "commit": {"message": "fix: unreleased prep"}},
+                {"sha": c, "commit": {"message": "release 1.1.0"}},
+                {"sha": d, "commit": {"message": "release 1.2.0"}},
             ],
+            "files": [],
+        }
+        release_11 = {
+            "status": "ahead",
+            "commits": overall["commits"][:2],
             "files": [
                 {
                     "filename": "src/sentinelx_core/handlers/fileops.py",
@@ -67,55 +99,90 @@ class UpstreamParityReportTests(unittest.TestCase):
                 }
             ],
         }
+        release_12 = {
+            "status": "ahead",
+            "commits": [overall["commits"][2]],
+            "files": [
+                {
+                    "filename": "tests/test_release.py",
+                    "status": "added",
+                    "additions": 5,
+                    "deletions": 0,
+                    "patch": "@@ -0,0 +1 @@\n+test",
+                }
+            ],
+        }
 
         def repo_head(repo, _branch):
-            return heads[repo]
+            return {"sha": d if repo == "upstream/core" else "p" * 40}
 
-        def compare(repo, _base, _head):
-            self.assertEqual(repo, "upstream/core")
-            return core_delta
+        def compare(repo, base, head):
+            if repo != "upstream/core":
+                raise AssertionError("protocol compare should not run")
+            if (base, head) == ("a" * 40, d):
+                return overall
+            if (base, head) == ("a" * 40, c):
+                return release_11
+            if (base, head) == (c, d):
+                return release_12
+            raise AssertionError((base, head))
 
-        def file_text(repo, path, _ref):
-            if repo == "upstream/core" and path == "CHANGELOG.md":
-                return "# Changelog\n\n## 1.1.0\n- useful change\n\n## 1.0.0\n- old\n"
-            if repo == "upstream/protocol" and path == "pyproject.toml":
-                return 'version = "2.0.0"\n'
+        def file_text(repo, path, ref):
+            if path == "pyproject.toml":
+                versions = {
+                    "a" * 40: "1.0.0",
+                    b: "1.0.0",
+                    c: "1.1.0",
+                    d: "1.2.0",
+                    "p" * 40: "2.0.0",
+                }
+                return f'name = "pkg"\nversion = "{versions[ref]}"\n'
+            if path == "CHANGELOG.md":
+                return (
+                    "# Changelog\n\n"
+                    "## 1.2.0 - second\n- second notes\n\n"
+                    "## 1.1.0 - first\n- first notes\n\n"
+                    "## 1.0.0 - old\n- old\n"
+                )
             return ""
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             baseline_path = tmp / "baseline.json"
             meta_path = tmp / "meta.json"
+            out_dir = tmp / "dossiers"
             baseline_path.write_text(json.dumps(baseline))
-            stdout = io.StringIO()
             argv = [
                 str(SCRIPT),
                 "--baseline",
                 str(baseline_path),
                 "--meta",
                 str(meta_path),
+                "--out-dir",
+                str(out_dir),
             ]
             with (
                 mock.patch.object(MODULE, "repo_head", side_effect=repo_head),
                 mock.patch.object(MODULE, "compare", side_effect=compare),
                 mock.patch.object(MODULE, "file_text", side_effect=file_text),
                 mock.patch.object(sys, "argv", argv),
-                contextlib.redirect_stdout(stdout),
             ):
                 self.assertEqual(MODULE.main(), 0)
 
             meta = json.loads(meta_path.read_text())
-            self.assertTrue(meta["changed"])
-            self.assertEqual(meta["core"]["head_sha"], "c" * 40)
-            self.assertEqual(meta["protocol"]["head_sha"], "b" * 40)
+            releases = meta["releases"]
+            self.assertEqual([r["version"] for r in releases], ["1.1.0", "1.2.0"])
+            self.assertEqual(releases[0]["previous_sha"], "a" * 40)
+            self.assertEqual(releases[1]["previous_sha"], c)
 
-            report = stdout.getvalue()
-            self.assertEqual(report.count("<!-- automation-upstream-parity -->"), 1)
-            self.assertIn("fix(core): useful change", report)
-            self.assertIn("src/sentinelx_core/handlers/fileops.py", report)
-            self.assertIn("@@ -1 +1 @@", report)
-            self.assertIn("## 1.1.0", report)
-            self.assertNotIn("## 1.0.0", report)
+            first = Path(releases[0]["body_file"]).read_text()
+            second = Path(releases[1]["body_file"]).read_text()
+            self.assertIn("automation-upstream-release:core:1.1.0", first)
+            self.assertIn("## 1.1.0 - first", first)
+            self.assertNotIn("## 1.2.0 - second", first)
+            self.assertIn("Closes #<this issue>", first)
+            self.assertIn("automation-upstream-release:core:1.2.0", second)
+            self.assertIn("tests/test_release.py", second)
 
 
 if __name__ == "__main__":

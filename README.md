@@ -31,10 +31,12 @@ Verification currently includes:
 - Clippy with warnings denied and workspace lint policy;
 - libFuzzer/ASan smoke runs for protocol JSON and binary mini-frames.
 
-Scheduled maintenance also compares checked-in reviewed upstream SHAs against
-both SentinelX core and protocol repositories and opens one pre-digested parity
-issue containing the commit range, changed files, changelog and relevant patch
-excerpts. This keeps routine upstream ports mechanical rather than exploratory.
+Scheduled maintenance watches the checked-in reviewed upstream release baselines
+for both SentinelX core and protocol. Unreleased commits are ignored; every new
+version bump creates one immutable, pre-digested release issue containing only
+that release delta, changed files, release notes and relevant patch excerpts.
+The port/update commit advances that component's baseline and closes its issue.
+This keeps routine upstream ports mechanical and leaves a clean release history.
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact matched surface,
 intentional deviations, and remaining differential/packaging work.
