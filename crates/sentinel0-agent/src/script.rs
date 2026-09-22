@@ -4,7 +4,7 @@ use crate::{
     policy::Policy,
     staging,
 };
-use rand::Rng;
+use rand::RngExt;
 use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,

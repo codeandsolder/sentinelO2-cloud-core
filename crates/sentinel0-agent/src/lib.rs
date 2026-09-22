@@ -29,7 +29,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
-use rand::Rng;
+use rand::RngExt;
 use sentinel0_proto::{HostInfo, Message, Op, bounding::bound_response_default};
 use std::{
     collections::BTreeMap, panic::AssertUnwindSafe, path::PathBuf, sync::Arc, time::Duration,

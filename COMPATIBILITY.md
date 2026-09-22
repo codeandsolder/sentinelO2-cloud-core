@@ -74,7 +74,7 @@ Reference surfaces:
 ### Verification
 
 - 96 workspace tests pass on both the current toolchain and the declared Rust
-  1.85 MSRV.
+  1.86 MSRV.
 - Real local WebSocket tests cover reconnect/liveness and binary transfer.
 - Property tests cover protocol parsing/bounding behavior.
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.

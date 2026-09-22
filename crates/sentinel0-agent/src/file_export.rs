@@ -228,7 +228,15 @@ pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
         .lock()
         .map_err(|_| HandlerError::new("internal_error", "export session lock poisoned"))?;
     let complete = session.next_index == session.num_chunks;
-    let digest = complete.then(|| format!("{:x}", session.hasher.clone().finalize()));
+    let digest = complete.then(|| {
+        session
+            .hasher
+            .clone()
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
 
     Ok(BTreeMap::from([
         ("transfer_id".into(), Value::String(transfer_id)),

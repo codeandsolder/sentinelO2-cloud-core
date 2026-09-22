@@ -5,7 +5,7 @@ use crate::{
     staging,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::{Map, Value};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 

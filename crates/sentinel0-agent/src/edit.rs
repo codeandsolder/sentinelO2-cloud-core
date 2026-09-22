@@ -2,7 +2,7 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
 };
-use rand::Rng;
+use rand::RngExt;
 use regex::RegexBuilder;
 use serde_json::{Map, Value};
 use similar::{ChangeTag, TextDiff};

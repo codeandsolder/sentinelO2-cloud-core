@@ -1,4 +1,3 @@
-use rand::RngCore;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -120,9 +119,8 @@ fn record_at_result_with_limit(
     let wrapped = json!({"at": at, "event": event});
     let bytes = serde_json::to_vec(&wrapped).map_err(std::io::Error::other)?;
 
-    let mut rng = rand::rng();
     let temp = loop {
-        let candidate = dir.join(format!(".pending-{:016x}.tmp", rng.next_u64()));
+        let candidate = dir.join(format!(".pending-{:016x}.tmp", rand::random::<u64>()));
         match OpenOptions::new()
             .write(true)
             .create_new(true)

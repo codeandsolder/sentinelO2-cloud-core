@@ -98,8 +98,16 @@ fn safe_dest(upload_base: &Path, target: &str) -> Result<PathBuf, HandlerError> 
     Ok(resolved)
 }
 
+fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn hash_bytes(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    hex_bytes(Sha256::digest(data))
 }
 
 fn is_safe_ip(ip: IpAddr) -> bool {
@@ -236,7 +244,7 @@ async fn fetch_to(
             HandlerError::new("io_error", format!("failed writing staged upload: {e}"))
         })?;
     }
-    Ok((size, format!("{:x}", hasher.finalize())))
+    Ok((size, hex_bytes(hasher.finalize())))
 }
 
 pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -492,7 +500,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
             })?;
         }
     }
-    let sha256 = format!("{:x}", hasher.finalize());
+    let sha256 = hex_bytes(hasher.finalize());
 
     if meta.total_size != 0 && meta.total_size != total {
         return Err(HandlerError::new(
