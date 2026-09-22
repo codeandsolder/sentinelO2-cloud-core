@@ -9,11 +9,24 @@
   "prConcurrentLimit": 0,
   "prHourlyLimit": 0,
   "rebaseWhen": "behind-base-branch",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 3am"],
+    "automerge": true,
+    "automergeType": "pr"
+  },
   "packageRules": [
     {
       "description": "Automerge ordinary compatible updates after CI",
-      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest", "lockFileMaintenance"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
       "matchCurrentVersion": "!/^0/",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Cargo lockfile maintenance is age-gated by repository CI",
+      "matchUpdateTypes": ["lockFileMaintenance"],
+      "minimumReleaseAge": null,
       "automerge": true,
       "automergeType": "pr"
     },
@@ -30,6 +43,7 @@
     {
       "description": "Package replacements stay open for the maintenance agent",
       "matchUpdateTypes": ["replacement"],
+      "minimumReleaseAge": null,
       "automerge": false
     }
   ]
