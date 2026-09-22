@@ -24,7 +24,7 @@ loss, and the client uses the application heartbeat as its active liveness
 mechanism rather than adding a second native WebSocket ping timer.
 
 Verification currently includes:
-- 96 workspace tests on both current Rust and the declared Rust 1.86 MSRV;
+- 96 workspace tests on both current Rust and the declared Rust 1.87 MSRV;
 - real local WebSocket lifecycle and binary-transfer integration tests;
 - official Python-generated protocol fixtures and property tests;
 - Clippy with warnings denied and workspace lint policy;

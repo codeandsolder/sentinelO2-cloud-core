@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.86"
+rust-version = "1.87"
 
 [workspace.dependencies]
 async-trait = "0.1.92"
