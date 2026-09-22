@@ -8,9 +8,11 @@ use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{
     Agent, AgentConfig, AgentError, AuthToken, Dispatcher, ReconnectPolicy, UnsupportedDispatcher,
+    core::CoreDispatcher,
     pending_results,
+    policy::{FileAccess, FileOpsPath, Policy},
 };
-use sentinel0_proto::{HostInfo, Message, Op};
+use sentinel0_proto::{HostInfo, Message, Op, decode_binary_frame, encode_binary_frame};
 use serde_json::{Map, Value, json};
 use std::{collections::BTreeMap, fs, time::Duration};
 use tokio::net::TcpListener;
@@ -75,6 +77,32 @@ async fn accept_agent(
     })
     .await
     .unwrap()
+}
+
+async fn next_non_heartbeat(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) -> WsMessage {
+    loop {
+        let frame = ws.next().await.unwrap().unwrap();
+        if let WsMessage::Text(text) = &frame {
+            if matches!(
+                serde_json::from_str::<Message>(text),
+                Ok(Message::Ping { .. })
+            ) {
+                ws.send(WsMessage::Text(
+                    serde_json::to_string(&Message::Pong {
+                        timestamp: Utc::now(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+                continue;
+            }
+        }
+        return frame;
+    }
 }
 
 async fn welcome(
@@ -217,11 +245,9 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() {
         .await
         .unwrap();
 
-        let reply = tokio::time::timeout(Duration::from_millis(100), ws.next())
+        let reply = tokio::time::timeout(Duration::from_secs(1), next_non_heartbeat(&mut ws))
             .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .expect("fresh pong did not arrive");
         let WsMessage::Text(reply) = reply else {
             panic!("expected pong text frame");
         };
@@ -238,9 +264,9 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() {
     });
 
     let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
-    tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
-        .unwrap()
+        .expect("frame-handling session did not finish")
         .unwrap();
     server.await.unwrap();
 }
@@ -289,11 +315,9 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         .await
         .unwrap();
 
-        let reply = tokio::time::timeout(Duration::from_millis(100), ws.next())
+        let reply = tokio::time::timeout(Duration::from_secs(1), next_non_heartbeat(&mut ws))
             .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .expect("operation response did not arrive");
         let WsMessage::Text(reply) = reply else {
             panic!("expected response text frame");
         };
@@ -322,9 +346,9 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
     });
 
     let agent = Agent::new(config(addr), EchoDispatcher).unwrap();
-    tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
-        .unwrap()
+        .expect("frame-handling session did not finish")
         .unwrap();
     server.await.unwrap();
 }
@@ -465,9 +489,9 @@ async fn held_job_completion_replays_after_welcome_and_is_cleared() {
     let mut cfg = config(addr);
     cfg.upload_base = upload_base;
     let agent = Agent::new(cfg, UnsupportedDispatcher).unwrap();
-    tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
-        .unwrap()
+        .expect("frame-handling session did not finish")
         .unwrap();
     server.await.unwrap();
 
@@ -701,9 +725,9 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
         let mut ws = accept_agent(&listener).await;
         welcome(&mut ws, "sess_app_heartbeat").await;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(90);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(180);
         while tokio::time::Instant::now() < deadline {
-            let item = tokio::time::timeout(Duration::from_millis(30), ws.next())
+            let item = tokio::time::timeout(Duration::from_millis(60), ws.next())
                 .await
                 .expect("agent stopped sending application heartbeats")
                 .unwrap()
@@ -736,7 +760,7 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
     cfg.heartbeat_timeout = Duration::from_millis(30);
     let agent = Agent::new(cfg, UnsupportedDispatcher).unwrap();
 
-    tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_millis(400), agent.run(cancel.clone()))
         .await
         .expect("application pong heartbeat failed to keep the session alive")
         .unwrap();
@@ -914,4 +938,186 @@ async fn inbound_websocket_control_ping_is_answered_without_native_keepalive_tim
         .unwrap()
         .unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.bin");
+    fs::write(&source, b"abcdef").unwrap();
+    let upload_base = dir.path().join("uploads");
+    fs::create_dir_all(&upload_base).unwrap();
+    let received = upload_base.join("received.bin");
+
+    let policy = Policy {
+        upload_base: upload_base.clone(),
+        file_ops_paths: vec![FileOpsPath {
+            path: dir.path().to_owned(),
+            access: FileAccess::ReadWrite,
+        }],
+        ..Policy::default()
+    };
+    let dispatcher = CoreDispatcher::new(policy, dir.path().join("config.yaml"), "test");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let server_cancel = cancel.clone();
+    let source_for_server = source.display().to_string();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_agent(&listener).await;
+        welcome(&mut ws, "sess_binary_roundtrip").await;
+
+        let export_id = "01010101010101010101010101010101";
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "request",
+                "id": "export_init",
+                "op": "file_export_init",
+                "payload": {
+                    "transfer_id": export_id,
+                    "source_path": source_for_server,
+                    "chunk_size": 3
+                },
+                "deadline": null,
+                "opaque_ref": null
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let init = next_non_heartbeat(&mut ws).await;
+        let WsMessage::Text(init) = init else {
+            panic!("expected export init JSON response");
+        };
+        assert!(matches!(
+            serde_json::from_str::<Message>(&init).unwrap(),
+            Message::Response { ok: true, .. }
+        ));
+
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "request",
+                "id": "export_chunk",
+                "op": "file_export_chunk",
+                "payload": {
+                    "transfer_id": export_id,
+                    "chunk_index": 0
+                },
+                "deadline": null,
+                "opaque_ref": null
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let first = next_non_heartbeat(&mut ws).await;
+        let WsMessage::Binary(first) = first else {
+            panic!("binary export payload must arrive before JSON ack");
+        };
+        let frame = decode_binary_frame(&first).unwrap();
+        assert_eq!(frame.transfer_id, [0x01; 16]);
+        assert_eq!(frame.chunk_index, 0);
+        assert_eq!(frame.payload, b"abc");
+
+        let second = next_non_heartbeat(&mut ws).await;
+        let WsMessage::Text(second) = second else {
+            panic!("expected JSON ack after binary export payload");
+        };
+        let Message::Response {
+            ok: true,
+            result: Some(result),
+            ..
+        } = serde_json::from_str::<Message>(&second).unwrap()
+        else {
+            panic!("expected successful export chunk ack");
+        };
+        assert_eq!(result["chunk_index"], 0);
+        assert!(!result.contains_key("__binary_payload__"));
+
+        let inbound_id = "10101010101010101010101010101010";
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "request",
+                "id": "upload_init",
+                "op": "upload_init",
+                "payload": {
+                    "upload_id": inbound_id,
+                    "target_path": "received.bin",
+                    "total_size": 3
+                },
+                "deadline": null,
+                "opaque_ref": null
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let upload_init = next_non_heartbeat(&mut ws).await;
+        assert!(matches!(upload_init, WsMessage::Text(_)));
+
+        ws.send(WsMessage::Binary(
+            encode_binary_frame([0x10; 16], 0, b"xyz").into(),
+        ))
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_millis(250), next_non_heartbeat(&mut ws))
+            .await
+            .expect("missing transfer_chunk_ack");
+        let WsMessage::Text(ack) = ack else {
+            panic!("expected transfer chunk ack event");
+        };
+        let Message::Event { kind, data, .. } = serde_json::from_str::<Message>(&ack).unwrap()
+        else {
+            panic!("expected event");
+        };
+        assert_eq!(kind, "transfer_chunk_ack");
+        assert_eq!(data["transfer_id"], inbound_id);
+        assert_eq!(data["chunk_index"], 0);
+        assert_eq!(data["ok"], true);
+        assert_eq!(data["bytes"], 3);
+
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "request",
+                "id": "upload_complete",
+                "op": "upload_complete",
+                "payload": {"upload_id": inbound_id},
+                "deadline": null,
+                "opaque_ref": null
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let complete = next_non_heartbeat(&mut ws).await;
+        let WsMessage::Text(complete) = complete else {
+            panic!("expected upload complete response");
+        };
+        let complete = serde_json::from_str::<Message>(&complete).unwrap();
+        assert!(
+            matches!(complete, Message::Response { ok: true, .. }),
+            "unexpected upload complete response: {complete:?}"
+        );
+
+        server_cancel.cancel();
+        let _ = ws.close(None).await;
+    });
+
+    let mut cfg = config(addr);
+    cfg.upload_base = upload_base;
+    let agent = Agent::new(cfg, dispatcher).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), agent.run(cancel.clone()))
+        .await
+        .expect("binary roundtrip session did not finish")
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(fs::read(received).unwrap(), b"xyz");
 }

@@ -1,10 +1,31 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+pub mod core;
+pub mod edit;
+pub mod edit_upload;
+pub mod file_export;
+pub mod fileops;
+pub mod fsmutate;
+pub mod git_ops;
+pub mod handler_error;
+pub mod host;
+pub mod identity;
 pub mod jobs;
+pub mod local_api;
+pub mod local_audit;
 pub mod pending_results;
+pub mod policy;
+pub mod preflight;
+pub mod project_snapshot;
+pub mod script;
+pub mod segment;
+pub mod shell;
+pub mod staging;
+pub mod upload;
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
@@ -364,8 +385,66 @@ impl<D: Dispatcher> Agent<D> {
                 }
                 outbound = response_rx.recv() => {
                     if let Some(outbound) = outbound {
-                        let mut wire = serde_json::to_value(&outbound.message)?;
-                        if matches!(outbound.message, Message::Response { .. }) {
+                        let mut message = outbound.message;
+
+                        if let Message::Response {
+                            id,
+                            ok: true,
+                            result: Some(result),
+                            ..
+                        } = &mut message
+                        {
+                            if let Some(encoded) = result
+                                .remove("__binary_payload__")
+                                .and_then(|value| value.as_str().map(str::to_owned))
+                            {
+                                let binary = (|| -> Result<Vec<u8>, String> {
+                                    let transfer_id = result
+                                        .get("transfer_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .ok_or_else(|| "missing transfer_id".to_string())?;
+                                    let chunk_index = result
+                                        .get("chunk_index")
+                                        .and_then(serde_json::Value::as_u64)
+                                        .ok_or_else(|| "missing chunk_index".to_string())?;
+                                    let chunk_index = u32::try_from(chunk_index)
+                                        .map_err(|_| "chunk_index exceeds u32".to_string())?;
+                                    let transfer_id = decode_transfer_id_hex(transfer_id)?;
+                                    let payload = STANDARD
+                                        .decode(encoded)
+                                        .map_err(|error| format!("invalid internal binary payload: {error}"))?;
+                                    Ok(sentinel0_proto::encode_binary_frame(
+                                        transfer_id,
+                                        chunk_index,
+                                        &payload,
+                                    ))
+                                })();
+
+                                match binary {
+                                    Ok(frame) => {
+                                        if ws.send(WsMessage::Binary(frame.into())).await.is_err() {
+                                            return Ok(SessionEnd::Lost(None));
+                                        }
+                                    }
+                                    Err(error) => {
+                                        message = Message::Response {
+                                            id: id.clone(),
+                                            ok: false,
+                                            result: None,
+                                            error: Some(sentinel0_proto::ResponseError {
+                                                code: "binary_emit_error".into(),
+                                                message: error,
+                                                details: None,
+                                            }),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+
+                        let is_response = matches!(message, Message::Response { .. });
+                        let mut wire = serde_json::to_value(&message)?;
+                        if is_response {
                             let _ = bound_response_default(&mut wire);
                         }
                         if ws.send(WsMessage::Text(
@@ -520,6 +599,84 @@ impl<D: Dispatcher> Agent<D> {
                                 _ => {}
                             }
                         }
+                        Some(Ok(WsMessage::Binary(raw))) => {
+                            let Ok(frame) = sentinel0_proto::decode_binary_frame(&raw) else {
+                                warn!("discarding malformed binary transfer frame");
+                                continue;
+                            };
+                            let transfer_id = frame
+                                .transfer_id
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>();
+                            let chunk_index = frame.chunk_index;
+                            let payload = frame.payload.to_vec();
+                            let upload_base = self.config.upload_base.clone();
+                            let response_tx = response_tx.clone();
+
+                            tasks.spawn(async move {
+                                let transfer_for_write = transfer_id.clone();
+                                let written = tokio::task::spawn_blocking(move || {
+                                    crate::upload::write_transfer_part_at(
+                                        &upload_base,
+                                        &transfer_for_write,
+                                        chunk_index,
+                                        &payload,
+                                    )
+                                })
+                                .await;
+
+                                let mut data = BTreeMap::from([
+                                    (
+                                        "transfer_id".into(),
+                                        serde_json::Value::String(transfer_id),
+                                    ),
+                                    (
+                                        "chunk_index".into(),
+                                        serde_json::Value::from(chunk_index),
+                                    ),
+                                ]);
+                                match written {
+                                    Ok(Ok(bytes)) => {
+                                        data.insert("ok".into(), serde_json::Value::Bool(true));
+                                        data.insert(
+                                            "bytes".into(),
+                                            serde_json::Value::from(bytes as u64),
+                                        );
+                                    }
+                                    Ok(Err(error)) => {
+                                        data.insert("ok".into(), serde_json::Value::Bool(false));
+                                        data.insert(
+                                            "error".into(),
+                                            serde_json::Value::String(format!(
+                                                "{}: {}",
+                                                error.code, error.message
+                                            )),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        data.insert("ok".into(), serde_json::Value::Bool(false));
+                                        data.insert(
+                                            "error".into(),
+                                            serde_json::Value::String(format!(
+                                                "ingest_error: {error}"
+                                            )),
+                                        );
+                                    }
+                                }
+
+                                let _ = response_tx
+                                    .send(Outbound {
+                                        message: Message::Event {
+                                            kind: "transfer_chunk_ack".into(),
+                                            data,
+                                            timestamp: Utc::now(),
+                                        },
+                                        clear_after_send: None,
+                                    })
+                                    .await;
+                            });
+                        }
                         Some(Ok(_)) => {}
                     }
                 }
@@ -592,6 +749,19 @@ async fn clear_pending(path: Option<PathBuf>) {
     {
         warn!(?error, "pending-result clear task failed");
     }
+}
+
+fn decode_transfer_id_hex(value: &str) -> Result<[u8; 16], String> {
+    if value.len() != 32 {
+        return Err("transfer_id must be 32 hex characters".into());
+    }
+    let mut bytes = [0_u8; 16];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *slot = u8::from_str_radix(&value[offset..offset + 2], 16)
+            .map_err(|error| format!("invalid transfer_id hex: {error}"))?;
+    }
+    Ok(bytes)
 }
 
 fn unix_time_seconds() -> f64 {

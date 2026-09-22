@@ -1,14 +1,33 @@
 use rand::RngCore;
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const PENDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const MAX_PENDING_FILES: usize = 500;
+
+fn store_lock(dir: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(dir).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(dir.to_owned(), Arc::downgrade(&lock));
+    lock
+}
 
 pub fn pending_dir(upload_base: &Path) -> PathBuf {
     upload_base
@@ -63,63 +82,107 @@ fn json_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 pub fn record(upload_base: &Path, job_id: &str, event: &Value) -> Option<PathBuf> {
-    record_at(upload_base, job_id, event, unix_seconds_now())
-}
-
-fn record_at(upload_base: &Path, job_id: &str, event: &Value, at: f64) -> Option<PathBuf> {
-    let result = (|| -> std::io::Result<PathBuf> {
-        let dir = pending_dir(upload_base);
-        fs::create_dir_all(&dir)?;
-
-        let existing = json_files(&dir)?;
-        if existing.len() >= MAX_PENDING_FILES {
-            let remove = existing.len() - MAX_PENDING_FILES + 1;
-            for stale in existing.into_iter().take(remove) {
-                let _ = fs::remove_file(stale);
-            }
+    match record_at_result(upload_base, job_id, event, unix_seconds_now()) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            tracing::warn!(%job_id, ?error, "pending result could not be persisted");
+            None
         }
-
-        let path = dir.join(format!("{}.json", safe_name(job_id)));
-        let wrapped = json!({"at": at, "event": event});
-        let bytes = serde_json::to_vec(&wrapped).map_err(std::io::Error::other)?;
-
-        let mut rng = rand::rng();
-        let temp = loop {
-            let candidate = dir.join(format!(".pending-{:016x}.tmp", rng.next_u64()));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(mut file) => {
-                    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-                        let _ = fs::remove_file(&candidate);
-                        return Err(error);
-                    }
-                    break candidate;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        };
-
-        if let Err(error) = fs::rename(&temp, &path) {
-            let _ = fs::remove_file(&temp);
-            return Err(error);
-        }
-        Ok(path)
-    })();
-
-    result.ok()
-}
-
-pub fn clear(path: Option<&Path>) {
-    if let Some(path) = path {
-        let _ = fs::remove_file(path);
     }
 }
 
+fn record_at_result(
+    upload_base: &Path,
+    job_id: &str,
+    event: &Value,
+    at: f64,
+) -> std::io::Result<PathBuf> {
+    record_at_result_with_limit(upload_base, job_id, event, at, MAX_PENDING_FILES, true)
+}
+
+fn record_at_result_with_limit(
+    upload_base: &Path,
+    job_id: &str,
+    event: &Value,
+    at: f64,
+    max_pending_files: usize,
+    durable: bool,
+) -> std::io::Result<PathBuf> {
+    let dir = pending_dir(upload_base);
+    let store = store_lock(&dir);
+    let _guard = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    fs::create_dir_all(&dir)?;
+
+    let path = dir.join(format!("{}.json", safe_name(job_id)));
+    let wrapped = json!({"at": at, "event": event});
+    let bytes = serde_json::to_vec(&wrapped).map_err(std::io::Error::other)?;
+
+    let mut rng = rand::rng();
+    let temp = loop {
+        let candidate = dir.join(format!(".pending-{:016x}.tmp", rng.next_u64()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(&bytes) {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                if durable {
+                    // Best-effort durability: if the connection dies after the
+                    // job completes, replay data should already be on stable
+                    // storage before we consider the result persisted.
+                    let _ = file.sync_all();
+                }
+                break candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+
+    let existing = json_files(&dir)?;
+    if existing.len() > max_pending_files {
+        let remove = existing.len() - max_pending_files;
+        for stale in existing.into_iter().take(remove) {
+            let _ = fs::remove_file(stale);
+        }
+    }
+
+    Ok(path)
+}
+
+pub fn clear(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        let _ = fs::remove_file(path);
+        return;
+    };
+    let store = store_lock(dir);
+    let _guard = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = fs::remove_file(path);
+}
+
 pub fn drain(upload_base: &Path) -> Vec<(PathBuf, Value)> {
+    let dir = pending_dir(upload_base);
+    let store = store_lock(&dir);
+    let _guard = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     drain_at(upload_base, unix_seconds_now())
 }
 
@@ -191,7 +254,7 @@ mod tests {
     #[test]
     fn expired_and_corrupt_entries_are_removed() {
         let (_tmp, upload) = base();
-        let expired = record_at(
+        let expired = record_at_result(
             &upload,
             "job_old",
             &event("job_old"),
@@ -226,20 +289,24 @@ mod tests {
     #[test]
     fn backlog_is_capped_and_newest_name_survives() {
         let (_tmp, upload) = base();
-        for i in 0..(MAX_PENDING_FILES + 5) {
-            record(
+        let max = 5;
+        for i in 0..(max + 5) {
+            record_at_result_with_limit(
                 &upload,
                 &format!("job_{i:04}"),
                 &event(&format!("job_{i:04}")),
+                unix_seconds_now(),
+                max,
+                false,
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("record {i} failed: {error}"));
         }
         let files = json_files(&pending_dir(&upload)).unwrap();
-        assert!(files.len() <= MAX_PENDING_FILES);
+        assert!(files.len() <= max);
         assert!(
             files
                 .iter()
-                .any(|path| path.file_stem().unwrap() == "job_0504")
+                .any(|path| path.file_stem().unwrap() == "job_0009")
         );
     }
 
@@ -269,16 +336,28 @@ mod tests {
     #[test]
     fn backlog_evicts_oldest_file_not_lexicographically_first_job_id() {
         let (_tmp, upload) = base();
-        record(&upload, "zzz_oldest", &event("zzz_oldest")).unwrap();
+        let max = 5;
+        record_at_result_with_limit(
+            &upload,
+            "zzz_oldest",
+            &event("zzz_oldest"),
+            unix_seconds_now(),
+            max,
+            false,
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(20));
 
-        for i in 0..MAX_PENDING_FILES {
-            record(
+        for i in 0..max {
+            record_at_result_with_limit(
                 &upload,
                 &format!("aaa_new_{i:04}"),
                 &event(&format!("aaa_new_{i:04}")),
+                unix_seconds_now(),
+                max,
+                false,
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("record {i} failed: {error}"));
         }
 
         let names: Vec<_> = json_files(&pending_dir(&upload))
@@ -289,9 +368,42 @@ mod tests {
                     .map(|name| name.to_string_lossy().into_owned())
             })
             .collect();
-        assert_eq!(names.len(), MAX_PENDING_FILES);
+        assert_eq!(names.len(), max);
         assert!(!names.iter().any(|name| name == "zzz_oldest"));
         assert!(names.iter().any(|name| name == "aaa_new_0000"));
+    }
+
+    #[test]
+    fn replacing_existing_job_at_capacity_does_not_evict_another_job() {
+        let (_tmp, upload) = base();
+        let max = 3;
+        for job in ["job_a", "job_b", "job_c"] {
+            record_at_result_with_limit(&upload, job, &event(job), unix_seconds_now(), max, false)
+                .unwrap();
+        }
+
+        record_at_result_with_limit(
+            &upload,
+            "job_b",
+            &event("job_b_replaced"),
+            unix_seconds_now(),
+            max,
+            false,
+        )
+        .unwrap();
+
+        let names = json_files(&pending_dir(&upload))
+            .unwrap()
+            .into_iter()
+            .filter_map(|path| {
+                path.file_stem()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), max);
+        for job in ["job_a", "job_b", "job_c"] {
+            assert!(names.iter().any(|name| name == job), "missing {job}");
+        }
     }
 
     #[test]

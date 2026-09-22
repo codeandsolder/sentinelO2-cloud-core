@@ -12,16 +12,47 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 async-trait = "0.1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1"
 futures-util = "0.3"
+glob = "0.3"
 http = "1"
+nix = { version = "0.30", features = ["signal", "process", "user", "fs"] }
 proptest = "1"
 rand = "0.9"
+regex = "1"
+# Keep the HTTPS upload client on the last 0.12 line that does not force
+# url >=2.5 / ICU, so the declared Rust 1.85 MSRV remains real.
+reqwest = { version = "=0.12.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+shlex = "1"
+similar = "2"
+soft-canonicalize = "0.5"
 thiserror = "2"
+tar = "0.4"
 tempfile = "3"
+toml = "0.9"
 tracing = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "process", "signal", "io-util", "fs"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+url = "=2.4.1"
+walkdir = "2"
+yaml_serde = "0.10"
+
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+complexity = "warn"
+perf = "warn"
+style = "warn"
