@@ -17,6 +17,7 @@ pub mod local_audit;
 pub mod pending_results;
 pub mod policy;
 pub mod preflight;
+pub mod progressive_help;
 pub mod project_snapshot;
 pub mod script;
 pub mod segment;
@@ -30,7 +31,7 @@ use chrono::Utc;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
 use rand::RngExt;
-use sentinel0_proto::{HostInfo, Message, Op, bounding::bound_response_default};
+use sentinel0_proto::{HostInfo, Message, Op, PreferredProfile, bounding::bound_response_default};
 use std::{
     collections::BTreeMap, panic::AssertUnwindSafe, path::PathBuf, sync::Arc, time::Duration,
 };
@@ -76,6 +77,7 @@ pub struct AgentConfig {
     pub host: HostInfo,
     pub agent_version: String,
     pub capabilities: Vec<String>,
+    pub preferred_profile: Option<PreferredProfile>,
     pub upload_base: PathBuf,
     pub reconnect: ReconnectPolicy,
     pub connect_timeout: Duration,
@@ -317,10 +319,11 @@ impl<D: Dispatcher> Agent<D> {
         .await
         .map_err(|_| AgentError::Timeout("connect"))??;
 
-        let hello = Message::hello(
+        let hello = Message::hello_with_profile(
             self.config.host.clone(),
             self.config.agent_version.clone(),
             self.config.capabilities.clone(),
+            self.config.preferred_profile.clone(),
         );
         ws.send(WsMessage::Text(serde_json::to_string(&hello)?.into()))
             .await?;

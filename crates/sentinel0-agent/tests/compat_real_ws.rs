@@ -12,7 +12,9 @@ use sentinel0_agent::{
     pending_results,
     policy::{FileAccess, FileOpsPath, Policy},
 };
-use sentinel0_proto::{HostInfo, Message, Op, decode_binary_frame, encode_binary_frame};
+use sentinel0_proto::{
+    HostInfo, Message, Op, PreferredProfile, decode_binary_frame, encode_binary_frame,
+};
 use serde_json::{Map, Value, json};
 use std::{collections::BTreeMap, fs, time::Duration};
 use tokio::net::TcpListener;
@@ -49,6 +51,7 @@ fn config(addr: std::net::SocketAddr) -> AgentConfig {
         host: host(),
         agent_version: "0.1-test".into(),
         capabilities: vec!["state".into(), "opaque_ref".into()],
+        preferred_profile: Some(PreferredProfile::Compact),
         upload_base: std::env::temp_dir()
             .join(format!("sentinel0-compat-{}", addr.port()))
             .join("uploads"),
@@ -114,7 +117,10 @@ async fn welcome(
     };
     assert!(matches!(
         serde_json::from_str::<Message>(&hello).unwrap(),
-        Message::Hello { .. }
+        Message::Hello {
+            preferred_profile: Some(PreferredProfile::Compact),
+            ..
+        }
     ));
     ws.send(WsMessage::Text(
         json!({

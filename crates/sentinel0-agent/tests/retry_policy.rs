@@ -98,6 +98,7 @@ fn valid_config() -> AgentConfig {
         },
         agent_version: "test".into(),
         capabilities: vec![],
+        preferred_profile: None,
         upload_base: PathBuf::from("/tmp/uploads"),
         reconnect: ReconnectPolicy::default(),
         connect_timeout: Duration::from_secs(15),

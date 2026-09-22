@@ -5,11 +5,12 @@ use sentinel0_agent::{
     Agent, AgentConfig, ReconnectPolicy, core::CoreDispatcher, host, identity::load_identity,
     policy::Policy,
 };
+use sentinel0_proto::PreferredProfile;
 use std::{error::Error, path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-const AGENT_VERSION: &str = "0.18.4-rust.1";
+const AGENT_VERSION: &str = "0.19.2-rust.1";
 
 #[derive(Debug, Parser)]
 #[command(name = "sentinelx-core")]
@@ -26,6 +27,10 @@ struct Args {
     check_config: bool,
     #[arg(long)]
     verify_enrollment: bool,
+    #[arg(long, hide = true)]
+    local_api_relay: Option<PathBuf>,
+    #[arg(long, hide = true, default_value_t = 30.0)]
+    relay_timeout: f64,
 }
 
 fn ws_base(hub: &str) -> String {
@@ -41,6 +46,13 @@ fn ws_base(hub: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    if let Some(path) = args.local_api_relay.as_deref() {
+        std::process::exit(sentinel0_agent::local_api::run_local_api_relay(
+            path,
+            args.relay_timeout,
+        ));
+    }
+
     let filter = tracing_subscriber::EnvFilter::try_new(&args.log_level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -91,6 +103,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         host,
         agent_version: AGENT_VERSION.into(),
         capabilities,
+        preferred_profile: match policy.preferred_profile.as_deref() {
+            Some("compact") => Some(PreferredProfile::Compact),
+            Some("full") => Some(PreferredProfile::Full),
+            _ => None,
+        },
         upload_base: policy.upload_base.clone(),
         reconnect: ReconnectPolicy::default(),
         connect_timeout: Duration::from_secs(15),

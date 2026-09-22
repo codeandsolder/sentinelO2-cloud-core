@@ -25,6 +25,8 @@ pub const MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 struct UploadMeta {
     upload_id: String,
     target_path: String,
+    #[serde(default)]
+    landed_in_place: bool,
     overwrite: bool,
     total_size: u64,
     filename: Option<String>,
@@ -69,8 +71,12 @@ fn safe_dest(upload_base: &Path, target: &str) -> Result<PathBuf, HandlerError> 
             "missing 'target_path'",
         ));
     }
-    let relative = Path::new(target);
-    if relative.is_absolute()
+    // Match the official upload staging semantics: a leading slash does
+    // not grant an absolute write, it is stripped and the path remains rooted
+    // under upload_base. Parent traversal is still refused.
+    let stripped = target.trim().trim_start_matches('/');
+    let relative = Path::new(stripped);
+    if relative.as_os_str().is_empty()
         || relative.components().any(|part| {
             matches!(
                 part,
@@ -80,7 +86,7 @@ fn safe_dest(upload_base: &Path, target: &str) -> Result<PathBuf, HandlerError> 
     {
         return Err(HandlerError::new(
             "path_traversal",
-            "target_path must be relative to upload_base and must not contain '..'",
+            "target_path must remain under upload_base and must not contain '..'",
         ));
     }
 
@@ -355,7 +361,19 @@ pub fn upload_init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResu
             format!("declared total_size exceeds upload cap of {MAX_UPLOAD_BYTES} bytes"),
         ));
     }
-    let destination = safe_dest(&policy.upload_base, target)?;
+    let land_in_place = payload
+        .get("land_in_place")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (destination, landed_in_place) = if land_in_place {
+        if let Some(resolved) = policy.resolve_path(target, true) {
+            (resolved, true)
+        } else {
+            (safe_dest(&policy.upload_base, target)?, false)
+        }
+    } else {
+        (safe_dest(&policy.upload_base, target)?, false)
+    };
     if destination.exists() && !overwrite {
         return Err(HandlerError::new(
             "conflict",
@@ -367,6 +385,7 @@ pub fn upload_init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResu
     let meta = UploadMeta {
         upload_id: upload_id.clone(),
         target_path: destination.display().to_string(),
+        landed_in_place,
         overwrite,
         total_size,
         filename: payload
@@ -609,6 +628,179 @@ mod tests {
         assert_eq!(
             fs::read(dir.path().join("nested/x.bin")).unwrap(),
             b"abcdef"
+        );
+    }
+
+    fn landing_policy(
+        upload_base: &Path,
+        entries: Vec<(PathBuf, crate::policy::FileAccess)>,
+    ) -> Policy {
+        Policy {
+            upload_base: upload_base.to_owned(),
+            file_ops_paths: entries
+                .into_iter()
+                .map(|(path, access)| crate::policy::FileOpsPath { path, access })
+                .collect(),
+            ..Policy::default()
+        }
+    }
+
+    fn upload_meta(policy: &Policy, init: &BTreeMap<String, Value>) -> UploadMeta {
+        let id = init["upload_id"].as_str().unwrap();
+        let bytes = fs::read(meta_path(&upload_dir(policy, id).unwrap())).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn land_in_place_under_rw_path() {
+        let uploads = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let target = workspace.path().join("canary.txt");
+        let policy = landing_policy(
+            uploads.path(),
+            vec![(
+                workspace.path().to_owned(),
+                crate::policy::FileAccess::ReadWrite,
+            )],
+        );
+        let init = upload_init(
+            &policy,
+            &Map::from_iter([
+                (
+                    "target_path".into(),
+                    Value::String(target.display().to_string()),
+                ),
+                ("total_size".into(), Value::from(10)),
+                ("land_in_place".into(), Value::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        let meta = upload_meta(&policy, &init);
+        assert!(meta.landed_in_place);
+        assert_eq!(PathBuf::from(meta.target_path), target);
+    }
+
+    #[test]
+    fn land_in_place_outside_rw_falls_back_to_staging() {
+        let uploads = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let target = elsewhere.path().join("x.txt");
+        let policy = landing_policy(
+            uploads.path(),
+            vec![(
+                workspace.path().to_owned(),
+                crate::policy::FileAccess::ReadWrite,
+            )],
+        );
+        let init = upload_init(
+            &policy,
+            &Map::from_iter([
+                (
+                    "target_path".into(),
+                    Value::String(target.display().to_string()),
+                ),
+                ("land_in_place".into(), Value::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        let meta = upload_meta(&policy, &init);
+        assert!(!meta.landed_in_place);
+        assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+    }
+
+    #[test]
+    fn land_in_place_is_opt_in_even_under_rw_path() {
+        let uploads = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let target = workspace.path().join("default-staged.txt");
+        let policy = landing_policy(
+            uploads.path(),
+            vec![(
+                workspace.path().to_owned(),
+                crate::policy::FileAccess::ReadWrite,
+            )],
+        );
+        let init = upload_init(
+            &policy,
+            &Map::from_iter([(
+                "target_path".into(),
+                Value::String(target.display().to_string()),
+            )]),
+        )
+        .unwrap();
+        let meta = upload_meta(&policy, &init);
+        assert!(!meta.landed_in_place);
+        assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+    }
+
+    #[test]
+    fn read_only_path_does_not_land_in_place() {
+        let uploads = tempdir().unwrap();
+        let readonly = tempdir().unwrap();
+        let target = readonly.path().join("z.txt");
+        let policy = landing_policy(
+            uploads.path(),
+            vec![(readonly.path().to_owned(), crate::policy::FileAccess::Read)],
+        );
+        let init = upload_init(
+            &policy,
+            &Map::from_iter([
+                (
+                    "target_path".into(),
+                    Value::String(target.display().to_string()),
+                ),
+                ("land_in_place".into(), Value::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        let meta = upload_meta(&policy, &init);
+        assert!(!meta.landed_in_place);
+        assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+    }
+
+    #[test]
+    fn land_in_place_traversal_outside_rw_is_still_refused() {
+        let uploads = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let policy = landing_policy(
+            uploads.path(),
+            vec![(
+                workspace.path().to_owned(),
+                crate::policy::FileAccess::ReadWrite,
+            )],
+        );
+        let error = upload_init(
+            &policy,
+            &Map::from_iter([
+                (
+                    "target_path".into(),
+                    Value::String("../../etc/passwd".into()),
+                ),
+                ("land_in_place".into(), Value::Bool(true)),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "path_traversal");
+    }
+
+    #[test]
+    fn absolute_staging_target_is_rooted_under_upload_base() {
+        let uploads = tempdir().unwrap();
+        let policy = policy(uploads.path());
+        let init = upload_init(
+            &policy,
+            &Map::from_iter([(
+                "target_path".into(),
+                Value::String("/srv/elsewhere/x.txt".into()),
+            )]),
+        )
+        .unwrap();
+        let meta = upload_meta(&policy, &init);
+        assert!(!meta.landed_in_place);
+        assert_eq!(
+            PathBuf::from(meta.target_path),
+            uploads.path().join("srv/elsewhere/x.txt")
         );
     }
 

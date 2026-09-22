@@ -59,6 +59,19 @@ fn resolve(policy: &Policy, raw: &str) -> Result<PathBuf, HandlerError> {
     })
 }
 
+fn access_error(raw: &str, error: std::io::Error) -> HandlerError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            HandlerError::new("not_found", format!("path does not exist: {raw:?}"))
+        }
+        std::io::ErrorKind::PermissionDenied => HandlerError::new(
+            "permission_denied",
+            format!("cannot access {raw:?}: {error}"),
+        ),
+        _ => HandlerError::new("io_error", format!("cannot access {raw:?}: {error}")),
+    }
+}
+
 fn line_count(text: &str) -> usize {
     if text.is_empty() {
         0
@@ -361,16 +374,7 @@ fn scan_utf16(
 pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let path = resolve(policy, raw)?;
-    let meta = fs::metadata(&path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            HandlerError::new("not_found", format!("path does not exist: {raw:?}"))
-        }
-        std::io::ErrorKind::PermissionDenied => HandlerError::new(
-            "permission_denied",
-            format!("cannot access {raw:?}: {error}"),
-        ),
-        _ => HandlerError::new("io_error", format!("failed to stat {raw:?}: {error}")),
-    })?;
+    let meta = fs::metadata(&path).map_err(|error| access_error(raw, error))?;
     if meta.is_dir() {
         return Err(HandlerError::new(
             "is_directory",
@@ -471,16 +475,7 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let root = resolve(policy, raw)?;
-    let meta = fs::metadata(&root).map_err(|error| {
-        HandlerError::new(
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "not_found"
-            } else {
-                "io_error"
-            },
-            format!("cannot access {raw:?}: {error}"),
-        )
-    })?;
+    let meta = fs::metadata(&root).map_err(|error| access_error(raw, error))?;
     if !meta.is_dir() {
         return Err(HandlerError::new(
             "is_file",
@@ -726,6 +721,16 @@ mod tests {
             }],
             ..Policy::default()
         }
+    }
+
+    #[test]
+    fn permission_denied_is_not_reported_as_internal_io_error() {
+        let error = access_error(
+            "/restricted/tree",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(error.code, "permission_denied");
+        assert!(error.message.contains("/restricted/tree"));
     }
 
     #[test]

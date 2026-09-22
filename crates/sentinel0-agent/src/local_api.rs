@@ -3,14 +3,131 @@ use crate::{
     policy::Policy,
 };
 use serde_json::{Map, Value, json};
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::{Read as _, Write as _},
+    path::Path,
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
+    process::Command,
     time::timeout,
 };
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+enum CompatVerdict {
+    Passed,
+    Failed { code: String, message: String },
+}
+
+fn compat_cache() -> &'static Mutex<HashMap<String, CompatVerdict>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CompatVerdict>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn forget_compatibility(endpoint_name: &str) {
+    let mut cache = compat_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.remove(endpoint_name);
+}
+
+fn relay_command(endpoint: &Endpoint, executable: &Path) -> Result<Vec<String>, HandlerError> {
+    let user = endpoint.run_as.as_deref().ok_or_else(|| {
+        HandlerError::new("internal_error", "relay requested without run_as user")
+    })?;
+    Ok(vec![
+        "sudo".into(),
+        "-n".into(),
+        "-u".into(),
+        user.into(),
+        executable.display().to_string(),
+        "--local-api-relay".into(),
+        endpoint.path.clone(),
+        "--relay-timeout".into(),
+        endpoint.timeout.as_secs_f64().to_string(),
+    ])
+}
+
+pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream as StdUnixStream;
+
+        let timeout = Duration::from_secs_f64(timeout_seconds.clamp(0.1, 300.0));
+        let mut payload = Vec::new();
+        if let Err(error) = std::io::stdin()
+            .take((MAX_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut payload)
+        {
+            eprintln!("stdin read failed: {error}");
+            return 2;
+        }
+        if payload.is_empty() {
+            eprintln!("nothing to send");
+            return 2;
+        }
+        if payload.len() > MAX_RESPONSE_BYTES {
+            eprintln!("request exceeded the cap");
+            return 4;
+        }
+
+        let mut stream = match StdUnixStream::connect(path) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("connect failed: {error}");
+                return 3;
+            }
+        };
+        let _ = stream.set_read_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(timeout));
+
+        if let Err(error) = stream.write_all(&payload) {
+            eprintln!("relay failed: {error}");
+            return 3;
+        }
+
+        let mut reply = Vec::new();
+        let mut chunk = [0_u8; 65_536];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    reply.extend_from_slice(&chunk[..count]);
+                    if reply.len() > MAX_RESPONSE_BYTES {
+                        eprintln!("reply exceeded the cap");
+                        return 4;
+                    }
+                    if reply.ends_with(b"\n") {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("relay failed: {error}");
+                    return 3;
+                }
+            }
+        }
+
+        if let Err(error) = std::io::stdout().write_all(&reply) {
+            eprintln!("stdout write failed: {error}");
+            return 3;
+        }
+        return 0;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, timeout_seconds);
+        eprintln!("local_api relay requires a Unix-domain socket");
+        3
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Action {
@@ -35,6 +152,36 @@ struct Endpoint {
 
 fn yaml_to_json(value: &yaml_serde::Value) -> Option<Value> {
     serde_json::to_value(value).ok()
+}
+
+fn valid_compatibility(value: Option<&Value>, protocol: &str) -> Option<Value> {
+    let value = value?.as_object()?;
+    let probe = value.get("probe")?.as_object()?;
+    let extract = value.get("extract")?.as_str()?;
+    if extract.trim().is_empty() {
+        return None;
+    }
+    let accept = value.get("accept")?.as_object()?;
+    let has_accept = accept.contains_key("exact")
+        || accept
+            .get("allowed")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+    if !has_accept {
+        return None;
+    }
+    let probe_ok = match protocol {
+        "http" => probe
+            .get("request")
+            .and_then(Value::as_str)
+            .is_some_and(|request| !request.trim().is_empty()),
+        "jsonrpc" => probe
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| !method.trim().is_empty()),
+        _ => false,
+    };
+    probe_ok.then(|| Value::Object(value.clone()))
 }
 
 fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Option<Endpoint> {
@@ -109,7 +256,7 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Option<Endpoint> {
         timeout: Duration::from_secs_f64(timeout_seconds),
         run_as: map.get("run_as").and_then(Value::as_str).map(str::to_owned),
         actions,
-        compatibility: map.get("compatibility").cloned().filter(Value::is_object),
+        compatibility: valid_compatibility(map.get("compatibility"), &protocol),
     })
 }
 
@@ -127,7 +274,7 @@ fn endpoints(policy: &Policy) -> BTreeMap<String, Endpoint> {
 pub fn has_usable_endpoints(policy: &Policy) -> bool {
     endpoints(policy)
         .values()
-        .any(|endpoint| endpoint.transport == "unix" && endpoint.run_as.is_none())
+        .any(|endpoint| endpoint.transport == "unix")
 }
 
 fn param_names(action: &Action) -> Vec<String> {
@@ -253,15 +400,6 @@ async fn connect(endpoint: &Endpoint) -> Result<UnixStream, HandlerError> {
             format!(
                 "transport {:?} is not available in the Rust compatibility agent",
                 endpoint.transport
-            ),
-        ));
-    }
-    if let Some(user) = endpoint.run_as.as_deref() {
-        return Err(HandlerError::new(
-            "run_as_not_permitted",
-            format!(
-                "endpoint {:?} requires run_as={user:?}; the Rust agent does not silently elevate for local_api",
-                endpoint.name
             ),
         ));
     }
@@ -431,12 +569,94 @@ async fn call_http(
         .map_err(|_| HandlerError::new("timeout", "endpoint did not answer in time"))?
 }
 
+async fn call_via_run_as(endpoint: &Endpoint, payload: &[u8]) -> Result<Vec<u8>, HandlerError> {
+    let executable = std::env::current_exe()
+        .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
+    let argv = relay_command(endpoint, &executable)?;
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().map_err(|error| {
+        HandlerError::new(
+            "run_as_not_permitted",
+            format!("could not start run_as relay: {error}"),
+        )
+    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HandlerError::new("internal_error", "run_as relay stdin was not piped"))?;
+    stdin
+        .write_all(payload)
+        .await
+        .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+    drop(stdin);
+
+    let output = timeout(
+        endpoint.timeout + Duration::from_secs(5),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| {
+        HandlerError::new(
+            "timeout",
+            format!("{} did not answer in time", endpoint.name),
+        )
+    })?
+    .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+
+    if output.status.success() && !output.stdout.is_empty() {
+        return Ok(output.stdout);
+    }
+
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let rc = output.status.code().unwrap_or(-1);
+    if detail.contains("a password is required")
+        || detail.contains("not allowed to execute")
+        || (rc == 1 && detail.to_ascii_lowercase().contains("sudo"))
+    {
+        let user = endpoint.run_as.as_deref().unwrap_or("<unknown>");
+        return Err(HandlerError::new(
+            "run_as_not_permitted",
+            format!(
+                "{:?} declares run_as={user:?}, but this agent may not become that user. The host owner can allow only this relay with a sudoers rule such as: sentinelx ALL=({user}) NOPASSWD: {} --local-api-relay * ({})",
+                endpoint.name,
+                executable.display(),
+                detail.chars().take(120).collect::<String>()
+            ),
+        ));
+    }
+    if rc == 3 {
+        return Err(HandlerError::new(
+            "endpoint_unreachable",
+            format!(
+                "cannot open {} as {}: {}",
+                endpoint.path,
+                endpoint.run_as.as_deref().unwrap_or("<unknown>"),
+                detail.chars().take(160).collect::<String>()
+            ),
+        ));
+    }
+
+    Err(HandlerError::new(
+        "bad_response",
+        format!(
+            "relay failed (rc={rc}): {}",
+            detail.chars().take(160).collect::<String>()
+        ),
+    ))
+}
+
 async fn call_jsonrpc(
     endpoint: &Endpoint,
     action: &Action,
     params: &Map<String, Value>,
 ) -> Result<Value, HandlerError> {
-    let mut stream = connect(endpoint).await?;
     let request = json!({
         "jsonrpc": "2.0",
         "id": format!("sentinel-local-api-{:08x}", rand::random::<u32>()),
@@ -446,17 +666,25 @@ async fn call_jsonrpc(
     let mut encoded = serde_json::to_vec(&request)
         .map_err(|e| HandlerError::new("internal_error", e.to_string()))?;
     encoded.push(b'\n');
-    timeout(endpoint.timeout, stream.write_all(&encoded))
-        .await
-        .map_err(|_| HandlerError::new("timeout", "timed out writing request"))?
-        .map_err(|e| HandlerError::new("endpoint_unreachable", e.to_string()))?;
 
-    let mut reader = BufReader::new(stream);
-    let mut line = Vec::new();
-    timeout(endpoint.timeout, reader.read_until(b'\n', &mut line))
-        .await
-        .map_err(|_| HandlerError::new("timeout", "endpoint did not answer in time"))?
-        .map_err(|e| HandlerError::new("bad_response", e.to_string()))?;
+    let line = if endpoint.run_as.is_some() {
+        call_via_run_as(endpoint, &encoded).await?
+    } else {
+        let mut stream = connect(endpoint).await?;
+        timeout(endpoint.timeout, stream.write_all(&encoded))
+            .await
+            .map_err(|_| HandlerError::new("timeout", "timed out writing request"))?
+            .map_err(|e| HandlerError::new("endpoint_unreachable", e.to_string()))?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        timeout(endpoint.timeout, reader.read_until(b'\n', &mut line))
+            .await
+            .map_err(|_| HandlerError::new("timeout", "endpoint did not answer in time"))?
+            .map_err(|e| HandlerError::new("bad_response", e.to_string()))?;
+        line
+    };
+
     if line.len() > MAX_RESPONSE_BYTES {
         return Err(HandlerError::new(
             "too_large",
@@ -492,6 +720,19 @@ async fn ensure_compatible(endpoint: &Endpoint) -> Result<(), HandlerError> {
     if constraint.is_empty() {
         return Ok(());
     }
+
+    if let Some(verdict) = compat_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&endpoint.name)
+        .cloned()
+    {
+        return match verdict {
+            CompatVerdict::Passed => Ok(()),
+            CompatVerdict::Failed { code, message } => Err(HandlerError::new(code, message)),
+        };
+    }
+
     let probe = constraint
         .get("probe")
         .and_then(Value::as_object)
@@ -524,17 +765,57 @@ async fn ensure_compatible(endpoint: &Endpoint) -> Result<(), HandlerError> {
         description: None,
         params_schema: None,
     };
-    let response = if endpoint.protocol == "http" {
-        call_http(endpoint, &probe_action, &Map::new()).await?
+    let response = match if endpoint.protocol == "http" {
+        call_http(endpoint, &probe_action, &Map::new()).await
     } else {
-        call_jsonrpc(endpoint, &probe_action, &Map::new()).await?
+        call_jsonrpc(endpoint, &probe_action, &Map::new()).await
+    } {
+        Ok(response) => response,
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "endpoint_unreachable" | "timeout" | "run_as_not_permitted"
+            ) =>
+        {
+            return Err(error);
+        }
+        Err(error) => {
+            let message = format!(
+                "could not read compatibility metadata {extract_path:?} from {:?}: {}",
+                endpoint.name, error.message
+            );
+            compat_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    endpoint.name.clone(),
+                    CompatVerdict::Failed {
+                        code: "compatibility_unknown".into(),
+                        message: message.clone(),
+                    },
+                );
+            return Err(HandlerError::new("compatibility_unknown", message));
+        }
     };
-    let found = extract(&response, extract_path).ok_or_else(|| {
-        HandlerError::new(
-            "compatibility_unknown",
-            format!("endpoint did not report {extract_path:?}"),
-        )
-    })?;
+
+    let Some(found) = extract(&response, extract_path) else {
+        let message = format!(
+            "{:?} did not report {extract_path:?}, so its compatibility cannot be established",
+            endpoint.name
+        );
+        compat_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                endpoint.name.clone(),
+                CompatVerdict::Failed {
+                    code: "compatibility_unknown".into(),
+                    message: message.clone(),
+                },
+            );
+        return Err(HandlerError::new("compatibility_unknown", message));
+    };
+
     let accepted = if let Some(exact) = accept.get("exact") {
         found == exact
     } else if let Some(allowed) = accept.get("allowed").and_then(Value::as_array) {
@@ -542,13 +823,26 @@ async fn ensure_compatible(endpoint: &Endpoint) -> Result<(), HandlerError> {
     } else {
         false
     };
+
+    let mut cache = compat_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if accepted {
+        cache.insert(endpoint.name.clone(), CompatVerdict::Passed);
         Ok(())
     } else {
-        Err(HandlerError::new(
-            "compatibility_mismatch",
-            format!("endpoint compatibility value {found} is not accepted"),
-        ))
+        let message = format!(
+            "{:?} reports {extract_path}={found}, which is not accepted by this profile",
+            endpoint.name
+        );
+        cache.insert(
+            endpoint.name.clone(),
+            CompatVerdict::Failed {
+                code: "compatibility_mismatch".into(),
+                message: message.clone(),
+            },
+        );
+        Err(HandlerError::new("compatibility_mismatch", message))
     }
 }
 
@@ -567,10 +861,18 @@ async fn call_action(
         )
     })?;
     ensure_compatible(endpoint).await?;
-    let raw = if endpoint.protocol == "http" {
-        call_http(endpoint, action, params).await?
+    let raw = match if endpoint.protocol == "http" {
+        call_http(endpoint, action, params).await
     } else {
-        call_jsonrpc(endpoint, action, params).await?
+        call_jsonrpc(endpoint, action, params).await
+    } {
+        Ok(raw) => raw,
+        Err(error) => {
+            if matches!(error.code.as_str(), "endpoint_unreachable" | "timeout") {
+                forget_compatibility(&endpoint.name);
+            }
+            return Err(error);
+        }
     };
     Ok(project(raw, &action.select))
 }
@@ -586,7 +888,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     if operation == "list" {
         let listed = endpoints
             .values()
-            .filter(|endpoint| endpoint.transport == "unix" && endpoint.run_as.is_none())
+            .filter(|endpoint| endpoint.transport == "unix")
             .map(|endpoint| {
                 json!({
                     "name": endpoint.name,
@@ -711,6 +1013,50 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_written_compatibility_constraint_is_dropped() {
+        let raw: yaml_serde::Value = yaml_serde::from_str(
+            "transport: unix\nprotocol: jsonrpc\npath: /tmp/x.sock\ncompatibility:\n  accept: { exact: 20 }\nactions:\n  a: { method: a }\n",
+        )
+        .unwrap();
+        let endpoint = endpoint_from_raw("x", &raw).unwrap();
+        assert!(endpoint.compatibility.is_none());
+    }
+
+    #[test]
+    fn run_as_endpoint_remains_usable_and_relay_has_no_shell() {
+        let raw: yaml_serde::Value = yaml_serde::from_str(
+            "transport: unix\nprotocol: jsonrpc\npath: /run/user/1002/x.sock\nrun_as: userx\nactions:\n  a: { method: a }\n",
+        )
+        .unwrap();
+        let endpoint = endpoint_from_raw("ep", &raw).unwrap();
+        let argv = relay_command(&endpoint, Path::new("/usr/local/bin/sentinelx-core")).unwrap();
+        assert_eq!(
+            &argv[..5],
+            &[
+                "sudo".to_owned(),
+                "-n".to_owned(),
+                "-u".to_owned(),
+                "userx".to_owned(),
+                "/usr/local/bin/sentinelx-core".to_owned(),
+            ]
+        );
+        assert_eq!(argv[5], "--local-api-relay");
+        assert_eq!(argv[6], "/run/user/1002/x.sock");
+        assert_eq!(argv[7], "--relay-timeout");
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains(';') || arg.contains("&&"))
+        );
+
+        let policy = Policy {
+            local_apis: BTreeMap::from([("ep".into(), raw)]),
+            ..Policy::default()
+        };
+        assert!(has_usable_endpoints(&policy));
+    }
 
     #[test]
     fn projection_supports_dotted_paths_and_arrays() {

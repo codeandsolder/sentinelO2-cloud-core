@@ -19,6 +19,39 @@ use tokio::{fs as async_fs, process::Command, time::timeout};
 const TIMEOUT_MIN: u64 = 1;
 const TIMEOUT_MAX: u64 = 600;
 
+fn staging_oserror(error: std::io::Error, path: &Path) -> HandlerError {
+    match error.raw_os_error() {
+        Some(code) if code == nix::libc::ENOSPC => HandlerError::new(
+            "no_space",
+            format!(
+                "cannot prepare the work area at {:?}: the filesystem is full ([Errno {code}]). This is a host condition, not a policy or allowlist issue. Free space on that filesystem (or point upload_base at one with room) and retry. A full disk also makes the agent itself unstable, so unrelated errors on this host may clear up once space is available.",
+                path.display()
+            ),
+        ),
+        Some(code) if matches!(code, nix::libc::EACCES | nix::libc::EPERM) => HandlerError::new(
+            "permission_denied",
+            format!(
+                "cannot prepare the work area at {:?}: the agent OS user lacks write permission ([Errno {code}]). Grant that user write access to the staging directory, or set upload_base to a directory it can write.",
+                path.display()
+            ),
+        ),
+        Some(code) if code == nix::libc::EROFS => HandlerError::new(
+            "read_only_filesystem",
+            format!(
+                "cannot prepare the work area at {:?}: the filesystem is mounted read-only ([Errno {code}]). Set upload_base to a writable location.",
+                path.display()
+            ),
+        ),
+        _ => HandlerError::new(
+            "staging_failed",
+            format!(
+                "cannot prepare the work area at {:?}: {error}",
+                path.display()
+            ),
+        ),
+    }
+}
+
 fn safe_filename(filename: Option<&str>, extension: &str) -> String {
     filename
         .and_then(|name| Path::new(name).file_name())
@@ -198,21 +231,24 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     let filename = safe_filename(payload.get("filename").and_then(Value::as_str), extension);
 
     let upload_base = policy.upload_base.clone();
+    let upload_base_for_error = upload_base.clone();
     let root = tokio::task::spawn_blocking(move || staging::staging_root(&upload_base))
         .await
-        .map_err(|e| HandlerError::new("internal_error", format!("staging setup failed: {e}")))?
-        .map_err(|e| HandlerError::new("io_error", e.to_string()))?;
+        .map_err(|e| {
+            HandlerError::new("internal_error", format!("staging setup task failed: {e}"))
+        })?
+        .map_err(|e| staging_oserror(e, &upload_base_for_error))?;
     let workdir = root.join(format!("script_job_{:016x}", rand::rng().random::<u64>()));
-    async_fs::create_dir_all(&workdir).await.map_err(|e| {
-        HandlerError::new("io_error", format!("failed creating script workdir: {e}"))
-    })?;
+    async_fs::create_dir_all(&workdir)
+        .await
+        .map_err(|e| staging_oserror(e, &workdir))?;
     let script_path = workdir.join(filename);
     async_fs::write(&script_path, content)
         .await
-        .map_err(|e| HandlerError::new("io_error", format!("failed writing script: {e}")))?;
+        .map_err(|e| staging_oserror(e, &script_path))?;
     async_fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .await
-        .map_err(|e| HandlerError::new("io_error", format!("failed chmod on script: {e}")))?;
+        .map_err(|e| staging_oserror(e, &script_path))?;
 
     let (argv, spawn_cwd) = build_command(interpreter, &script_path, &args, sudo, cwd);
     let started = Instant::now();
@@ -323,6 +359,34 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn staging_host_conditions_have_specific_error_codes() {
+        let path = Path::new("/var/lib/sentinelx/uploads/.sentinelx_uploads/script_job_x");
+        assert_eq!(
+            staging_oserror(std::io::Error::from_raw_os_error(nix::libc::ENOSPC), path).code,
+            "no_space"
+        );
+        for code in [nix::libc::EACCES, nix::libc::EPERM] {
+            assert_eq!(
+                staging_oserror(std::io::Error::from_raw_os_error(code), path).code,
+                "permission_denied"
+            );
+        }
+        assert_eq!(
+            staging_oserror(std::io::Error::from_raw_os_error(nix::libc::EROFS), path).code,
+            "read_only_filesystem"
+        );
+        assert_eq!(
+            staging_oserror(std::io::Error::from_raw_os_error(nix::libc::EIO), path).code,
+            "staging_failed"
+        );
+        let message =
+            staging_oserror(std::io::Error::from_raw_os_error(nix::libc::ENOSPC), path).message;
+        assert!(message.contains("host condition"));
+        assert!(message.contains("unstable"));
+        assert!(message.contains(&path.display().to_string()));
+    }
 
     #[tokio::test]
     async fn bash_script_captures_output_and_exit_code() {

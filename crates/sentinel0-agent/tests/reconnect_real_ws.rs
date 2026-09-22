@@ -111,6 +111,7 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
             host: host(),
             agent_version: "0.1.0".into(),
             capabilities: vec!["opaque_ref".into()],
+            preferred_profile: None,
             upload_base: std::env::temp_dir()
                 .join(format!("sentinel0-reconnect-{}", addr.port()))
                 .join("uploads"),
@@ -187,6 +188,7 @@ async fn established_session_loss_discards_old_handshake_backoff() {
             host: host(),
             agent_version: "0.1.0".into(),
             capabilities: vec![],
+            preferred_profile: None,
             upload_base: std::env::temp_dir()
                 .join(format!("sentinel0-reconnect-{}", addr.port()))
                 .join("uploads"),
@@ -259,6 +261,7 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() {
             host: host(),
             agent_version: "0.1.0".into(),
             capabilities: vec![],
+            preferred_profile: None,
             upload_base: std::env::temp_dir()
                 .join(format!("sentinel0-reconnect-{}", addr.port()))
                 .join("uploads"),
@@ -336,6 +339,7 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() {
             host: host(),
             agent_version: "0.1.0".into(),
             capabilities: vec![],
+            preferred_profile: None,
             upload_base: std::env::temp_dir()
                 .join(format!("sentinel0-reconnect-{}", addr.port()))
                 .join("uploads"),
@@ -371,6 +375,7 @@ async fn cancellation_interrupts_reconnect_sleep_immediately() {
             host: host(),
             agent_version: "0.1.0".into(),
             capabilities: vec![],
+            preferred_profile: None,
             upload_base: std::env::temp_dir().join("sentinel0-cancel-backoff/uploads"),
             reconnect: ReconnectPolicy {
                 steps: vec![Duration::from_secs(5)].into(),
@@ -419,6 +424,7 @@ async fn cancellation_interrupts_wait_for_welcome_immediately() {
             host: host(),
             agent_version: "0.1.0".into(),
             capabilities: vec![],
+            preferred_profile: None,
             upload_base: std::env::temp_dir().join("sentinel0-cancel-welcome/uploads"),
             reconnect: ReconnectPolicy {
                 steps: vec![Duration::ZERO].into(),

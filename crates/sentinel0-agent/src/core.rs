@@ -149,7 +149,59 @@ impl CoreDispatcher {
         ]))
     }
 
+    fn no_new_privileges() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                return status.lines().any(|line| {
+                    line.strip_prefix("NoNewPrivs:")
+                        .and_then(|rest| rest.split_whitespace().next())
+                        == Some("1")
+                });
+            }
+        }
+        false
+    }
+
+    fn unusable_commands_for(allowed_commands: &[String], no_new_privileges: bool) -> Value {
+        if !no_new_privileges {
+            return json!({});
+        }
+
+        let blocked = allowed_commands
+            .iter()
+            .filter(|command| {
+                let mut parts = command.split_whitespace();
+                let Some(first) = parts.next() else {
+                    return false;
+                };
+                command.as_str() == "sudo"
+                    || command.starts_with("sudo ")
+                    || first.contains("/sudo")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if blocked.is_empty() {
+            json!({})
+        } else {
+            json!({
+                "commands": blocked,
+                "reason": "no_new_privileges",
+                "detail": concat!(
+                    "This agent runs with NoNewPrivileges set, so sudo can never ",
+                    "elevate regardless of sudoers. These entries are in the allowlist ",
+                    "but will always fail. Either run the privileged step through a ",
+                    "service action, or have the operator install the agent without ",
+                    "that hardening -- not recommended -- or wrap the work in a ",
+                    "setuid-free helper the agent can call directly."
+                ),
+            })
+        }
+    }
+
     fn capabilities_result(&self, payload: &Map<String, Value>) -> HandlerResult {
+        let detail = crate::progressive_help::capabilities_detail(payload)?;
         let mut ops = self
             .capabilities()
             .into_iter()
@@ -203,7 +255,9 @@ impl CoreDispatcher {
             .map(|entry| Value::String(entry.path.display().to_string()))
             .collect::<Vec<_>>();
 
-        if payload.get("detail").and_then(Value::as_str) == Some("summary") {
+        if detail == "summary" {
+            let location_count = self.policy.locations.len()
+                + usize::from(!self.policy.locations.contains_key("config"));
             return Ok(BTreeMap::from([
                 ("agent".into(), Value::String("sentinelx-cloud-core".into())),
                 ("version".into(), Value::String(self.agent_version.clone())),
@@ -212,6 +266,8 @@ impl CoreDispatcher {
                     json!({
                         "hostname": host::hostname(),
                         "label": self.policy.hostname_label,
+                        "kernel": host::kernel(),
+                        "arch": std::env::consts::ARCH,
                     }),
                 ),
                 (
@@ -219,8 +275,66 @@ impl CoreDispatcher {
                     Value::Array(ops.into_iter().map(Value::String).collect()),
                 ),
                 (
-                    "policy_counts".into(),
-                    serde_json::to_value(self.policy.config_summary()).unwrap_or(Value::Null),
+                    "limits".into(),
+                    json!({
+                        "exec_timeout_default": self.policy.exec_timeout_default,
+                        "exec_timeout_max": self.policy.exec_timeout_max,
+                    }),
+                ),
+                (
+                    "upload_base".into(),
+                    Value::String(self.policy.upload_base.display().to_string()),
+                ),
+                (
+                    "file_ops_limits".into(),
+                    json!({
+                        "max_read_bytes": self.policy.file_ops_max_read_bytes,
+                        "max_list_entries": self.policy.file_ops_max_list_entries,
+                        "max_search_results": self.policy.file_ops_max_search_results,
+                    }),
+                ),
+                (
+                    "policy_summary".into(),
+                    json!({
+                        "allowed_commands": self.policy.allowed_commands.len(),
+                        "services": self.policy.services.len(),
+                        "locations": location_count,
+                        "playbooks": self.policy.playbooks.len(),
+                        "file_ops_paths": self.policy.file_ops_paths.len(),
+                        "writable_paths": self
+                            .policy
+                            .file_ops_paths
+                            .iter()
+                            .filter(|entry| entry.access == crate::policy::FileAccess::ReadWrite)
+                            .count(),
+                        "trusted_fetch_hosts": self.policy.trusted_fetch_hosts.len(),
+                    }),
+                ),
+                (
+                    "query_contract".into(),
+                    json!({
+                        "help": ["topic", "path", "playbook", "offset", "limit"],
+                        "capabilities_detail": ["summary", "full"],
+                        "max_page_limit": 100,
+                        "legacy_empty_payload": "full",
+                    }),
+                ),
+                (
+                    "next".into(),
+                    json!({
+                        "help_index": {
+                            "backend_operation": "help",
+                            "payload": {"topic": "index"},
+                        },
+                        "playbook": {
+                            "backend_operation": "help",
+                            "payload": {"playbook": "<name>"},
+                        },
+                        "full_capabilities": {
+                            "backend_operation": "capabilities",
+                            "payload": {"detail": "full"},
+                        },
+                    }),
                 ),
             ]));
         }
@@ -235,6 +349,23 @@ impl CoreDispatcher {
                     .map(|value| (name.clone(), value))
             })
             .collect::<Map<String, Value>>();
+
+        let mut locations = self
+            .policy
+            .locations
+            .iter()
+            .filter_map(|(name, value)| {
+                serde_json::to_value(value)
+                    .ok()
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<Map<String, Value>>();
+        locations.entry("config".into()).or_insert_with(|| {
+            json!({
+                "path": self.config_path.display().to_string(),
+                "description": "The agent's active config.yaml.",
+            })
+        });
 
         Ok(BTreeMap::from([
             ("agent".into(), Value::String("sentinelx-cloud-core".into())),
@@ -275,7 +406,15 @@ impl CoreDispatcher {
                 ),
             ),
             ("exec_strict".into(), Value::Bool(self.policy.exec_strict)),
+            (
+                "unusable_commands".into(),
+                Self::unusable_commands_for(
+                    &self.policy.allowed_commands,
+                    Self::no_new_privileges(),
+                ),
+            ),
             ("services".into(), Value::Object(services)),
+            ("locations".into(), Value::Object(locations)),
             ("playbooks".into(), Value::Object(playbooks)),
             (
                 "limits".into(),
@@ -450,94 +589,49 @@ impl CoreDispatcher {
     }
 
     fn help(&self, payload: &Map<String, Value>) -> HandlerResult {
-        let topic = payload.get("topic").and_then(Value::as_str);
-        if topic == Some("operations") {
-            return Ok(BTreeMap::from([
-                ("topic".into(), Value::String("operations".into())),
-                ("navigation".into(), Value::Object(self.help_navigation())),
-            ]));
-        }
-        if topic == Some("access") {
-            return Ok(BTreeMap::from([
-                ("topic".into(), Value::String("access".into())),
-                (
-                    "extending_access".into(),
-                    Value::Object(self.help_extending_access()),
-                ),
-            ]));
-        }
+        let paths = &self.policy.file_ops_paths;
+        let writable = paths
+            .iter()
+            .filter(|entry| entry.access == crate::policy::FileAccess::ReadWrite)
+            .count();
+        let playbook_names = self.policy.playbooks.keys().cloned().collect::<Vec<_>>();
 
-        if topic == Some("index") || topic == Some("playbooks") {
-            let offset = payload.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let limit = payload
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(50)
-                .clamp(1, 100) as usize;
-            let names = self.policy.playbooks.keys().cloned().collect::<Vec<_>>();
-            let page = names
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .cloned()
-                .map(Value::String)
-                .collect::<Vec<_>>();
-            let next = offset + page.len();
-            return Ok(BTreeMap::from([
-                (
-                    "topic".into(),
-                    Value::String(topic.unwrap_or("index").into()),
-                ),
-                (
-                    "topics".into(),
-                    json!({
-                        "security": "security model",
-                        "operations": "operation/navigation map",
-                        "access": "how to extend configured access",
-                        "playbooks": "configured workflows",
-                    }),
-                ),
-                (
-                    "playbooks".into(),
-                    json!({
-                        "names": page,
-                        "total": names.len(),
-                        "next_offset": (next < names.len()).then_some(next),
-                        "truncated": next < names.len(),
-                    }),
-                ),
-            ]));
-        }
-
-        if let Some(name) = payload.get("playbook").and_then(Value::as_str) {
-            let Some(definition) = self.policy.playbooks.get(name) else {
-                return Err(HandlerError::new(
-                    "not_found",
-                    format!("playbook not found: {name}"),
-                ));
-            };
-            return Ok(BTreeMap::from([
-                ("playbook".into(), Value::String(name.into())),
-                (
-                    "definition".into(),
-                    serde_json::to_value(definition).unwrap_or(Value::Null),
-                ),
-            ]));
-        }
-
-        Ok(BTreeMap::from([
+        let full = Map::from_iter([
+            ("agent".into(), Value::String("sentinelx-cloud-core".into())),
+            ("version".into(), Value::String(self.agent_version.clone())),
+            (
+                "host_label".into(),
+                self.policy
+                    .hostname_label
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            ),
             (
                 "summary".into(),
                 Value::String(
-                    "SentinelX provides policy-gated remote host operations over an authenticated outbound connection.".into(),
+                    "SentinelX provides policy-gated, auditable remote host operations over an authenticated outbound connection. The host policy and OS permissions are independent gates.".into(),
                 ),
             ),
             (
                 "security_model".into(),
                 json!({
-                    "two_layers": "SentinelX policy and OS permissions must both allow an action.",
-                    "permission_errors": "permission_denied means the policy allowed the path but the OS account could not access it.",
+                    "two_layers": "Every file/command/service action must pass both SentinelX policy and the agent OS account's permissions.",
+                    "allowlist_errors": "path_not_allowed, command_not_allowed and service_not_allowed mean the host policy refused the requested scope.",
+                    "permission_errors": "permission_denied means policy allowed the request but the operating-system account could not access the resource.",
+                    "sudo": "read/list/search never escalate; edit may use sudo when requested; move/copy/delete/chmod/chown never sudo.",
+                    "audit_transparency": "Operations are recorded in the host-local audit without storing file contents or command arguments.",
                 }),
+            ),
+            (
+                "operating_notes".into(),
+                json!([
+                    "Diagnose before mutating: prefer read/list/search and state first.",
+                    "For structured edits, use dry_run plus diff before applying risky changes.",
+                    "When an action is blocked, use the returned policy or permission error rather than guessing.",
+                    "Keep rollback paths for destructive or service-affecting changes.",
+                    "Use capabilities for exact policy detail and help for progressive orientation.",
+                ]),
             ),
             (
                 "navigation".into(),
@@ -548,19 +642,68 @@ impl CoreDispatcher {
                 Value::Object(self.help_extending_access()),
             ),
             (
+                "managing_hosts".into(),
+                json!({
+                    "add_a_host": "Install and enroll the SentinelX agent on the additional host; it joins the same account.",
+                    "update_this_agent": "Use the repository/installer maintenance path for the installed implementation, then restart the agent.",
+                    "targeting": "With multiple hosts, pass host_id on each operation or set a default host in the Hub integration.",
+                }),
+            ),
+            (
                 "playbooks".into(),
                 json!({
-                    "names": self.policy.playbooks.keys().collect::<Vec<_>>(),
+                    "what": "Named multi-step recipes declared by this host policy.",
+                    "names": playbook_names,
                     "count": self.policy.playbooks.len(),
                 }),
             ),
             (
-                "resources".into(),
+                "policy".into(),
                 json!({
-                    "source_and_issues": "https://github.com/codeandsolder/sentinelO2-cloud-core",
+                    "allowed_commands": self.policy.allowed_commands.len(),
+                    "file_ops_paths": paths.len(),
+                    "writable_paths": writable,
+                    "services": self.policy.services.len(),
+                    "locations": self.policy.locations.len() + usize::from(!self.policy.locations.contains_key("config")),
+                    "playbooks": self.policy.playbooks.len(),
+                    "trusted_fetch_hosts": self.policy.trusted_fetch_hosts.len(),
                 }),
             ),
-        ]))
+            (
+                "examples".into(),
+                json!([
+                    "Diagnose why a service is failing and show the evidence before changing it.",
+                    "Check disk usage and identify what is consuming space.",
+                    "Review a bounded slice of a log for suspicious events.",
+                    "Restart an allowlisted service and confirm it returned healthy.",
+                    "Explain which policy entry is needed for a blocked operation.",
+                ]),
+            ),
+            (
+                "getting_started".into(),
+                Value::String(
+                    "Start with capabilities for the effective policy and state for current host status. If something is blocked, use the returned error to determine whether policy or OS permissions need attention.".into(),
+                ),
+            ),
+            (
+                "resources".into(),
+                json!({
+                    "dashboard": "https://mcp.sentinelx.app/dashboard",
+                    "upstream": "https://github.com/pensados/sentinelx-cloud-core",
+                    "compatibility_fork": "https://github.com/codeandsolder/sentinelO2-cloud-core",
+                    "issues": "https://github.com/codeandsolder/sentinelO2-cloud-core/issues",
+                }),
+            ),
+            (
+                "about".into(),
+                json!({
+                    "project": "SentinelO2 is a Rust compatibility reimplementation of the SentinelX host agent.",
+                    "scope": "Match the hosted SentinelX protocol and Linux feature set while fixing implementation bugs rather than reproducing them.",
+                }),
+            ),
+        ]);
+
+        crate::progressive_help::select_help_response(payload, full, &self.policy.playbooks)
     }
 
     async fn exec(&self, payload: &Map<String, Value>) -> HandlerResult {
@@ -876,6 +1019,35 @@ mod tests {
             IMPLEMENTED_OPS.len()
         );
         assert!(capabilities.iter().any(|name| name == "local_api"));
+    }
+
+    #[test]
+    fn unusable_commands_reports_only_sudo_under_no_new_privileges() {
+        let commands = vec![
+            "sudo systemctl".to_owned(),
+            "/usr/bin/sudo -n true".to_owned(),
+            "echo".to_owned(),
+        ];
+        let value = CoreDispatcher::unusable_commands_for(&commands, true);
+        assert_eq!(value["reason"], "no_new_privileges");
+        assert_eq!(
+            value["commands"],
+            json!(["sudo systemctl", "/usr/bin/sudo -n true"])
+        );
+
+        assert_eq!(
+            CoreDispatcher::unusable_commands_for(&commands, false),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn unusable_commands_ignores_empty_and_whitespace_wildcards() {
+        let commands = vec!["".to_owned(), "   ".to_owned(), "echo".to_owned()];
+        assert_eq!(
+            CoreDispatcher::unusable_commands_for(&commands, true),
+            json!({})
+        );
     }
 
     #[test]

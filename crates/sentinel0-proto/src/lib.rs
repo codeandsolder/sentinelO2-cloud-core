@@ -267,13 +267,22 @@ impl Message {
         agent_version: impl Into<String>,
         capabilities: Vec<String>,
     ) -> Self {
+        Self::hello_with_profile(host, agent_version, capabilities, None)
+    }
+
+    pub fn hello_with_profile(
+        host: HostInfo,
+        agent_version: impl Into<String>,
+        capabilities: Vec<String>,
+        preferred_profile: Option<PreferredProfile>,
+    ) -> Self {
         Self::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             agent_version: agent_version.into(),
-            agent_name: Some("sentinel0".into()),
+            agent_name: Some("sentinelx-core".into()),
             host: Box::new(host),
             capabilities,
-            preferred_profile: None,
+            preferred_profile,
         }
     }
 }

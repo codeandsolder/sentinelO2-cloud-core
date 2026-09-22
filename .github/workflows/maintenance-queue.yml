@@ -389,3 +389,88 @@ jobs:
           )"
 
           gh issue create --repo "$REPO" --title "Rust ${VERSION}: full best-practices refresh" --label "automation:rust-release" --body "$body"
+
+
+  upstream-parity-queue:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Prepare upstream parity label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh label create "automation:upstream" --repo "$REPO" --color "fbca04" --description "Queued automatically when SentinelX upstream changes" --force
+
+      - name: Build upstream parity dossier
+        id: parity
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          if python3 .github/scripts/upstream-parity-report.py               --baseline .github/upstream-parity.json               --meta /tmp/upstream-meta.json               > /tmp/upstream-parity.md               2> /tmp/upstream-parity.err; then
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+            echo "changed=$(jq -r '.changed' /tmp/upstream-meta.json)" >> "$GITHUB_OUTPUT"
+          else
+            cat /tmp/upstream-parity.err
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Queue, refresh, or close upstream parity issue
+        if: steps.parity.outputs.failed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CHANGED: ${{ steps.parity.outputs.changed }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker="automation-upstream-parity"
+          existing="$(gh issue list --repo "$REPO" --state open --label "automation:upstream" --limit 50 --search "$marker in:body" --json number --jq '.[0].number // empty')"
+
+          if [[ "$CHANGED" == "true" ]]; then
+            core="$(jq -r '.core.head_version // "unknown"' /tmp/upstream-meta.json)"
+            proto="$(jq -r '.protocol.head_version // "unknown"' /tmp/upstream-meta.json)"
+            title="upstream parity: core ${core}, protocol ${proto}"
+            if [[ -n "$existing" ]]; then
+              gh issue edit "$existing" --repo "$REPO" --title "$title" --body-file /tmp/upstream-parity.md
+            else
+              gh issue create --repo "$REPO" --title "$title" --label "automation:upstream" --body-file /tmp/upstream-parity.md
+            fi
+          elif [[ -n "$existing" ]]; then
+            gh issue close "$existing" --repo "$REPO" --reason completed --comment "Closed automatically: the checked-in upstream parity baseline matches current upstream."
+          fi
+
+      - name: Report upstream parity detector failure
+        if: steps.parity.outputs.failed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker="automation-maintenance-error-upstream-parity"
+          existing="$(gh issue list --repo "$REPO" --state open --label "automation:maintenance-error" --limit 50 --search "$marker in:body" --json number --jq '.[0].number // empty')"
+          {
+            echo "<!-- ${marker} -->"
+            echo "<!-- automation-queue:maintenance-error -->"
+            echo
+            echo "The SentinelX upstream parity detector failed."
+            echo
+            echo "~~~~text"
+            tail -n 200 /tmp/upstream-parity.err 2>/dev/null || true
+            echo "~~~~"
+            echo
+            echo "Repair the detector so upstream core/protocol changes are again reduced to a prepared maintenance dossier."
+          } > /tmp/upstream-error.md
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --repo "$REPO" --body-file /tmp/upstream-error.md
+          else
+            gh issue create --repo "$REPO" --title "maintenance detector: upstream parity failed" --label "automation:maintenance-error" --body-file /tmp/upstream-error.md
+          fi
