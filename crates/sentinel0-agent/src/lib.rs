@@ -25,7 +25,6 @@ pub mod shell;
 pub mod staging;
 pub mod upload;
 
-use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -120,20 +119,18 @@ impl ReconnectPolicy {
     }
 }
 
-#[async_trait]
 pub trait Dispatcher: Send + Sync + 'static {
-    async fn dispatch(
+    fn dispatch(
         &self,
         id: &str,
         op: Op,
         payload: serde_json::Map<String, serde_json::Value>,
-    ) -> Message;
+    ) -> impl std::future::Future<Output = Message> + Send;
 }
 
 #[derive(Debug, Default)]
 pub struct UnsupportedDispatcher;
 
-#[async_trait]
 impl Dispatcher for UnsupportedDispatcher {
     async fn dispatch(
         &self,
