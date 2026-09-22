@@ -31,6 +31,15 @@ jobs:
       - name: Verify lockfile
         run: cargo +1.98.1 metadata --locked --format-version 1 >/dev/null
 
+  maintenance-scripts:
+    name: Maintenance scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Unit tests
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
   rust:
     name: Rust 1.98.1
     runs-on: ubuntu-24.04
@@ -91,7 +100,7 @@ jobs:
   release:
     name: Release binary
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lockfile, rust, msrv, fuzz-smoke]
+    needs: [lockfile, maintenance-scripts, rust, msrv, fuzz-smoke]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

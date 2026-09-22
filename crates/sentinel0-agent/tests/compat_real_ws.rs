@@ -3,7 +3,6 @@
     reason = "tungstenite fixes the handshake callback Result error type"
 )]
 
-use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{
@@ -280,7 +279,6 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() {
 #[derive(Debug, Default)]
 struct EchoDispatcher;
 
-#[async_trait]
 impl Dispatcher for EchoDispatcher {
     async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> Message {
         let mut result = BTreeMap::new();
@@ -362,7 +360,6 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
 #[derive(Debug, Default)]
 struct SlowDispatcher;
 
-#[async_trait]
 impl Dispatcher for SlowDispatcher {
     async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> Message {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -510,7 +507,6 @@ async fn held_job_completion_replays_after_welcome_and_is_cleared() {
 #[derive(Debug, Default)]
 struct JobDispatcher;
 
-#[async_trait]
 impl Dispatcher for JobDispatcher {
     async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> Message {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -829,7 +825,6 @@ async fn unrelated_application_traffic_does_not_mask_missing_heartbeat_pong() {
 #[derive(Debug, Default)]
 struct PanickingDispatcher;
 
-#[async_trait]
 impl Dispatcher for PanickingDispatcher {
     async fn dispatch(&self, _id: &str, _op: Op, _payload: Map<String, Value>) -> Message {
         panic!("intentional dispatcher panic fixture");

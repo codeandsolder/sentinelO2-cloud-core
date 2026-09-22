@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -282,9 +283,13 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def cli() -> int:
     try:
-        raise SystemExit(main())
-    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as exc:
+        return main()
+    except (OSError, KeyError, ValueError) as exc:
         print(f"upstream parity detector failed: {exc}", file=sys.stderr)
-        raise
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

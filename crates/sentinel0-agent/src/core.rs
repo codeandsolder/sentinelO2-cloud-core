@@ -5,7 +5,6 @@ use crate::{
     policy::Policy,
     segment, shell,
 };
-use async_trait::async_trait;
 use chrono::Utc;
 use sentinel0_proto::{Message, Op};
 use serde_json::{Map, Value, json};
@@ -887,7 +886,6 @@ impl CoreDispatcher {
     }
 }
 
-#[async_trait]
 impl Dispatcher for CoreDispatcher {
     async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> Message {
         if !IMPLEMENTED_OPS.contains(&op) || !self.op_enabled(op) {
