@@ -41,7 +41,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if ! cargo upgrade --incompatible allow --pinned allow > /tmp/cargo-upgrade.log 2>&1; then
+          if ! cargo upgrade --incompatible allow --pinned allow > /tmp/cargo-upgrade.log 2>&1 ||
+             ! cargo update >> /tmp/cargo-upgrade.log 2>&1; then
             cat /tmp/cargo-upgrade.log
             echo "failed=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -55,7 +56,8 @@ jobs:
             for dep in "${quarantined[@]}"; do
               exclude_args+=(--exclude "$dep")
             done
-            if ! cargo upgrade --incompatible allow --pinned allow "${exclude_args[@]}" >> /tmp/cargo-upgrade.log 2>&1; then
+            if ! cargo upgrade --incompatible allow --pinned allow "${exclude_args[@]}" >> /tmp/cargo-upgrade.log 2>&1 ||
+               ! cargo update >> /tmp/cargo-upgrade.log 2>&1; then
               cat /tmp/cargo-upgrade.log
               echo "failed=true" >> "$GITHUB_OUTPUT"
               exit 0
