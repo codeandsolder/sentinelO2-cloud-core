@@ -118,7 +118,7 @@ pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
             eprintln!("stdout write failed: {error}");
             return 3;
         }
-        return 0;
+        0
     }
 
     #[cfg(not(unix))]
