@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a compact, pre-digested SentinelX upstream parity report."""
+"""Build immutable, release-scoped SentinelX upstream parity dossiers."""
 
 from __future__ import annotations
 
@@ -9,13 +9,12 @@ import json
 import os
 import re
 import sys
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 API = "https://api.github.com"
-USER_AGENT = "sentinelo2-upstream-parity/1.0"
+USER_AGENT = "sentinelo2-upstream-parity/2.0"
 MAX_PATCH_PER_FILE = 5000
 MAX_PATCH_TOTAL = 32000
 MAX_CHANGELOG = 9000
@@ -54,24 +53,18 @@ def file_text(repo: str, path: str, ref: str) -> str:
     return base64.b64decode(payload["content"]).decode("utf-8", "replace")
 
 
-def first_core_version(changelog: str) -> str | None:
-    match = re.search(r"^##\s+(\d+\.\d+\.\d+)\b", changelog, re.M)
-    return match.group(1) if match else None
-
-
-def changelog_since(changelog: str, reviewed_version: str | None) -> str:
-    if not reviewed_version:
-        return changelog[:MAX_CHANGELOG]
-    marker = re.search(
-        rf"^##\s+{re.escape(reviewed_version)}\b", changelog, re.M
-    )
-    before = changelog[: marker.start()] if marker else changelog
-    return before[:MAX_CHANGELOG].rstrip()
-
-
-def protocol_version(pyproject: str) -> str | None:
+def package_version(pyproject: str) -> str | None:
     match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
     return match.group(1) if match else None
+
+
+def changelog_section(changelog: str, version: str) -> str:
+    start = re.search(rf"^##\s+{re.escape(version)}\b.*$", changelog, re.M)
+    if not start:
+        return ""
+    next_heading = re.search(r"^##\s+", changelog[start.end() :], re.M)
+    end = start.end() + next_heading.start() if next_heading else len(changelog)
+    return changelog[start.start() : end].strip()[:MAX_CHANGELOG]
 
 
 def classify(path: str) -> str:
@@ -108,24 +101,74 @@ def short_sha(value: str) -> str:
     return value[:12]
 
 
-def markdown_for_repo(label: str, cfg: dict, head: dict, delta: dict):
-    repo = cfg["repo"]
-    old = cfg["reviewed_sha"]
-    new = head["sha"]
+def release_points(component: str, cfg: dict, head_sha: str) -> tuple[list[dict], int]:
+    """Return version-bump commits after the reviewed baseline, in commit order."""
+    if head_sha == cfg["reviewed_sha"]:
+        return [], 0
+
+    overall = compare(cfg["repo"], cfg["reviewed_sha"], head_sha)
+    if overall.get("status") not in {"ahead", "identical"}:
+        raise ValueError(
+            f"{component} baseline is not an ancestor of upstream head: "
+            f"{overall.get('status', 'unknown')}"
+        )
+
+    commits = overall.get("commits") or []
+    previous_version = cfg.get("reviewed_version")
+    previous_sha = cfg["reviewed_sha"]
+    releases: list[dict] = []
+
+    for commit in commits:
+        sha = commit["sha"]
+        version = package_version(file_text(cfg["repo"], "pyproject.toml", sha))
+        if not version or version == previous_version:
+            continue
+
+        releases.append(
+            {
+                "component": component,
+                "repo": cfg["repo"],
+                "previous_version": previous_version,
+                "previous_sha": previous_sha,
+                "version": version,
+                "release_sha": sha,
+                "subject": commit["commit"]["message"].splitlines()[0],
+            }
+        )
+        previous_version = version
+        previous_sha = sha
+
+    return releases, len(commits)
+
+
+def markdown_for_release(release: dict, delta: dict, changelog: str) -> str:
+    repo = release["repo"]
+    old = release["previous_sha"]
+    new = release["release_sha"]
+    component = release["component"]
+    version = release["version"]
     files = delta.get("files") or []
     commits = delta.get("commits") or []
 
     lines = [
-        f"### {label}",
+        f"<!-- automation-upstream-release:{component}:{version} -->",
+        "<!-- automation-queue:upstream-parity -->",
+        "",
+        f"# SentinelX upstream {component} {version}",
+        "",
+        "This issue is an immutable release-scoped port/review dossier. "
+        "It should be closed by the SentinelO² update commit that ports or explicitly reviews this release.",
         "",
         f"- Repository: {repo}",
-        f"- Reviewed SHA: {short_sha(old)}",
-        f"- Current SHA: {short_sha(new)}",
+        f"- Previous reviewed release: {release.get('previous_version') or '?'} ({short_sha(old)})",
+        f"- Release: {version} ({short_sha(new)})",
+        f"- Release commit subject: {release['subject']}",
         f"- Compare: https://github.com/{repo}/compare/{old}...{new}",
         f"- Compare status: {delta.get('status', 'unknown')}",
         "",
-        "#### Commits",
+        "## Commits in this release delta",
     ]
+
     if commits:
         for commit in commits:
             sha = commit["sha"]
@@ -142,7 +185,7 @@ def markdown_for_repo(label: str, cfg: dict, head: dict, delta: dict):
         grouped.setdefault(classify(item["filename"]), []).append(item["filename"])
         by_name[item["filename"]] = item
 
-    lines += ["", "#### Changed files"]
+    lines += ["", "## Changed files"]
     if not files:
         lines.append("- No changed files returned.")
     for category in sorted(grouped):
@@ -150,136 +193,108 @@ def markdown_for_repo(label: str, cfg: dict, head: dict, delta: dict):
         for path in grouped[category]:
             item = by_name[path]
             lines.append(
-                f"  - {path} ({item.get('status', '?')}, +{item.get('additions', 0)}/-{item.get('deletions', 0)})"
+                f"  - {path} ({item.get('status', '?')}, "
+                f"+{item.get('additions', 0)}/-{item.get('deletions', 0)})"
             )
 
-    return "\n".join(lines), files
+    if changelog:
+        lines += ["", "## Release notes", "", changelog]
+
+    patch_budget = MAX_PATCH_TOTAL
+    patches = []
+    for item in files:
+        path = item["filename"]
+        patch = item.get("patch")
+        if not patch or not relevant_for_patch(path) or patch_budget <= 0:
+            continue
+        clipped = patch[: min(MAX_PATCH_PER_FILE, patch_budget)]
+        patch_budget -= len(clipped)
+        patches.append((path, clipped, len(patch) > len(clipped)))
+
+    if patches:
+        lines += ["", "## Relevant patch excerpts"]
+        for path, patch, clipped in patches:
+            lines += ["", f"### {repo}:{path}", "~~~~diff", patch]
+            if clipped:
+                lines.append("\n# ... patch clipped by detector ...")
+            lines.append("~~~~")
+
+    lines += [
+        "",
+        "## Maintenance checklist",
+        "",
+        "- Review every changed behavior and upstream regression test in this release delta.",
+        "- Port Linux/cross-platform behavior unless there is a documented intentional divergence.",
+        "- Platform-specific changes may be marked not-applicable only after checking shared wire/config semantics.",
+        "- Prefer translating upstream regression tests with each behavior port.",
+        "- Re-run protocol fixtures/differentials, stable CI, MSRV, fuzz and real-WebSocket tests.",
+        "- Update COMPATIBILITY.md and the project Notion summary for material differences.",
+        f"- Advance only the `{component}` entry in `.github/upstream-parity.json` "
+        f"to version `{version}` and SHA `{new}` in the commit that resolves this issue.",
+        "- Use `Closes #<this issue>` in that update commit/PR so the release issue closes when the commit lands on main.",
+        "- Record intentional non-ports next to the compatibility baseline so they are not rediscovered.",
+        "",
+        "Do not refresh this issue for later upstream commits or releases. A later release gets a new issue.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", default=".github/upstream-parity.json", type=Path)
     parser.add_argument("--meta", required=True, type=Path)
+    parser.add_argument("--out-dir", required=True, type=Path)
     args = parser.parse_args()
 
     baseline = json.loads(args.baseline.read_text())
-    core_cfg = baseline["core"]
-    proto_cfg = baseline["protocol"]
+    args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    core_head = repo_head(core_cfg["repo"], core_cfg.get("branch", "main"))
-    proto_head = repo_head(proto_cfg["repo"], proto_cfg.get("branch", "main"))
-    core_changed = core_head["sha"] != core_cfg["reviewed_sha"]
-    proto_changed = proto_head["sha"] != proto_cfg["reviewed_sha"]
+    meta = {"releases": [], "components": {}}
+    for component in ("core", "protocol"):
+        cfg = baseline[component]
+        head = repo_head(cfg["repo"], cfg.get("branch", "main"))
+        releases, commits_since_review = release_points(component, cfg, head["sha"])
 
-    core_delta = (
-        compare(core_cfg["repo"], core_cfg["reviewed_sha"], core_head["sha"])
-        if core_changed
-        else {"status": "identical", "commits": [], "files": []}
-    )
-    proto_delta = (
-        compare(proto_cfg["repo"], proto_cfg["reviewed_sha"], proto_head["sha"])
-        if proto_changed
-        else {"status": "identical", "commits": [], "files": []}
-    )
+        current_version = package_version(
+            file_text(cfg["repo"], "pyproject.toml", head["sha"])
+        )
+        meta["components"][component] = {
+            "repo": cfg["repo"],
+            "reviewed_sha": cfg["reviewed_sha"],
+            "reviewed_version": cfg.get("reviewed_version"),
+            "head_sha": head["sha"],
+            "head_version": current_version,
+            "commits_since_review": commits_since_review,
+            "release_count": len(releases),
+        }
 
-    core_changelog = file_text(core_cfg["repo"], "CHANGELOG.md", core_head["sha"])
-    core_version = first_core_version(core_changelog)
-    proto_pyproject = file_text(proto_cfg["repo"], "pyproject.toml", proto_head["sha"])
-    proto_version = protocol_version(proto_pyproject)
+        for release in releases:
+            delta = compare(
+                release["repo"], release["previous_sha"], release["release_sha"]
+            )
+            changelog = ""
+            try:
+                text = file_text(release["repo"], "CHANGELOG.md", release["release_sha"])
+                changelog = changelog_section(text, release["version"])
+            except (OSError, KeyError, ValueError):
+                # Some upstreams do not carry a changelog. The release commit,
+                # changed files and patch excerpts are still sufficient.
+                pass
 
-    changed = core_changed or proto_changed
-    meta = {
-        "changed": changed,
-        "core": {
-            "repo": core_cfg["repo"],
-            "reviewed_sha": core_cfg["reviewed_sha"],
-            "head_sha": core_head["sha"],
-            "reviewed_version": core_cfg.get("reviewed_version"),
-            "head_version": core_version,
-        },
-        "protocol": {
-            "repo": proto_cfg["repo"],
-            "reviewed_sha": proto_cfg["reviewed_sha"],
-            "head_sha": proto_head["sha"],
-            "reviewed_version": proto_cfg.get("reviewed_version"),
-            "head_version": proto_version,
-        },
-    }
+            safe_version = re.sub(r"[^A-Za-z0-9._-]+", "_", release["version"])
+            body = args.out_dir / f"{component}-{safe_version}.md"
+            body.write_text(markdown_for_release(release, delta, changelog))
+            marker = f"automation-upstream-release:{component}:{release['version']}"
+            meta["releases"].append(
+                {
+                    **release,
+                    "marker": marker,
+                    "title": f"upstream {component} {release['version']} parity",
+                    "body_file": str(body),
+                }
+            )
+
     args.meta.write_text(json.dumps(meta, indent=2) + "\n")
-
-    print("<!-- automation-upstream-parity -->")
-    print("<!-- automation-queue:upstream-parity -->")
-    print()
-    print("# SentinelX upstream parity delta")
-    print()
-    print(
-        "Generated from the last reviewed upstream SHAs in .github/upstream-parity.json. "
-        "This is a prepared port/review dossier, not a request to rediscover upstream history."
-    )
-    print()
-    print(
-        f"Core: {core_cfg.get('reviewed_version', '?')} -> {core_version or '?'}. "
-        f"Protocol: {proto_cfg.get('reviewed_version', '?')} -> {proto_version or '?'}."
-    )
-    print()
-
-    core_md, core_files = markdown_for_repo(
-        "sentinelx-cloud-core", core_cfg, core_head, core_delta
-    )
-    proto_md, proto_files = markdown_for_repo(
-        "sentinelx-cloud-protocol", proto_cfg, proto_head, proto_delta
-    )
-    print(core_md)
-    print()
-    print(proto_md)
-
-    release_delta = changelog_since(core_changelog, core_cfg.get("reviewed_version"))
-    if release_delta:
-        print()
-        print("## Upstream changelog since reviewed release")
-        print()
-        print(release_delta)
-
-    patch_budget = MAX_PATCH_TOTAL
-    patches = []
-    for repo, files in (
-        (core_cfg["repo"], core_files),
-        (proto_cfg["repo"], proto_files),
-    ):
-        for item in files:
-            path = item["filename"]
-            patch = item.get("patch")
-            if not patch or not relevant_for_patch(path) or patch_budget <= 0:
-                continue
-            clipped = patch[: min(MAX_PATCH_PER_FILE, patch_budget)]
-            patch_budget -= len(clipped)
-            patches.append((repo, path, clipped, len(patch) > len(clipped)))
-
-    if patches:
-        print()
-        print("## Relevant patch excerpts")
-        for repo, path, patch, clipped in patches:
-            print()
-            print(f"### {repo}:{path}")
-            print("~~~~diff")
-            print(patch)
-            if clipped:
-                print("\n# ... patch clipped by detector ...")
-            print("~~~~")
-
-    print()
-    print("## Maintenance checklist")
-    print()
-    print("- Review every changed core/protocol behavior and upstream test.")
-    print("- Port Linux/cross-platform behavior unless there is a documented intentional divergence.")
-    print("- Platform-specific changes may be marked not-applicable only after checking shared wire/config semantics.")
-    print("- Prefer translating upstream regression tests with each behavior port.")
-    print("- Re-run protocol fixtures/differentials, stable CI, MSRV, fuzz and real-WebSocket tests.")
-    print("- Update COMPATIBILITY.md and the project Notion summary for material differences.")
-    print("- When resolved, advance .github/upstream-parity.json to the exact current SHAs/versions shown above.")
-    print("- Record intentional non-ports next to the baseline so the same delta is not investigated again.")
-    print()
-    print("This same issue is refreshed if upstream advances before the current range is reviewed.")
     return 0
 
 
