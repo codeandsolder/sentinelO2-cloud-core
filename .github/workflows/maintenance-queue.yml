@@ -47,6 +47,27 @@ jobs:
             exit 0
           fi
 
+          mapfile -t quarantined < <(python3 .github/scripts/cargo-release-quarantine.py manifest --hours 72)
+          if (( ${#quarantined[@]} )); then
+            printf 'Quarantining fresh direct dependencies: %s\\n' "${quarantined[*]}"
+            git reset --hard HEAD
+            exclude_args=()
+            for dep in "${quarantined[@]}"; do
+              exclude_args+=(--exclude "$dep")
+            done
+            if ! cargo upgrade --incompatible allow --pinned allow "${exclude_args[@]}" >> /tmp/cargo-upgrade.log 2>&1; then
+              cat /tmp/cargo-upgrade.log
+              echo "failed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if ! python3 .github/scripts/cargo-release-quarantine.py lockfile --hours 72; then
+            echo "quarantined=true" >> "$GITHUB_OUTPUT"
+            git reset --hard HEAD
+            exit 0
+          fi
+
           python3 <<'PY'
           import json
           import subprocess
@@ -117,7 +138,7 @@ jobs:
           git reset --hard HEAD
 
       - name: Queue manifest dependency issues
-        if: steps.manifest.outputs.failed != 'true'
+        if: steps.manifest.outputs.failed != 'true' && steps.manifest.outputs.quarantined != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -208,6 +229,12 @@ jobs:
             echo "failed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          if ! python3 .github/scripts/cargo-release-quarantine.py lockfile --hours 72; then
+            echo "quarantined=true" >> "$GITHUB_OUTPUT"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            git reset --hard HEAD
+            exit 0
+          fi
           if git diff --quiet -- Cargo.lock; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
@@ -217,7 +244,7 @@ jobs:
           git reset --hard HEAD
 
       - name: Queue or close lockfile refresh issue
-        if: steps.manifest.outputs.failed != 'true' && steps.lockfile.outputs.failed != 'true'
+        if: steps.manifest.outputs.failed != 'true' && steps.lockfile.outputs.failed != 'true' && steps.lockfile.outputs.quarantined != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -299,12 +326,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION="$({
-            curl -fsSL https://static.rust-lang.org/dist/channel-rust-stable.toml
-          } | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          curl -fsSL https://static.rust-lang.org/dist/channel-rust-stable.toml -o /tmp/rust-stable.toml
+          read -r VERSION RELEASE_DATE ELIGIBLE < <(python3 - <<'PY'
+          import datetime as dt
+          import tomllib
+          with open("/tmp/rust-stable.toml", "rb") as f:
+              data = tomllib.load(f)
+          version = data["pkg"]["rust"]["version"].split()[0]
+          release_date = dt.date.fromisoformat(data["date"])
+          # The manifest has date precision only. Waiting until UTC midnight
+          # four dates later guarantees at least 72 hours even if publication
+          # happened at the very end of the release date.
+          eligible_at = dt.datetime.combine(
+              release_date + dt.timedelta(days=4),
+              dt.time.min,
+              tzinfo=dt.timezone.utc,
+          )
+          eligible = dt.datetime.now(dt.timezone.utc) >= eligible_at
+          print(version, release_date.isoformat(), "yes" if eligible else "no")
+          PY
+          )
 
           test -n "$VERSION"
-          echo "Current stable Rust: $VERSION"
+          echo "Current stable Rust: $VERSION (release date $RELEASE_DATE)"
+          if [[ "$ELIGIBLE" != "yes" ]]; then
+            echo "Rust $VERSION is still inside the 72-hour release quarantine"
+            exit 0
+          fi
 
           gh label create "automation:rust-release" --repo "$REPO" --color "8250df" --description "Queued automatically when stable Rust changes" --force
 
