@@ -1,5 +1,8 @@
-use sentinel0_agent::{MAX_RETRY_AFTER, ReconnectPolicy, parse_retry_after};
-use std::{sync::Arc, time::Duration};
+use sentinel0_agent::{
+    AgentConfig, AuthToken, ConfigError, MAX_RETRY_AFTER, ReconnectPolicy, parse_retry_after,
+};
+use sentinel0_proto::HostInfo;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[test]
 fn retry_after_parses_semicolon_and_comma_forms() {
@@ -73,4 +76,68 @@ fn jitter_never_exceeds_selected_window() {
     for _ in 0..256 {
         assert!(policy.delay(0) <= Duration::from_millis(50));
     }
+}
+
+fn valid_config() -> AgentConfig {
+    AgentConfig {
+        hub_ws_base: "wss://example.invalid".into(),
+        token: AuthToken::new("token"),
+        host: HostInfo {
+            id: "host".into(),
+            hostname: "host".into(),
+            os: "linux".into(),
+            kernel: None,
+            arch: None,
+            cpu_model: None,
+            cpu_cores: None,
+            mem_total_bytes: None,
+            disk_total_bytes: None,
+            machine_type: None,
+            distro: None,
+            config_summary: None,
+        },
+        agent_version: "test".into(),
+        capabilities: vec![],
+        upload_base: PathBuf::from("/tmp/uploads"),
+        reconnect: ReconnectPolicy::default(),
+        connect_timeout: Duration::from_secs(15),
+        welcome_timeout: Duration::from_secs(10),
+        heartbeat_interval: Duration::from_secs(30),
+        heartbeat_timeout: Duration::from_secs(90),
+    }
+}
+
+#[test]
+fn valid_agent_config_passes_validation() {
+    assert_eq!(valid_config().validate(), Ok(()));
+}
+
+#[test]
+fn zero_heartbeat_interval_is_rejected_before_tokio_interval_can_panic() {
+    let mut config = valid_config();
+    config.heartbeat_interval = Duration::ZERO;
+    assert_eq!(
+        config.validate(),
+        Err(ConfigError::ZeroDuration("heartbeat_interval"))
+    );
+}
+
+#[test]
+fn heartbeat_timeout_must_exceed_interval() {
+    let mut config = valid_config();
+    config.heartbeat_timeout = config.heartbeat_interval;
+    assert_eq!(
+        config.validate(),
+        Err(ConfigError::HeartbeatTimeoutTooShort)
+    );
+}
+
+#[test]
+fn empty_or_header_invalid_tokens_are_rejected_at_startup() {
+    let mut config = valid_config();
+    config.token = AuthToken::new("");
+    assert_eq!(config.validate(), Err(ConfigError::EmptyToken));
+
+    config.token = AuthToken::new("bad\nheader");
+    assert_eq!(config.validate(), Err(ConfigError::InvalidTokenHeader));
 }

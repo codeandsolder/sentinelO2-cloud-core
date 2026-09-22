@@ -133,7 +133,7 @@ async fn enrollment_rejected_is_retryable_and_recovers_without_restart() {
         let _ = second.close(None).await;
     });
 
-    let agent = Agent::new(config(addr), UnsupportedDispatcher);
+    let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
         .expect("enrollment rejection did not retry")
@@ -163,7 +163,7 @@ async fn other_pre_welcome_error_is_fatal_and_does_not_retry() {
         .unwrap();
     });
 
-    let agent = Agent::new(config(addr), UnsupportedDispatcher);
+    let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
     let error = tokio::time::timeout(
         Duration::from_millis(100),
         agent.run(CancellationToken::new()),
@@ -237,7 +237,7 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() {
         let _ = ws.close(None).await;
     });
 
-    let agent = Agent::new(config(addr), UnsupportedDispatcher);
+    let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
         .unwrap()
@@ -321,7 +321,7 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         let _ = ws.close(None).await;
     });
 
-    let agent = Agent::new(config(addr), EchoDispatcher);
+    let agent = Agent::new(config(addr), EchoDispatcher).unwrap();
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
         .unwrap()
@@ -413,7 +413,7 @@ async fn slow_request_does_not_block_ping_handling() {
         let _ = ws.close(None).await;
     });
 
-    let agent = Agent::new(config(addr), SlowDispatcher);
+    let agent = Agent::new(config(addr), SlowDispatcher).unwrap();
     tokio::time::timeout(Duration::from_millis(600), agent.run(cancel.clone()))
         .await
         .unwrap()
@@ -464,7 +464,7 @@ async fn held_job_completion_replays_after_welcome_and_is_cleared() {
 
     let mut cfg = config(addr);
     cfg.upload_base = upload_base;
-    let agent = Agent::new(cfg, UnsupportedDispatcher);
+    let agent = Agent::new(cfg, UnsupportedDispatcher).unwrap();
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
         .unwrap()
@@ -572,7 +572,7 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
 
     let mut cfg = config(addr);
     cfg.upload_base = upload_base.clone();
-    let agent = Agent::new(cfg, JobDispatcher);
+    let agent = Agent::new(cfg, JobDispatcher).unwrap();
     tokio::time::timeout(Duration::from_millis(1200), agent.run(cancel.clone()))
         .await
         .unwrap()
@@ -680,7 +680,7 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
     let mut cfg = config(addr);
     cfg.upload_base = upload_base.clone();
     cfg.welcome_timeout = Duration::from_millis(900);
-    let agent = Agent::new(cfg, JobDispatcher);
+    let agent = Agent::new(cfg, JobDispatcher).unwrap();
     tokio::time::timeout(Duration::from_millis(1800), agent.run(cancel.clone()))
         .await
         .unwrap()
@@ -734,7 +734,7 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
     let mut cfg = config(addr);
     cfg.heartbeat_interval = Duration::from_millis(10);
     cfg.heartbeat_timeout = Duration::from_millis(30);
-    let agent = Agent::new(cfg, UnsupportedDispatcher);
+    let agent = Agent::new(cfg, UnsupportedDispatcher).unwrap();
 
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
@@ -787,8 +787,128 @@ async fn unrelated_application_traffic_does_not_mask_missing_heartbeat_pong() {
     let mut cfg = config(addr);
     cfg.heartbeat_interval = Duration::from_millis(10);
     cfg.heartbeat_timeout = Duration::from_millis(30);
-    let agent = Agent::new(cfg, UnsupportedDispatcher);
+    let agent = Agent::new(cfg, UnsupportedDispatcher).unwrap();
 
+    tokio::time::timeout(Duration::from_millis(250), agent.run(cancel.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[derive(Debug, Default)]
+struct PanickingDispatcher;
+
+#[async_trait]
+impl Dispatcher for PanickingDispatcher {
+    async fn dispatch(&self, _id: &str, _op: Op, _payload: Map<String, Value>) -> Message {
+        panic!("intentional dispatcher panic fixture");
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_panic_becomes_internal_error_without_killing_socket_loop() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let server_cancel = cancel.clone();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_agent(&listener).await;
+        welcome(&mut ws, "sess_panic").await;
+
+        ws.send(WsMessage::Text(
+            json!({
+                "type":"request",
+                "id":"req_panic",
+                "op":"state",
+                "payload":{},
+                "deadline":null,
+                "opaque_ref":null
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_millis(150), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WsMessage::Text(reply) = reply else {
+            panic!("expected response");
+        };
+        let Message::Response { ok, error, .. } = serde_json::from_str::<Message>(&reply).unwrap()
+        else {
+            panic!("expected response message");
+        };
+        assert!(!ok);
+        assert_eq!(error.unwrap().code, "internal_error");
+
+        ws.send(WsMessage::Text(
+            serde_json::to_string(&Message::Ping {
+                timestamp: Utc::now(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let pong = tokio::time::timeout(Duration::from_millis(100), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Message>(match &pong {
+                WsMessage::Text(text) => text,
+                _ => panic!("expected text pong"),
+            })
+            .unwrap(),
+            Message::Pong { .. }
+        ));
+
+        server_cancel.cancel();
+        let _ = ws.close(None).await;
+    });
+
+    let agent = Agent::new(config(addr), PanickingDispatcher).unwrap();
+    tokio::time::timeout(Duration::from_millis(300), agent.run(cancel.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn inbound_websocket_control_ping_is_answered_without_native_keepalive_timer() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let server_cancel = cancel.clone();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_agent(&listener).await;
+        welcome(&mut ws, "sess_control_ping").await;
+
+        ws.send(WsMessage::Ping(vec![1, 2, 3, 4].into()))
+            .await
+            .unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_millis(100), ws.next())
+            .await
+            .expect("tungstenite did not emit automatic control pong")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reply, WsMessage::Pong(ref payload) if payload.as_ref() == [1, 2, 3, 4]));
+
+        server_cancel.cancel();
+        let _ = ws.close(None).await;
+    });
+
+    let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
     tokio::time::timeout(Duration::from_millis(250), agent.run(cancel.clone()))
         .await
         .unwrap()

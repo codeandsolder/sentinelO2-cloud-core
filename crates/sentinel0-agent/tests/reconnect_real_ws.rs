@@ -124,7 +124,8 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
             heartbeat_timeout: Duration::from_secs(90),
         },
         UnsupportedDispatcher,
-    );
+    )
+    .unwrap();
 
     tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
@@ -206,7 +207,8 @@ async fn established_session_loss_discards_old_handshake_backoff() {
             heartbeat_timeout: Duration::from_secs(90),
         },
         UnsupportedDispatcher,
-    );
+    )
+    .unwrap();
 
     tokio::time::timeout(Duration::from_millis(150), agent.run(cancel.clone()))
         .await
@@ -270,7 +272,8 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() {
             heartbeat_timeout: Duration::from_secs(90),
         },
         UnsupportedDispatcher,
-    );
+    )
+    .unwrap();
 
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
@@ -346,11 +349,98 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() {
             heartbeat_timeout: Duration::from_millis(25),
         },
         UnsupportedDispatcher,
-    );
+    )
+    .unwrap();
 
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
         .expect("silent established peer did not trigger heartbeat recovery")
         .unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_reconnect_sleep_immediately() {
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+
+    let agent = Agent::new(
+        AgentConfig {
+            hub_ws_base: "ws://127.0.0.1:9".into(),
+            token: AuthToken::new("test-token"),
+            host: host(),
+            agent_version: "0.1.0".into(),
+            capabilities: vec![],
+            upload_base: std::env::temp_dir().join("sentinel0-cancel-backoff/uploads"),
+            reconnect: ReconnectPolicy {
+                steps: vec![Duration::from_secs(5)].into(),
+                jitter: false,
+            },
+            connect_timeout: Duration::from_millis(100),
+            welcome_timeout: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(30),
+            heartbeat_timeout: Duration::from_secs(90),
+        },
+        UnsupportedDispatcher,
+    )
+    .unwrap();
+
+    let task = tokio::spawn(async move { agent.run(cancel_for_task).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    cancel.cancel();
+
+    tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("cancellation waited for the full reconnect delay")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_wait_for_welcome_immediately() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let agent_cancel = cancel.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+            .await
+            .unwrap();
+        let _hello = ws.next().await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    });
+
+    let agent = Agent::new(
+        AgentConfig {
+            hub_ws_base: format!("ws://{addr}"),
+            token: AuthToken::new("test-token"),
+            host: host(),
+            agent_version: "0.1.0".into(),
+            capabilities: vec![],
+            upload_base: std::env::temp_dir().join("sentinel0-cancel-welcome/uploads"),
+            reconnect: ReconnectPolicy {
+                steps: vec![Duration::ZERO].into(),
+                jitter: false,
+            },
+            connect_timeout: Duration::from_millis(100),
+            welcome_timeout: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_secs(30),
+            heartbeat_timeout: Duration::from_secs(90),
+        },
+        UnsupportedDispatcher,
+    )
+    .unwrap();
+
+    let task = tokio::spawn(async move { agent.run(agent_cancel).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    cancel.cancel();
+
+    tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("cancellation waited for the welcome timeout")
+        .unwrap()
+        .unwrap();
+    server.abort();
 }

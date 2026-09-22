@@ -1,0 +1,27 @@
+[package]
+name = "sentinel0-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sentinel0-proto = { path = "../crates/sentinel0-proto" }
+serde_json = "1"
+
+[[bin]]
+name = "protocol_json"
+path = "fuzz_targets/protocol_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "binary_frame"
+path = "fuzz_targets/binary_frame.rs"
+test = false
+doc = false
+bench = false

@@ -213,11 +213,9 @@ pub fn bound_response(response: &mut Value, soft_limit: usize) -> Option<Value> 
         }
 
         let mut meta = truncation_meta(original, response);
-        response
-            .get_mut("result")
-            .and_then(Value::as_object_mut)
-            .expect("result was normalized to an object")
-            .insert(TRUNCATION_KEY.into(), meta.clone());
+        if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
+            result.insert(TRUNCATION_KEY.into(), meta.clone());
+        }
 
         let delivered = serialized_size(response);
         if let Some(object) = meta.as_object_mut() {

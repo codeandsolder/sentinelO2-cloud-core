@@ -1,21 +1,30 @@
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 pub mod jobs;
 pub mod pending_results;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
 use rand::Rng;
 use sentinel0_proto::{HostInfo, Message, Op, bounding::bound_response_default};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, panic::AssertUnwindSafe, path::PathBuf, sync::Arc, time::Duration,
+};
 use tokio::{
     sync::mpsc,
+    task::JoinSet,
     time::{Instant, interval, sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{self, Message as WsMessage, protocol::frame::coding::CloseCode},
+    connect_async_with_config,
+    tungstenite::{
+        self, Message as WsMessage,
+        protocol::{WebSocketConfig, frame::coding::CloseCode},
+    },
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -122,6 +131,49 @@ impl Dispatcher for UnsupportedDispatcher {
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("hub WebSocket base URL must not be empty")]
+    EmptyHubUrl,
+    #[error("authorization token must not be empty")]
+    EmptyToken,
+    #[error("authorization token cannot be represented as an HTTP header")]
+    InvalidTokenHeader,
+    #[error("{0} must be greater than zero")]
+    ZeroDuration(&'static str),
+    #[error("heartbeat_timeout must be greater than heartbeat_interval")]
+    HeartbeatTimeoutTooShort,
+}
+
+impl AgentConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.hub_ws_base.trim().is_empty() {
+            return Err(ConfigError::EmptyHubUrl);
+        }
+        if self.token.0.is_empty() {
+            return Err(ConfigError::EmptyToken);
+        }
+        self.token
+            .bearer_header()
+            .map_err(|_| ConfigError::InvalidTokenHeader)?;
+
+        for (name, value) in [
+            ("connect_timeout", self.connect_timeout),
+            ("welcome_timeout", self.welcome_timeout),
+            ("heartbeat_interval", self.heartbeat_interval),
+            ("heartbeat_timeout", self.heartbeat_timeout),
+        ] {
+            if value.is_zero() {
+                return Err(ConfigError::ZeroDuration(name));
+            }
+        }
+        if self.heartbeat_timeout <= self.heartbeat_interval {
+            return Err(ConfigError::HeartbeatTimeoutTooShort);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AgentError {
@@ -161,28 +213,31 @@ pub struct Agent<D> {
 }
 
 impl<D: Dispatcher> Agent<D> {
-    pub fn new(config: AgentConfig, dispatcher: D) -> Self {
-        Self {
+    pub fn new(config: AgentConfig, dispatcher: D) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self {
             config,
             dispatcher: Arc::new(dispatcher),
-        }
+        })
     }
 
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), AgentError> {
         let mut attempt = 0usize;
         let mut retry_hint = None;
+        let mut tasks = JoinSet::new();
+
         while !cancel.is_cancelled() {
             let delay = retry_hint
                 .take()
                 .unwrap_or_else(|| self.config.reconnect.delay(attempt));
             if !delay.is_zero() {
                 tokio::select! {
-                    _ = cancel.cancelled() => return Ok(()),
+                    _ = cancel.cancelled() => break,
                     _ = sleep(delay) => {}
                 }
             }
 
-            match self.serve_one(&cancel).await {
+            match self.serve_one(&cancel, &mut tasks).await {
                 Ok(SessionEnd::Clean) => {
                     attempt = 0;
                 }
@@ -208,10 +263,23 @@ impl<D: Dispatcher> Agent<D> {
                 }
             }
         }
+
+        tasks.abort_all();
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                if !error.is_cancelled() {
+                    warn!(?error, "request task failed during shutdown");
+                }
+            }
+        }
         Ok(())
     }
 
-    async fn serve_one(&self, cancel: &CancellationToken) -> Result<SessionEnd, AgentError> {
+    async fn serve_one(
+        &self,
+        cancel: &CancellationToken,
+        tasks: &mut JoinSet<()>,
+    ) -> Result<SessionEnd, AgentError> {
         let url = format!(
             "{}/agent/connect",
             self.config.hub_ws_base.trim_end_matches('/')
@@ -219,9 +287,14 @@ impl<D: Dispatcher> Agent<D> {
         let mut req = url.into_client_request()?;
         req.headers_mut()
             .insert(AUTHORIZATION, self.config.token.bearer_header()?);
-        let (mut ws, _) = timeout(self.config.connect_timeout, connect_async(req))
-            .await
-            .map_err(|_| AgentError::Timeout("connect"))??;
+        let websocket_config = WebSocketConfig::default()
+            .max_message_size(Some(sentinel0_proto::MAX_BINARY_FRAME_BYTES));
+        let (mut ws, _) = timeout(
+            self.config.connect_timeout,
+            connect_async_with_config(req, Some(websocket_config), false),
+        )
+        .await
+        .map_err(|_| AgentError::Timeout("connect"))??;
 
         let hello = Message::hello(
             self.config.host.clone(),
@@ -258,7 +331,7 @@ impl<D: Dispatcher> Agent<D> {
             _ => return Err(AgentError::ExpectedWelcome),
         }
 
-        for (path, event) in pending_results::drain(&self.config.upload_base) {
+        for (path, event) in drain_pending(self.config.upload_base.clone()).await {
             if ws
                 .send(WsMessage::Text(serde_json::to_string(&event)?.into()))
                 .await
@@ -266,7 +339,7 @@ impl<D: Dispatcher> Agent<D> {
             {
                 break;
             }
-            pending_results::clear(Some(&path));
+            clear_pending(Some(path)).await;
         }
 
         let mut heartbeat = interval(self.config.heartbeat_interval);
@@ -300,7 +373,7 @@ impl<D: Dispatcher> Agent<D> {
                         )).await.is_err() {
                             return Ok(SessionEnd::Lost(None));
                         }
-                        pending_results::clear(outbound.clear_after_send.as_deref());
+                        clear_pending(outbound.clear_after_send).await;
                     }
                 }
                 item = ws.next() => {
@@ -371,8 +444,9 @@ impl<D: Dispatcher> Agent<D> {
                                         let started_at = Utc::now();
                                         let host_id = self.config.host.id.clone();
                                         let upload_base = self.config.upload_base.clone();
-                                        tokio::spawn(async move {
-                                            let mut response = dispatcher.dispatch(&id, op, payload).await;
+                                        tasks.spawn(async move {
+                                            let mut response =
+                                                dispatch_safely(dispatcher, id.clone(), op, payload).await;
                                             if let Ok(mut bounded) = serde_json::to_value(&response) {
                                                 let _ = bound_response_default(&mut bounded);
                                                 if let Ok(parsed) = serde_json::from_value(bounded) {
@@ -393,15 +467,15 @@ impl<D: Dispatcher> Agent<D> {
                                                 data,
                                                 timestamp: Utc::now(),
                                             };
-                                            let pending_path = serde_json::to_value(&event)
-                                                .ok()
-                                                .and_then(|value| {
-                                                    pending_results::record(
-                                                        &upload_base,
-                                                        &job_id,
-                                                        &value,
-                                                    )
-                                                });
+                                            let pending_path = match serde_json::to_value(&event) {
+                                                Ok(value) => {
+                                                    record_pending(upload_base, job_id.clone(), value).await
+                                                }
+                                                Err(error) => {
+                                                    warn!(?error, %job_id, "failed to serialize background completion for persistence");
+                                                    None
+                                                }
+                                            };
                                             let _ = response_tx
                                                 .send(Outbound {
                                                     message: event,
@@ -410,21 +484,23 @@ impl<D: Dispatcher> Agent<D> {
                                                 .await;
                                         });
                                     } else {
-                                        tokio::spawn(async move {
-                                            let mut response = dispatcher.dispatch(&id, op, payload).await;
+                                        tasks.spawn(async move {
+                                            let mut response =
+                                                dispatch_safely(dispatcher, id.clone(), op, payload).await;
                                             if let Message::Response {
                                                 result: Some(result),
                                                 ..
                                             } = &mut response
-                                                && !result.contains_key("__binary_payload__")
                                             {
-                                                result.insert(
-                                                    "_sx_timing".into(),
-                                                    serde_json::json!({
-                                                        "received_at": received_at,
-                                                        "finished_at": unix_time_seconds(),
-                                                    }),
-                                                );
+                                                if !result.contains_key("__binary_payload__") {
+                                                    result.insert(
+                                                        "_sx_timing".into(),
+                                                        serde_json::json!({
+                                                            "received_at": received_at,
+                                                            "finished_at": unix_time_seconds(),
+                                                        }),
+                                                    );
+                                                }
                                             }
                                             let _ = response_tx
                                                 .send(Outbound {
@@ -449,6 +525,72 @@ impl<D: Dispatcher> Agent<D> {
                 }
             }
         }
+    }
+}
+
+async fn dispatch_safely<D: Dispatcher>(
+    dispatcher: Arc<D>,
+    id: String,
+    op: Op,
+    payload: serde_json::Map<String, serde_json::Value>,
+) -> Message {
+    match AssertUnwindSafe(dispatcher.dispatch(&id, op, payload))
+        .catch_unwind()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            warn!(%id, %op, "dispatcher panicked; converting panic into internal_error");
+            Message::Response {
+                id,
+                ok: false,
+                result: None,
+                error: Some(sentinel0_proto::ResponseError {
+                    code: "internal_error".into(),
+                    message: "operation handler panicked".into(),
+                    details: None,
+                }),
+            }
+        }
+    }
+}
+
+async fn drain_pending(upload_base: PathBuf) -> Vec<(PathBuf, serde_json::Value)> {
+    match tokio::task::spawn_blocking(move || pending_results::drain(&upload_base)).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(?error, "pending-result drain task failed");
+            Vec::new()
+        }
+    }
+}
+
+async fn record_pending(
+    upload_base: PathBuf,
+    job_id: String,
+    event: serde_json::Value,
+) -> Option<PathBuf> {
+    match tokio::task::spawn_blocking(move || {
+        pending_results::record(&upload_base, &job_id, &event)
+    })
+    .await
+    {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(?error, "pending-result record task failed");
+            None
+        }
+    }
+}
+
+async fn clear_pending(path: Option<PathBuf>) {
+    if path.is_none() {
+        return;
+    }
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || pending_results::clear(path.as_deref())).await
+    {
+        warn!(?error, "pending-result clear task failed");
     }
 }
 

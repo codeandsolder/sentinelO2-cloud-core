@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 //! SentinelX v1 wire compatibility types.
 //!
 //! This models the wire contract, not the Python implementation. The legacy
@@ -242,10 +245,10 @@ where
     use serde::de::Error as _;
 
     let value = Option::<String>::deserialize(deserializer)?;
-    if let Some(ref value) = value
-        && value.chars().count() > 256
-    {
-        return Err(D::Error::custom("opaque_ref exceeds 256 characters"));
+    if let Some(ref value) = value {
+        if value.chars().count() > 256 {
+            return Err(D::Error::custom("opaque_ref exceeds 256 characters"));
+        }
     }
     Ok(value)
 }
@@ -301,7 +304,12 @@ pub fn decode_binary_frame(frame: &[u8]) -> Result<BinaryFrame<'_>, BinaryFrameE
     }
     let mut transfer_id = [0_u8; TRANSFER_ID_BYTES];
     transfer_id.copy_from_slice(&frame[..TRANSFER_ID_BYTES]);
-    let chunk_index = u32::from_be_bytes(frame[16..20].try_into().expect("fixed four-byte slice"));
+    let chunk_bytes: [u8; 4] = frame
+        .get(16..20)
+        .ok_or(BinaryFrameError::TooShort)?
+        .try_into()
+        .map_err(|_| BinaryFrameError::TooShort)?;
+    let chunk_index = u32::from_be_bytes(chunk_bytes);
     Ok(BinaryFrame {
         transfer_id,
         chunk_index,

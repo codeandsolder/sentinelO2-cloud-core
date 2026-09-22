@@ -50,7 +50,15 @@ fn json_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             out.push(path);
         }
     }
-    out.sort();
+    out.sort_by(|left, right| {
+        let left_time = fs::metadata(left)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        let right_time = fs::metadata(right)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        left_time.cmp(&right_time).then_with(|| left.cmp(right))
+    });
     Ok(out)
 }
 
@@ -84,7 +92,7 @@ fn record_at(upload_base: &Path, job_id: &str, event: &Value, at: f64) -> Option
                 .open(&candidate)
             {
                 Ok(mut file) => {
-                    if let Err(error) = file.write_all(&bytes) {
+                    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
                         let _ = fs::remove_file(&candidate);
                         return Err(error);
                     }
@@ -256,6 +264,34 @@ mod tests {
             .is_none()
         );
         clear(None);
+    }
+
+    #[test]
+    fn backlog_evicts_oldest_file_not_lexicographically_first_job_id() {
+        let (_tmp, upload) = base();
+        record(&upload, "zzz_oldest", &event("zzz_oldest")).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        for i in 0..MAX_PENDING_FILES {
+            record(
+                &upload,
+                &format!("aaa_new_{i:04}"),
+                &event(&format!("aaa_new_{i:04}")),
+            )
+            .unwrap();
+        }
+
+        let names: Vec<_> = json_files(&pending_dir(&upload))
+            .unwrap()
+            .into_iter()
+            .filter_map(|path| {
+                path.file_stem()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        assert_eq!(names.len(), MAX_PENDING_FILES);
+        assert!(!names.iter().any(|name| name == "zzz_oldest"));
+        assert!(names.iter().any(|name| name == "aaa_new_0000"));
     }
 
     #[test]
