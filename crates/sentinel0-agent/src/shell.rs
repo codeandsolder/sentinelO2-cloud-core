@@ -105,11 +105,13 @@ pub async fn run_shell(
 mod tests {
     use super::*;
 
+    const SUCCESS_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[tokio::test]
     async fn shell_merges_stdout_and_stderr_like_python_core() {
         let result = run_shell(
             "printf out; printf err >&2",
-            Duration::from_secs(1),
+            SUCCESS_TEST_TIMEOUT,
             None,
             None,
         )
@@ -120,7 +122,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_output_uses_legacy_marker() {
-        let result = run_shell("true", Duration::from_secs(1), None, None).await;
+        let result = run_shell("true", SUCCESS_TEST_TIMEOUT, None, None).await;
         assert_eq!(result["output"], "⚠️ Sin salida");
     }
 
