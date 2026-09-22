@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -9,57 +10,78 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 jobs:
+  lockfile:
+    name: Lockfile consistency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install current stable Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Verify lockfile
+        run: cargo +1.98.1 metadata --locked --format-version 1 >/dev/null
+
   rust:
-    name: Rust stable
-    runs-on: ubuntu-latest
+    name: Rust 1.98.1
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7.0.1
+      - name: Install current stable Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: stable
+          key: stable-1.98.1
       - name: Format
-        run: cargo fmt --all -- --check
+        run: cargo +1.98.1 fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo +1.98.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Tests
-        run: cargo test --workspace --all-targets
+        run: cargo +1.98.1 test --locked --workspace --all-targets
 
   msrv:
     name: Rust 1.85 MSRV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - name: Install MSRV
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: msrv-1.85
       - name: Check all targets
-        run: cargo check --workspace --all-targets
+        run: cargo +1.85.0 check --locked --workspace --all-targets
       - name: Tests
-        run: cargo test --workspace
+        run: cargo +1.85.0 test --locked --workspace
 
   fuzz-smoke:
     name: Fuzz smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2.86.3
+        with:
+          tool: cargo-fuzz
+          fallback: none
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: fuzz-nightly
       - name: Protocol JSON
@@ -70,22 +92,23 @@ jobs:
   release:
     name: Release binary
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [rust, msrv, fuzz-smoke]
-    runs-on: ubuntu-latest
+    needs: [lockfile, rust, msrv, fuzz-smoke]
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - name: Install current stable Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
-          key: release
+          key: release-1.98.1
       - name: Build
-        run: cargo build --release --bin sentinelx-core
+        run: cargo +1.98.1 build --locked --release --bin sentinelx-core
       - name: Smoke
         run: ./target/release/sentinelx-core --help >/dev/null
       - name: Checksum
         run: sha256sum target/release/sentinelx-core > target/release/sentinelx-core.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: sentinelx-core-linux-x86_64
           path: |

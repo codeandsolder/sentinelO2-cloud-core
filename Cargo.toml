@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
   "crates/sentinel0-proto",
   "crates/sentinel0-agent",
@@ -11,40 +11,37 @@ license = "Apache-2.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
-async-trait = "0.1"
-base64 = "0.22"
-clap = { version = "4.5", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
-flate2 = "1"
-futures-util = "0.3"
-glob = "0.3"
-http = "1"
-nix = { version = "0.30", features = ["signal", "process", "user", "fs"] }
-proptest = "1"
-rand = "0.9"
-regex = "1"
-# Keep the HTTPS upload client on the last 0.12 line that does not force
-# url >=2.5 / ICU, so the declared Rust 1.85 MSRV remains real.
-reqwest = { version = "=0.12.12", default-features = false, features = ["rustls-tls", "stream"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-shlex = "1"
-similar = "2"
-soft-canonicalize = "0.5"
-thiserror = "2"
-tar = "0.4"
-tempfile = "3"
-toml = "0.9"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "process", "signal", "io-util", "fs"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-url = "=2.4.1"
-walkdir = "2"
-yaml_serde = "0.10"
-
+async-trait = "0.1.92"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+flate2 = "1.1.10"
+futures-util = "0.3.34"
+glob = "0.3.4"
+http = "1.5.0"
+nix = { version = "0.31.3", features = ["signal", "process", "user", "fs"] }
+proptest = "1.11.0"
+rand = "0.10.3"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+shlex = "2.0.1"
+similar = "3.2.0"
+soft-canonicalize = "0.5.6"
+thiserror = "2.0.20"
+tar = "0.4.46"
+tempfile = "3.27.0"
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "process", "signal", "io-util", "fs"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+url = "2.5.8"
+walkdir = "2.5.0"
+yaml_serde = "0.10.7"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
