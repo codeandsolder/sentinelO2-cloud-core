@@ -360,7 +360,7 @@ impl CoreDispatcher {
                     .map(|value| (name.clone(), value))
             })
             .collect::<Map<String, Value>>();
-        locations.entry("config".into()).or_insert_with(|| {
+        locations.entry("config").or_insert_with(|| {
             json!({
                 "path": self.config_path.display().to_string(),
                 "description": "The agent's active config.yaml.",

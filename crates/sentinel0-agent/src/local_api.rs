@@ -248,6 +248,7 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Option<Endpoint> {
         .and_then(Value::as_f64)
         .unwrap_or(30.0)
         .clamp(0.1, 300.0);
+    let compatibility = valid_compatibility(map.get("compatibility"), &protocol);
     Some(Endpoint {
         name: name.to_owned(),
         transport,
@@ -256,7 +257,7 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Option<Endpoint> {
         timeout: Duration::from_secs_f64(timeout_seconds),
         run_as: map.get("run_as").and_then(Value::as_str).map(str::to_owned),
         actions,
-        compatibility: valid_compatibility(map.get("compatibility"), &protocol),
+        compatibility,
     })
 }
 
