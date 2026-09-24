@@ -4,12 +4,15 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use glob::Pattern;
-use regex::RegexBuilder;
+use grep_matcher::Matcher;
+use grep_regex::RegexMatcherBuilder;
+use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Bytes};
+use ignore::WalkBuilder;
 use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
@@ -592,42 +595,46 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .unwrap_or(policy.file_ops_max_search_results)
         .min(policy.file_ops_max_search_results);
 
-    let regex = if is_regex {
-        Some(
-            RegexBuilder::new(needle)
-                .case_insensitive(!case_sensitive)
-                .build()
-                .map_err(|e| {
-                    HandlerError::new(
-                        "invalid_payload",
-                        format!("pattern is not a valid regex: {e}"),
-                    )
-                })?,
-        )
+    let mut matcher_builder = RegexMatcherBuilder::new();
+    matcher_builder.case_insensitive(!case_sensitive);
+    let matcher = if is_regex {
+        matcher_builder.build(needle)
     } else {
-        None
-    };
-    let literal = if case_sensitive {
-        needle.to_owned()
-    } else {
-        needle.to_lowercase()
-    };
+        matcher_builder.build_literals(&[needle])
+    }
+    .map_err(|e| {
+        let message = if is_regex {
+            format!("pattern is not a valid regex: {e}")
+        } else {
+            format!("pattern could not be compiled: {e}")
+        };
+        HandlerError::new("invalid_payload", message)
+    })?;
 
     let mut matches = Vec::new();
     let mut files_searched = 0_u64;
     let mut truncated = false;
-    let walker = if root.is_dir() {
-        WalkDir::new(&root)
-    } else {
-        WalkDir::new(&root).max_depth(0)
-    };
+    let mut walker = WalkBuilder::new(&root);
+    walker
+        .hidden(false)
+        .parents(false)
+        .ignore(false)
+        .git_global(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !entry.file_type().is_some_and(|ty| ty.is_dir()) || !SKIP_DIRS.contains(&name.as_ref())
+        });
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::none())
+        .build();
 
-    for entry in walker.into_iter().filter_entry(|entry| {
-        let name = entry.file_name().to_string_lossy();
-        !entry.file_type().is_dir() || !SKIP_DIRS.contains(&name.as_ref())
-    }) {
+    for entry in walker.build() {
         let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_file() || skip_search_file(entry.path()) {
+        if !entry.file_type().is_some_and(|ty| ty.is_file()) || skip_search_file(entry.path()) {
             continue;
         }
         if file_glob
@@ -643,56 +650,52 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         let Ok(n) = file.read(&mut probe) else {
             continue;
         };
-        if probe[..n].contains(&0) {
-            continue;
-        }
-        drop(file);
-        let Ok(file) = fs::File::open(entry.path()) else {
+        if probe[..n].contains(&0) || file.rewind().is_err() {
             continue;
         };
         files_searched += 1;
-        for (line_idx, line) in BufReader::new(file).lines().enumerate() {
-            let Ok(line) = line else { continue };
-            let column = if let Some(regex) = regex.as_ref() {
-                regex.find(&line).map(|m| m.start())
-            } else {
-                let hay = if case_sensitive {
-                    line.clone()
-                } else {
-                    line.to_lowercase()
+
+        let rel = if root.is_file() {
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(raw)
+                .to_owned()
+        } else {
+            entry
+                .path()
+                .strip_prefix(&root)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let search_result = searcher.search_file(
+            &matcher,
+            &file,
+            Bytes(|line_number, line| {
+                let Ok(line) = std::str::from_utf8(line) else {
+                    return Ok(true);
                 };
-                hay.find(&literal)
-            };
-            let Some(column) = column else { continue };
-            let mut preview = line.trim().to_owned();
-            if preview.chars().count() > PREVIEW_CHARS {
-                preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
-            }
-            let rel = if root.is_file() {
-                root.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(raw)
-                    .to_owned()
-            } else {
-                entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or(entry.path())
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            matches.push(serde_json::json!({
-                "file": rel,
-                "line": line_idx + 1,
-                "column": column + 1,
-                "text": preview,
-            }));
-            if matches.len() >= cap {
-                truncated = true;
-                break;
-            }
+                let Ok(Some(found)) = matcher.find(line.as_bytes()) else {
+                    return Ok(true);
+                };
+                let mut preview = line.trim().to_owned();
+                if preview.chars().count() > PREVIEW_CHARS {
+                    preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
+                }
+                matches.push(serde_json::json!({
+                    "file": rel.as_str(),
+                    "line": line_number,
+                    "column": found.start() + 1,
+                    "text": preview,
+                }));
+                Ok(matches.len() < cap)
+            }),
+        );
+        if search_result.is_err() {
+            continue;
         }
-        if truncated {
+        if matches.len() >= cap {
+            truncated = true;
             break;
         }
     }
@@ -761,5 +764,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(search_result["matches"][0]["line"], 2);
+    }
+
+    fn search_payload(root: &Path, pattern: &str) -> Map<String, Value> {
+        Map::from_iter([
+            ("path".into(), Value::String(root.display().to_string())),
+            ("pattern".into(), Value::String(pattern.into())),
+        ])
+    }
+
+    #[test]
+    fn search_is_case_insensitive_by_default_and_reports_byte_column() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "prefix NeEdLe suffix\n").unwrap();
+        let result = search(&policy(dir.path()), &search_payload(dir.path(), "needle")).unwrap();
+        assert_eq!(result["matches"][0]["line"], 1);
+        assert_eq!(result["matches"][0]["column"], 8);
+        assert_eq!(result["matches"][0]["text"], "prefix NeEdLe suffix");
+    }
+
+    #[test]
+    fn search_case_sensitive_mode_rejects_case_mismatch() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "NeEdLe\n").unwrap();
+        let mut payload = search_payload(dir.path(), "needle");
+        payload.insert("case_sensitive".into(), Value::Bool(true));
+        let result = search(&policy(dir.path()), &payload).unwrap();
+        assert_eq!(result["matches"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn search_regex_mode_uses_ripgrep_matcher() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "abc 123 xyz\n").unwrap();
+        let mut payload = search_payload(dir.path(), r"\d{3}");
+        payload.insert("regex".into(), Value::Bool(true));
+        let result = search(&policy(dir.path()), &payload).unwrap();
+        assert_eq!(result["matches"][0]["column"], 5);
+    }
+
+    #[test]
+    fn search_skips_binary_noise_dirs_and_nonmatching_globs() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("target")).unwrap();
+        fs::write(dir.path().join("target").join("hidden.txt"), "needle\n").unwrap();
+        fs::write(dir.path().join("keep.rs"), "needle\n").unwrap();
+        fs::write(dir.path().join("wrong.txt"), "needle\n").unwrap();
+        fs::write(dir.path().join("binary.rs"), b"needle\0more\n").unwrap();
+
+        let mut payload = search_payload(dir.path(), "needle");
+        payload.insert("file_glob".into(), Value::String("*.rs".into()));
+        let result = search(&policy(dir.path()), &payload).unwrap();
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["file"], "keep.rs");
+        assert_eq!(result["files_searched"], 1);
+    }
+
+    #[test]
+    fn search_global_result_cap_sets_truncated() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\nneedle\n").unwrap();
+        let mut payload = search_payload(dir.path(), "needle");
+        payload.insert("max_results".into(), Value::from(1));
+        let result = search(&policy(dir.path()), &payload).unwrap();
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn search_single_file_preserves_basename_contract() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        fs::write(&file, "needle\n").unwrap();
+        let result = search(&policy(dir.path()), &search_payload(&file, "needle")).unwrap();
+        assert_eq!(result["matches"][0]["file"], "a.txt");
+    }
+
+    #[test]
+    fn invalid_regex_is_a_payload_error() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let mut payload = search_payload(dir.path(), "(");
+        payload.insert("regex".into(), Value::Bool(true));
+        let error = search(&policy(dir.path()), &payload).unwrap_err();
+        assert_eq!(error.code, "invalid_payload");
+        assert!(error.message.contains("valid regex"));
     }
 }
