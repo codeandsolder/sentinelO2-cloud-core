@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader, Read, Seek},
+    io::{Read, Seek},
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
