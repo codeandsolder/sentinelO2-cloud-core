@@ -86,22 +86,22 @@ async fn next_non_heartbeat(
 ) -> WsMessage {
     loop {
         let frame = ws.next().await.unwrap().unwrap();
-        if let WsMessage::Text(text) = &frame {
-            if matches!(
+        if let WsMessage::Text(text) = &frame
+            && matches!(
                 serde_json::from_str::<Message>(text),
                 Ok(Message::Ping { .. })
-            ) {
-                ws.send(WsMessage::Text(
-                    serde_json::to_string(&Message::Pong {
-                        timestamp: Utc::now(),
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-                continue;
-            }
+            )
+        {
+            ws.send(WsMessage::Text(
+                serde_json::to_string(&Message::Pong {
+                    timestamp: Utc::now(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            continue;
         }
         return frame;
     }
