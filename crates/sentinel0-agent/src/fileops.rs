@@ -392,10 +392,10 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     }
 
     let mut cap = policy.file_ops_max_read_bytes;
-    if let Some(requested) = payload.get("max_bytes").and_then(Value::as_u64) {
-        if requested > 0 {
-            cap = cap.min(usize::try_from(requested).unwrap_or(usize::MAX));
-        }
+    if let Some(requested) = payload.get("max_bytes").and_then(Value::as_u64)
+        && requested > 0
+    {
+        cap = cap.min(usize::try_from(requested).unwrap_or(usize::MAX));
     }
     let range = parse_range(payload)?;
     let mut probe = vec![0_u8; PROBE.min(usize::try_from(meta.len()).unwrap_or(PROBE))];

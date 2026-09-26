@@ -279,45 +279,45 @@ pub fn has_usable_endpoints(policy: &Policy) -> bool {
 }
 
 fn param_names(action: &Action) -> Vec<String> {
-    if let Some(schema) = action.params_schema.as_ref().and_then(Value::as_object) {
-        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-            let required = schema
-                .get("required")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .filter(|name| properties.contains_key(*name))
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let mut rest = properties
-                .keys()
-                .filter(|name| !required.contains(name))
-                .cloned()
-                .collect::<Vec<_>>();
-            rest.sort();
-            let mut names = required;
-            names.extend(rest);
-            return names;
-        }
+    if let Some(schema) = action.params_schema.as_ref().and_then(Value::as_object)
+        && let Some(properties) = schema.get("properties").and_then(Value::as_object)
+    {
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|name| properties.contains_key(*name))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut rest = properties
+            .keys()
+            .filter(|name| !required.contains(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        rest.sort();
+        let mut names = required;
+        names.extend(rest);
+        return names;
     }
     let mut names = Vec::new();
     if let Some(request) = action.request.as_deref() {
         let bytes = request.as_bytes();
         let mut index = 0;
         while index < bytes.len() {
-            if bytes[index] == b'{' {
-                if let Some(end) = request[index + 1..].find('}') {
-                    let name = &request[index + 1..index + 1 + end];
-                    if !name.is_empty() && !names.iter().any(|existing| existing == name) {
-                        names.push(name.to_owned());
-                    }
-                    index += end + 2;
-                    continue;
+            if bytes[index] == b'{'
+                && let Some(end) = request[index + 1..].find('}')
+            {
+                let name = &request[index + 1..index + 1 + end];
+                if !name.is_empty() && !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_owned());
                 }
+                index += end + 2;
+                continue;
             }
             index += 1;
         }
@@ -348,14 +348,14 @@ fn render(template: &str, params: &Map<String, Value>) -> Result<String, Handler
             .unwrap_or_else(|| value.to_string());
         output = output.replace(&format!("{{{key}}}"), &percent_encode(&value));
     }
-    if let Some(start) = output.find('{') {
-        if let Some(end) = output[start + 1..].find('}') {
-            let missing = &output[start + 1..start + 1 + end];
-            return Err(HandlerError::new(
-                "missing_param",
-                format!("the action needs a value for {missing:?}"),
-            ));
-        }
+    if let Some(start) = output.find('{')
+        && let Some(end) = output[start + 1..].find('}')
+    {
+        let missing = &output[start + 1..start + 1 + end];
+        return Err(HandlerError::new(
+            "missing_param",
+            format!("the action needs a value for {missing:?}"),
+        ));
     }
     Ok(output)
 }

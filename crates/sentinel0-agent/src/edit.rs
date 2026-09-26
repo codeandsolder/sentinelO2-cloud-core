@@ -50,13 +50,13 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
             "cannot use 'validator' and 'validator_preset' together",
         ));
     }
-    if let Some(preset) = payload.get("validator_preset").and_then(Value::as_str) {
-        if !PRESETS.contains(&preset) {
-            return Err(HandlerError::new(
-                "invalid_payload",
-                format!("validator_preset must be one of: {}", PRESETS.join(", ")),
-            ));
-        }
+    if let Some(preset) = payload.get("validator_preset").and_then(Value::as_str)
+        && !PRESETS.contains(&preset)
+    {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            format!("validator_preset must be one of: {}", PRESETS.join(", ")),
+        ));
     }
     let count = payload.get("count").and_then(Value::as_i64).unwrap_or(0);
     if count < 0 {
