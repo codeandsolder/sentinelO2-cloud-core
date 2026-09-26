@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.19.2 behavior at reviewed upstream commit
-  `dbca7ebefa069ce6260b94de01d0afc6d7cd1edd`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.19.3 behavior at reviewed upstream commit
+  `84df791a30794abcd95d1c999aa43dd839ec4380`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -81,8 +81,10 @@ Reference surfaces:
   land directly under an rw path; otherwise it falls back to staging.
 - `read`/`list` distinguish host permission errors from missing paths, matching
   upstream 0.19.1 diagnostics.
-- `script_run` names staging host conditions (`no_space`,
-  `permission_denied`, `read_only_filesystem`, `staging_failed`) as in 0.19.2.
+- `script_run` names staging host conditions (`no_space`, `permission_denied`,
+  `read_only_filesystem`, `staging_failed`) and non-sudo cwd failures
+  (`permission_denied`, `not_found`, `not_a_directory`) as in upstream 0.19.3,
+  while preserving `interpreter_missing` when cwd itself is valid.
 - Hello advertises upstream-compatible `agent_name=sentinelx-core` and the
   configured preferred tool profile.
 - Help implements the upstream progressive topic/path/playbook/pagination

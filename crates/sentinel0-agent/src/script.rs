@@ -270,6 +270,35 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     }
 
     let child = command.spawn().map_err(|e| {
+        if let Some(cwd) = spawn_cwd.as_deref() {
+            // With a non-sudo script, Command changes into cwd before exec. Name
+            // cwd failures explicitly instead of surfacing an opaque spawn error.
+            // A missing interpreter is still distinguished when cwd itself exists.
+            match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    return HandlerError::new(
+                        "permission_denied",
+                        format!(
+                            "cannot enter cwd {:?}: the agent's OS user lacks permission to change into it. Being inside an rw file_ops path does not grant Unix access. Either run with sudo=true -- the directory is then entered after elevation -- or grant the agent's user execute (+x) on it and its parents.",
+                            cwd.display()
+                        ),
+                    );
+                }
+                std::io::ErrorKind::NotFound if !cwd.exists() => {
+                    return HandlerError::new(
+                        "not_found",
+                        format!("cwd {:?} does not exist.", cwd.display()),
+                    );
+                }
+                std::io::ErrorKind::NotADirectory if !cwd.is_dir() => {
+                    return HandlerError::new(
+                        "not_a_directory",
+                        format!("cwd {:?} is not a directory.", cwd.display()),
+                    );
+                }
+                _ => {}
+            }
+        }
         let code = if e.kind() == std::io::ErrorKind::NotFound {
             "interpreter_missing"
         } else {
@@ -411,6 +440,70 @@ mod tests {
         assert_eq!(result["ok"], false);
         assert!(result["output"].as_str().unwrap().contains("hello"));
         assert!(result["output"].as_str().unwrap().contains("err"));
+    }
+
+    #[tokio::test]
+    async fn missing_cwd_is_named_not_found() {
+        let dir = tempdir().unwrap();
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let missing = dir.path().join("nope");
+        let error = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("bash".into())),
+                ("content".into(), Value::String("echo hi".into())),
+                ("cwd".into(), Value::String(missing.display().to_string())),
+            ]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "not_found");
+        assert!(error.message.contains("cwd"));
+    }
+
+    #[tokio::test]
+    async fn file_cwd_is_named_not_a_directory() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let error = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("bash".into())),
+                ("content".into(), Value::String("echo hi".into())),
+                ("cwd".into(), Value::String(file.display().to_string())),
+            ]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "not_a_directory");
+    }
+
+    #[tokio::test]
+    async fn missing_interpreter_is_not_mistaken_for_missing_cwd() {
+        let dir = tempdir().unwrap();
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let error = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("powershell".into())),
+                ("content".into(), Value::String("Write-Output hi".into())),
+                ("cwd".into(), Value::String(dir.path().display().to_string())),
+            ]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "interpreter_missing");
     }
 
     #[tokio::test]
