@@ -245,10 +245,10 @@ where
     use serde::de::Error as _;
 
     let value = Option::<String>::deserialize(deserializer)?;
-    if let Some(ref value) = value {
-        if value.chars().count() > 256 {
-            return Err(D::Error::custom("opaque_ref exceeds 256 characters"));
-        }
+    if let Some(ref value) = value
+        && value.chars().count() > 256
+    {
+        return Err(D::Error::custom("opaque_ref exceeds 256 characters"));
     }
     Ok(value)
 }
