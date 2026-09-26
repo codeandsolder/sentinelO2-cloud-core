@@ -74,7 +74,7 @@ jobs:
           - Review relevant language, standard-library, rustc, Cargo, Clippy, rustfmt, target/platform, and tooling changes.
           - Review all Rust code, `Cargo.toml`/`Cargo.lock`, CI, Docker/build tooling, `SKILL.md`, README/docs, examples, lints, and project conventions for newly preferable patterns or obsolete workarounds.
           - Adopt useful newly-stable features and current best practices where they improve the project; remove workarounds that the new stable release makes unnecessary.
-          - Update the current-stable CI/toolchain references while preserving the intentional MSRV contract unless there is a separately justified reason to raise it.
+          - Update the current-stable CI/toolchain references. Keep the MSRV reasonably current and raise it when maintained dependencies require a newer compiler; do not pin dependencies solely to preserve an old MSRV.
           - Run the full CI-equivalent test matrix and fix fallout.
           - If the release genuinely requires no changes beyond what is already present, document what was reviewed and close this issue as a no-op.
 
