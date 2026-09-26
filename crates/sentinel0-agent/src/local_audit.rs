@@ -12,6 +12,77 @@ const TRIM_TRIGGER: usize = 5500;
 const RETENTION_CHECK_EVERY: usize = 100;
 const TAIL_BLOCK: usize = 64 * 1024;
 
+const SAFE_PAYLOAD_KEYS: &[&str] = &[
+    "action",
+    "allow_no_change",
+    "backup_dir",
+    "background",
+    "branch",
+    "case_sensitive",
+    "cleanup",
+    "count",
+    "create",
+    "cwd",
+    "depth",
+    "dest",
+    "detail",
+    "diff",
+    "dotall",
+    "dry_run",
+    "expected_remote_sha",
+    "file_glob",
+    "filename",
+    "force",
+    "glob",
+    "interpreter",
+    "interpret_escapes",
+    "max_bytes",
+    "max_results",
+    "mode",
+    "multiline",
+    "operation",
+    "path",
+    "ref",
+    "ref_pattern",
+    "regex",
+    "remote",
+    "role",
+    "service",
+    "sha256",
+    "source_path",
+    "src",
+    "target_path",
+    "timeout",
+    "transfer_id",
+    "upload_id",
+    "validator_preset",
+    "view_range",
+];
+
+fn redacted_summary(value: &Value) -> Value {
+    match value {
+        Value::String(text) => json!({"redacted": true, "bytes": text.len()}),
+        Value::Array(items) => json!({"redacted": true, "items": items.len()}),
+        Value::Object(fields) => json!({"redacted": true, "fields": fields.len()}),
+        _ => json!({"redacted": true}),
+    }
+}
+
+#[must_use]
+pub fn summarize_payload(payload: &Map<String, Value>) -> Map<String, Value> {
+    payload
+        .iter()
+        .map(|(key, value)| {
+            let summary = if SAFE_PAYLOAD_KEYS.contains(&key.as_str()) {
+                value.clone()
+            } else {
+                redacted_summary(value)
+            };
+            (key.clone(), summary)
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 struct RetentionState {
     checked_once: bool,
@@ -174,5 +245,45 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["n"], 2);
         assert_eq!(rows[1]["n"], 1);
+    }
+
+    #[test]
+    fn payload_summary_keeps_routing_metadata_but_not_sensitive_values() {
+        let payload = Map::from_iter([
+            ("path".into(), Value::String("/tmp/example".into())),
+            ("mode".into(), Value::String("replace".into())),
+            ("content".into(), Value::String("CONTENT_SECRET".into())),
+            ("new_text".into(), Value::String("TEXT_SECRET".into())),
+            ("command".into(), Value::String("COMMAND_SECRET".into())),
+            (
+                "env".into(),
+                json!({"TOKEN": "ENV_SECRET", "OTHER": "value"}),
+            ),
+            ("patch".into(), Value::String("PATCH_SECRET".into())),
+            (
+                "url".into(),
+                Value::String("https://URL_SECRET@example.test".into()),
+            ),
+            ("params".into(), json!({"password": "PARAM_SECRET"})),
+        ]);
+
+        let summary = summarize_payload(&payload);
+        assert_eq!(summary["path"], "/tmp/example");
+        assert_eq!(summary["mode"], "replace");
+        assert_eq!(summary["content"], json!({"redacted": true, "bytes": 14}));
+        assert_eq!(summary["env"], json!({"redacted": true, "fields": 2}));
+
+        let encoded = serde_json::to_string(&summary).unwrap();
+        for secret in [
+            "CONTENT_SECRET",
+            "TEXT_SECRET",
+            "COMMAND_SECRET",
+            "ENV_SECRET",
+            "PATCH_SECRET",
+            "URL_SECRET",
+            "PARAM_SECRET",
+        ] {
+            assert!(!encoded.contains(secret), "audit summary leaked {secret}");
+        }
     }
 }

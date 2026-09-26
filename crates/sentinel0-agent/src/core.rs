@@ -899,7 +899,7 @@ impl Dispatcher for CoreDispatcher {
         }
 
         let started = Instant::now();
-        let audit_payload = payload.clone();
+        let audit_payload = crate::local_audit::summarize_payload(&payload);
         let result = match op {
             Op::Ping => self.ping(),
             Op::Capabilities => self.capabilities_result(&payload),
