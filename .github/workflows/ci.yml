@@ -59,7 +59,7 @@ jobs:
         run: cargo +1.98.1 test --locked --workspace --all-targets
 
   msrv:
-    name: Rust 1.87 MSRV
+    name: Rust 1.88 MSRV
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -67,14 +67,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install MSRV
-        run: rustup toolchain install 1.87.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          key: msrv-1.87
+          key: msrv-1.88
       - name: Check all targets
-        run: cargo +1.87.0 check --locked --workspace --all-targets
+        run: cargo +1.88.0 check --locked --workspace --all-targets
       - name: Tests
-        run: cargo +1.87.0 test --locked --workspace
+        run: cargo +1.88.0 test --locked --workspace
 
   fuzz-smoke:
     name: Fuzz smoke

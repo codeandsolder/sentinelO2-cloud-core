@@ -286,10 +286,10 @@ impl<D: Dispatcher> Agent<D> {
 
         tasks.abort_all();
         while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result {
-                if !error.is_cancelled() {
-                    warn!(?error, "request task failed during shutdown");
-                }
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                warn!(?error, "request task failed during shutdown");
             }
         }
         Ok(())
@@ -393,11 +393,10 @@ impl<D: Dispatcher> Agent<D> {
                             result: Some(result),
                             ..
                         } = &mut message
-                        {
-                            if let Some(encoded) = result
+                            && let Some(encoded) = result
                                 .remove("__binary_payload__")
                                 .and_then(|value| value.as_str().map(str::to_owned))
-                            {
+                        {
                                 let binary = (|| -> Result<Vec<u8>, String> {
                                     let transfer_id = result
                                         .get("transfer_id")
@@ -439,7 +438,6 @@ impl<D: Dispatcher> Agent<D> {
                                         };
                                     }
                                 }
-                            }
                         }
 
                         let is_response = matches!(message, Message::Response { .. });
@@ -570,16 +568,15 @@ impl<D: Dispatcher> Agent<D> {
                                                 result: Some(result),
                                                 ..
                                             } = &mut response
+                                                && !result.contains_key("__binary_payload__")
                                             {
-                                                if !result.contains_key("__binary_payload__") {
-                                                    result.insert(
-                                                        "_sx_timing".into(),
-                                                        serde_json::json!({
-                                                            "received_at": received_at,
-                                                            "finished_at": unix_time_seconds(),
-                                                        }),
-                                                    );
-                                                }
+                                                result.insert(
+                                                    "_sx_timing".into(),
+                                                    serde_json::json!({
+                                                        "received_at": received_at,
+                                                        "finished_at": unix_time_seconds(),
+                                                    }),
+                                                );
                                             }
                                             let _ = response_tx
                                                 .send(Outbound {

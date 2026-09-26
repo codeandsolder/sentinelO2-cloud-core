@@ -42,10 +42,11 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>), 
 }
 
 fn extension(name: &str) -> &str {
-    if let Some((_, ext)) = name.rsplit_once('.') {
-        if !ext.is_empty() && (!name.starts_with('.') || name[1..].contains('.')) {
-            return ext;
-        }
+    if let Some((_, ext)) = name.rsplit_once('.')
+        && !ext.is_empty()
+        && (!name.starts_with('.') || name[1..].contains('.'))
+    {
+        return ext;
     }
     if name.starts_with('.') {
         "<dotfile>"
