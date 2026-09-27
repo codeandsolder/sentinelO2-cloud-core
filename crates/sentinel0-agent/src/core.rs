@@ -409,11 +409,19 @@ impl CoreDispatcher {
             ),
             ("exec_strict".into(), Value::Bool(self.policy.exec_strict)),
             (
+                "exec_enforce_allowlist".into(),
+                Value::Bool(self.policy.exec_enforce_allowlist),
+            ),
+            (
                 "unusable_commands".into(),
-                Self::unusable_commands_for(
-                    &self.policy.allowed_commands,
-                    Self::no_new_privileges(),
-                ),
+                if self.policy.exec_enforce_allowlist {
+                    Self::unusable_commands_for(
+                        &self.policy.allowed_commands,
+                        Self::no_new_privileges(),
+                    )
+                } else {
+                    json!({})
+                },
             ),
             ("services".into(), Value::Object(services)),
             ("locations".into(), Value::Object(locations)),
@@ -468,7 +476,8 @@ impl CoreDispatcher {
             .file_ops_paths
             .iter()
             .any(|entry| entry.access == crate::policy::FileAccess::ReadWrite);
-        let has_commands = !self.policy.allowed_commands.is_empty();
+        let exec_policy_allows_any =
+            !self.policy.exec_enforce_allowlist || !self.policy.allowed_commands.is_empty();
         let has_services = !self.policy.services.is_empty();
 
         let mut navigation = Map::from_iter([
@@ -507,11 +516,13 @@ impl CoreDispatcher {
                 Value::String("mutate files under rw paths (never sudo)".into()),
             );
         }
-        if self.help_ops_live(&[Op::Exec]) && has_commands {
-            navigation.insert(
-                "exec".into(),
-                Value::String("run ONE allowlisted command (no pipes or redirects)".into()),
-            );
+        if self.help_ops_live(&[Op::Exec]) && exec_policy_allows_any {
+            let description = if self.policy.exec_enforce_allowlist {
+                "run a shell command covered by this host's configured command allowlist"
+            } else {
+                "run a shell command; command allowlist enforcement is disabled on this host"
+            };
+            navigation.insert("exec".into(), Value::String(description.into()));
         }
         if self.help_ops_live(&[Op::ScriptRun]) {
             navigation.insert(
@@ -571,9 +582,11 @@ impl CoreDispatcher {
             ),
             (
                 "command".into(),
-                Value::String(
-                    "Add the command under allowed_commands, then reload; or use the configured add_allowed_command playbook when available.".into(),
-                ),
+                Value::String(if self.policy.exec_enforce_allowlist {
+                    "Command allowlist enforcement is enabled. Add the command under allowed_commands, then reload; or use the configured add_allowed_command playbook when available.".into()
+                } else {
+                    "Command allowlist enforcement is disabled, so exec does not require an allowed_commands entry. OS permissions and the agent's runtime guardrails still apply.".into()
+                }),
             ),
             (
                 "service".into(),
@@ -618,7 +631,7 @@ impl CoreDispatcher {
             (
                 "security_model".into(),
                 json!({
-                    "two_layers": "Every file/command/service action must pass both SentinelX policy and the agent OS account's permissions.",
+                    "two_layers": "Every action must pass the SentinelX policy checks that apply to it and the agent OS account's permissions. Exec command allowlisting is optional and reported explicitly.",
                     "allowlist_errors": "path_not_allowed, command_not_allowed and service_not_allowed mean the host policy refused the requested scope.",
                     "permission_errors": "permission_denied means policy allowed the request but the operating-system account could not access the resource.",
                     "sudo": "read/list/search never escalate; edit may use sudo when requested; move/copy/delete/chmod/chown never sudo.",
@@ -663,6 +676,7 @@ impl CoreDispatcher {
                 "policy".into(),
                 json!({
                     "allowed_commands": self.policy.allowed_commands.len(),
+                    "exec_enforce_allowlist": self.policy.exec_enforce_allowlist,
                     "file_ops_paths": paths.len(),
                     "writable_paths": writable,
                     "services": self.policy.services.len(),
@@ -1111,17 +1125,17 @@ mod tests {
             .unwrap();
         let navigation = response["navigation"].as_object().unwrap();
 
-        assert_eq!(navigation.len(), 2);
+        assert_eq!(navigation.len(), 3);
         assert!(navigation.contains_key("capabilities"));
         assert!(navigation.contains_key("state"));
-        assert!(!navigation.contains_key("exec"));
+        assert!(navigation.contains_key("exec"));
         assert!(!navigation.contains_key("read / list / search"));
         assert!(!navigation.contains_key("service / restart"));
         assert!(!navigation.contains_key("playbooks"));
     }
 
     #[test]
-    fn help_access_tells_deny_all_host_to_change_config_on_host() {
+    fn help_access_tells_non_self_editing_host_to_change_config_on_host() {
         let mut policy = Policy::default();
         policy.disabled_ops.insert("edit".into());
         let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
@@ -1141,7 +1155,6 @@ mod tests {
     fn help_navigation_requires_real_prerequisites() {
         let dir = tempdir().unwrap();
         let mut policy = Policy {
-            allowed_commands: vec!["git".into()],
             file_ops_paths: vec![FileOpsPath {
                 path: dir.path().to_owned(),
                 access: FileAccess::ReadWrite,
@@ -1174,6 +1187,40 @@ mod tests {
                 "missing live help entry: {key}"
             );
         }
+    }
+
+    #[test]
+    fn help_exec_matches_optional_allowlist_enforcement() {
+        let dispatcher = CoreDispatcher::new(Policy::default(), "/tmp/config".into(), "test");
+        let navigation = dispatcher.help_navigation();
+        assert!(navigation.contains_key("exec"));
+        assert!(
+            navigation["exec"]
+                .as_str()
+                .unwrap()
+                .contains("enforcement is disabled")
+        );
+
+        let access = dispatcher.help_extending_access();
+        assert!(
+            access["command"]
+                .as_str()
+                .unwrap()
+                .contains("does not require an allowed_commands entry")
+        );
+
+        let enforced = Policy {
+            exec_enforce_allowlist: true,
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(enforced, "/tmp/config".into(), "test");
+        assert!(!dispatcher.help_navigation().contains_key("exec"));
+        assert!(
+            dispatcher.help_extending_access()["command"]
+                .as_str()
+                .unwrap()
+                .contains("enforcement is enabled")
+        );
     }
 
     #[tokio::test]
