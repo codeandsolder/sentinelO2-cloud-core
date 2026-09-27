@@ -156,20 +156,18 @@ fn record_at_result_with_limit(
                     }
                     return Err(error);
                 }
-                if durable {
-                    if let Err(error) = file.sync_all() {
-                        drop(file);
-                        if let Err(cleanup) = fs::remove_file(&candidate)
-                            && cleanup.kind() != std::io::ErrorKind::NotFound
-                        {
-                            tracing::warn!(
-                                path = %candidate.display(),
-                                %cleanup,
-                                "failed cleaning pending-result temp after fsync failure"
-                            );
-                        }
-                        return Err(error);
+                if durable && let Err(error) = file.sync_all() {
+                    drop(file);
+                    if let Err(cleanup) = fs::remove_file(&candidate)
+                        && cleanup.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            path = %candidate.display(),
+                            %cleanup,
+                            "failed cleaning pending-result temp after fsync failure"
+                        );
                     }
+                    return Err(error);
                 }
                 break candidate;
             }

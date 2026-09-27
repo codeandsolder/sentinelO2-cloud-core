@@ -134,18 +134,18 @@ fn result(
         ("duration".into(), Value::from(duration)),
         ("returncode".into(), Value::from(returncode)),
     ]);
-    if let Some(captured) = captured {
-        if captured.stdout.truncated() || captured.stderr.truncated() {
-            out.insert("output_truncated".into(), Value::Bool(true));
-            out.insert(
-                "stdout_bytes".into(),
-                Value::from(captured.stdout.total_bytes()),
-            );
-            out.insert(
-                "stderr_bytes".into(),
-                Value::from(captured.stderr.total_bytes()),
-            );
-        }
+    if let Some(captured) = captured
+        && (captured.stdout.truncated() || captured.stderr.truncated())
+    {
+        out.insert("output_truncated".into(), Value::Bool(true));
+        out.insert(
+            "stdout_bytes".into(),
+            Value::from(captured.stdout.total_bytes()),
+        );
+        out.insert(
+            "stderr_bytes".into(),
+            Value::from(captured.stderr.total_bytes()),
+        );
     }
     out
 }
@@ -443,13 +443,11 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                 tracing::warn!(%message);
                 cleanup_error.get_or_insert(message);
             }
-            if cleanup {
-                if let Some(workdir_error) = cleanup_workdir_error(&workdir).await {
-                    cleanup_error = Some(match cleanup_error {
-                        Some(existing) => format!("{existing}; {workdir_error}"),
-                        None => workdir_error,
-                    });
-                }
+            if cleanup && let Some(workdir_error) = cleanup_workdir_error(&workdir).await {
+                cleanup_error = Some(match cleanup_error {
+                    Some(existing) => format!("{existing}; {workdir_error}"),
+                    None => workdir_error,
+                });
             }
             let error =
                 HandlerError::new("io_error", format!("script output capture failed: {error}"));
@@ -517,13 +515,11 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                         }
                     } else if let Err(error) =
                         nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                        && error != nix::errno::Errno::ESRCH
                     {
-                        if error != nix::errno::Errno::ESRCH {
-                            let message =
-                                format!("failed killing timed-out process group: {error}");
-                            tracing::warn!(%message);
-                            cleanup_error = Some(message);
-                        }
+                        let message = format!("failed killing timed-out process group: {error}");
+                        tracing::warn!(%message);
+                        cleanup_error = Some(message);
                     }
                 }
             }

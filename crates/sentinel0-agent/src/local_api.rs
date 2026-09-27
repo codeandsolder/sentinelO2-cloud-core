@@ -1075,8 +1075,10 @@ mod tests {
         )
         .unwrap();
         let endpoint = endpoint_from_raw("ep", &raw).unwrap();
+        let policy = Policy::default();
+        let sudo = policy.tooling.command("sudo").display().to_string();
         let argv = relay_command(
-            &Policy::default(),
+            &policy,
             &endpoint,
             Path::new("/usr/local/bin/sentinelx-core"),
         )
@@ -1084,7 +1086,7 @@ mod tests {
         assert_eq!(
             &argv[..5],
             &[
-                "sudo".to_owned(),
+                sudo,
                 "-n".to_owned(),
                 "-u".to_owned(),
                 "userx".to_owned(),

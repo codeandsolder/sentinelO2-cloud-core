@@ -746,10 +746,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     fs::write(&staged, &updated)
         .map_err(|e| HandlerError::new("write_failed", format!("failed staging edit: {e}")))?;
 
-    let validator = match run_validator(policy, &staged, payload) {
-        Ok(value) => value,
-        Err(error) => return Err(error),
-    };
+    let validator = run_validator(policy, &staged, payload)?;
     let want_diff = payload
         .get("diff")
         .and_then(Value::as_bool)

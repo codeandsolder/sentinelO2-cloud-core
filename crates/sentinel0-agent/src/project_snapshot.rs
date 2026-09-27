@@ -160,7 +160,7 @@ fn parse_status(raw: &[u8]) -> Map<String, Value> {
                 unstaged += 1;
             }
             if line.starts_with("2 ") {
-                drop(records.next());
+                let _ = records.next();
             }
         } else if line.starts_with("? ") {
             untracked += 1;

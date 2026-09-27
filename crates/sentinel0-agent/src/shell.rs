@@ -252,8 +252,10 @@ mod tests {
 
     #[tokio::test]
     async fn huge_output_is_bounded_and_reported() {
-        let mut policy = Policy::default();
-        policy.exec_capture_max_bytes = 64 * 1024;
+        let policy = Policy {
+            exec_capture_max_bytes: 64 * 1024,
+            ..Policy::default()
+        };
         let result = run_shell(
             &policy,
             "yes X | head -c 1000000",
