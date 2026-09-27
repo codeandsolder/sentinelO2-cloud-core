@@ -2,6 +2,7 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     jobs::BACKGROUND_TIMEOUT_MAX_SECS,
     policy::Policy,
+    process_output::{CapturedOutput, WaitOutcome, wait_bounded},
     staging,
 };
 use rand::RngExt;
@@ -14,7 +15,7 @@ use std::{
     process::Stdio,
     time::{Duration, Instant},
 };
-use tokio::{fs as async_fs, process::Command, time::timeout};
+use tokio::{fs as async_fs, process::Command};
 
 const TIMEOUT_MIN: u64 = 1;
 const TIMEOUT_MAX: u64 = 600;
@@ -52,6 +53,30 @@ fn staging_oserror(error: std::io::Error, path: &Path) -> HandlerError {
     }
 }
 
+async fn cleanup_workdir_error(workdir: &Path) -> Option<String> {
+    match async_fs::remove_dir_all(workdir).await {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            let message = format!(
+                "failed cleaning script workdir {}: {error}",
+                workdir.display()
+            );
+            tracing::warn!(%message);
+            Some(message)
+        }
+    }
+}
+
+fn with_cleanup_detail(mut error: HandlerError, cleanup: Option<String>) -> HandlerError {
+    if let Some(cleanup) = cleanup {
+        error
+            .details
+            .insert("cleanup_error".into(), Value::String(cleanup));
+    }
+    error
+}
+
 fn safe_filename(filename: Option<&str>, extension: &str) -> String {
     filename
         .and_then(|name| Path::new(name).file_name())
@@ -61,9 +86,9 @@ fn safe_filename(filename: Option<&str>, extension: &str) -> String {
         .unwrap_or_else(|| format!("script.{extension}"))
 }
 
-fn merged_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
-    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+fn merged_output(captured: &CapturedOutput) -> String {
+    let stdout = captured.stdout.rendered_trimmed_lossy();
+    let stderr = captured.stderr.rendered_trimmed_lossy();
     if stdout.is_empty() && stderr.is_empty() {
         "⚠️ Sin salida".into()
     } else if stderr.is_empty() {
@@ -88,8 +113,9 @@ fn result(
     output: String,
     duration: f64,
     returncode: i32,
+    captured: Option<&CapturedOutput>,
 ) -> BTreeMap<String, Value> {
-    BTreeMap::from([
+    let mut out = BTreeMap::from([
         ("ok".into(), Value::Bool(returncode == 0)),
         ("interpreter".into(), Value::String(meta.interpreter.into())),
         ("sudo".into(), Value::Bool(meta.sudo)),
@@ -107,10 +133,25 @@ fn result(
         ("output".into(), Value::String(output)),
         ("duration".into(), Value::from(duration)),
         ("returncode".into(), Value::from(returncode)),
-    ])
+    ]);
+    if let Some(captured) = captured {
+        if captured.stdout.truncated() || captured.stderr.truncated() {
+            out.insert("output_truncated".into(), Value::Bool(true));
+            out.insert(
+                "stdout_bytes".into(),
+                Value::from(captured.stdout.total_bytes()),
+            );
+            out.insert(
+                "stderr_bytes".into(),
+                Value::from(captured.stderr.total_bytes()),
+            );
+        }
+    }
+    out
 }
 
 fn build_command(
+    policy: &Policy,
     interpreter: &str,
     script: &Path,
     args: &[String],
@@ -118,17 +159,30 @@ fn build_command(
     cwd: Option<&str>,
 ) -> (Vec<String>, Option<PathBuf>) {
     let mut inner = match interpreter {
-        "bash" => vec!["bash".into(), script.display().to_string()],
-        "python3" => vec!["python3".into(), script.display().to_string()],
+        "bash" => vec![
+            policy.tooling.command("bash").display().to_string(),
+            script.display().to_string(),
+        ],
+        // Keep the old Hub's interpreter value compatible, but never invoke
+        // Python directly. uv owns interpreter selection/install semantics.
+        "python3" => vec![
+            policy.tooling.command("uv").display().to_string(),
+            "run".into(),
+            "--no-project".into(),
+            "--python".into(),
+            policy.tooling.uv_python.clone(),
+            "python".into(),
+            script.display().to_string(),
+        ],
         "pwsh" => vec![
-            "pwsh".into(),
+            policy.tooling.command("pwsh").display().to_string(),
             "-NoProfile".into(),
             "-NonInteractive".into(),
             "-File".into(),
             script.display().to_string(),
         ],
         "powershell" => vec![
-            "powershell".into(),
+            policy.tooling.command("powershell").display().to_string(),
             "-NoProfile".into(),
             "-NonInteractive".into(),
             "-File".into(),
@@ -139,19 +193,21 @@ fn build_command(
     inner.extend(args.iter().cloned());
 
     if sudo {
+        let sudo = policy.tooling.command("sudo").display().to_string();
         if let Some(cwd) = cwd {
             let mut argv = vec![
-                "sudo".into(),
-                "sh".into(),
+                sudo,
+                "-n".into(),
+                policy.tooling.command("bash").display().to_string(),
                 "-c".into(),
                 "cd \"$1\" || { echo \"sentinelx: cannot enter $1\" >&2; exit 126; }; shift; exec \"$@\"" .into(),
-                "sh".into(),
+                "bash".into(),
                 cwd.into(),
             ];
             argv.extend(inner);
             (argv, None)
         } else {
-            let mut argv = vec!["sudo".into()];
+            let mut argv = vec![sudo, "-n".into()];
             argv.extend(inner);
             (argv, None)
         }
@@ -244,21 +300,31 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         .map_err(|e| staging_oserror(e, &workdir))?;
     let script_path = workdir.join(filename);
     if let Err(error) = async_fs::write(&script_path, content).await {
-        if cleanup {
-            let _ = async_fs::remove_dir_all(&workdir).await;
-        }
-        return Err(staging_oserror(error, &script_path));
+        let cleanup_error = if cleanup {
+            cleanup_workdir_error(&workdir).await
+        } else {
+            None
+        };
+        return Err(with_cleanup_detail(
+            staging_oserror(error, &script_path),
+            cleanup_error,
+        ));
     }
     if let Err(error) =
         async_fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).await
     {
-        if cleanup {
-            let _ = async_fs::remove_dir_all(&workdir).await;
-        }
-        return Err(staging_oserror(error, &script_path));
+        let cleanup_error = if cleanup {
+            cleanup_workdir_error(&workdir).await
+        } else {
+            None
+        };
+        return Err(with_cleanup_detail(
+            staging_oserror(error, &script_path),
+            cleanup_error,
+        ));
     }
 
-    let (argv, spawn_cwd) = build_command(interpreter, &script_path, &args, sudo, cwd);
+    let (argv, spawn_cwd) = build_command(policy, interpreter, &script_path, &args, sudo, cwd);
     let started = Instant::now();
     let mut command = Command::new(&argv[0]);
     command
@@ -268,6 +334,14 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    if let Err(error) = policy.tooling.configure_tokio(&mut command) {
+        let cleanup_error = if cleanup {
+            cleanup_workdir_error(&workdir).await
+        } else {
+            None
+        };
+        return Err(with_cleanup_detail(error, cleanup_error));
+    }
     if let Some(cwd) = spawn_cwd.as_ref() {
         command.current_dir(cwd);
     }
@@ -317,22 +391,75 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                 };
                 HandlerError::new(code, format!("failed starting script: {error}"))
             };
-            if cleanup {
-                let _ = async_fs::remove_dir_all(&workdir).await;
-            }
-            return Err(handler_error);
+            let cleanup_error = if cleanup {
+                cleanup_workdir_error(&workdir).await
+            } else {
+                None
+            };
+            return Err(with_cleanup_detail(handler_error, cleanup_error));
         }
     };
     let pid = child.id();
 
-    let outcome = match timeout(
+    let wait_outcome = match wait_bounded(
+        &mut child,
         Duration::from_secs(timeout_seconds),
-        child.wait_with_output(),
+        policy.exec_capture_max_bytes,
     )
     .await
     {
-        Ok(Ok(output)) => {
-            let rc = output.status.code().unwrap_or(-1);
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let mut cleanup_error = None;
+            #[cfg(unix)]
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Some(pid) = pid {
+                        let pgid = nix::unistd::Pid::from_raw(pid as i32);
+                        if let Err(kill_error) =
+                            nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                            && kill_error != nix::errno::Errno::ESRCH
+                        {
+                            let message = format!(
+                                "failed killing script after output-capture error: {kill_error}"
+                            );
+                            tracing::warn!(%message);
+                            cleanup_error = Some(message);
+                        }
+                    }
+                }
+                Err(state_error) => {
+                    let message = format!(
+                        "failed checking script state after output-capture error: {state_error}; refusing PID-based group signal"
+                    );
+                    tracing::warn!(%message);
+                    cleanup_error = Some(message);
+                }
+            }
+            if let Err(wait_error) = child.wait().await {
+                let message =
+                    format!("failed reaping script after output-capture error: {wait_error}");
+                tracing::warn!(%message);
+                cleanup_error.get_or_insert(message);
+            }
+            if cleanup {
+                if let Some(workdir_error) = cleanup_workdir_error(&workdir).await {
+                    cleanup_error = Some(match cleanup_error {
+                        Some(existing) => format!("{existing}; {workdir_error}"),
+                        None => workdir_error,
+                    });
+                }
+            }
+            let error =
+                HandlerError::new("io_error", format!("script output capture failed: {error}"));
+            return Err(with_cleanup_detail(error, cleanup_error));
+        }
+    };
+
+    let outcome = match wait_outcome {
+        WaitOutcome::Completed(captured) => {
+            let rc = captured.status.code().unwrap_or(-1);
             result(
                 ResultMeta {
                     interpreter,
@@ -341,32 +468,56 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                     cleanup,
                 },
                 argv.clone(),
-                merged_output(&output.stdout, &output.stderr),
+                merged_output(&captured),
                 (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
                 rc,
+                Some(&captured),
             )
         }
-        Ok(Err(e)) => {
-            if cleanup {
-                let _ = async_fs::remove_dir_all(&workdir).await;
-            }
-            return Err(HandlerError::new(
-                "io_error",
-                format!("script execution failed: {e}"),
-            ));
-        }
-        Err(_) => {
+        WaitOutcome::TimedOut => {
+            let mut cleanup_error = None;
             #[cfg(unix)]
-            if let Some(pid) = pid {
+            if let Some(pid) = pid
+                && !matches!(child.try_wait(), Ok(Some(_)))
+            {
                 let pgid = nix::unistd::Pid::from_raw(pid as i32);
                 if sudo {
-                    let _ = Command::new("sudo")
+                    let status = Command::new(policy.tooling.command("sudo"))
                         .args(["-n", "kill", "-9", "--", &format!("-{}", pgid.as_raw())])
+                        .env("PATH", policy.tooling.path_env()?)
                         .status()
                         .await;
-                } else {
-                    let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+                    match status {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            let message = format!(
+                                "sudo kill of timed-out process group {} exited with {status}",
+                                pgid.as_raw()
+                            );
+                            tracing::warn!(%message);
+                            cleanup_error = Some(message);
+                        }
+                        Err(error) => {
+                            let message =
+                                format!("failed killing timed-out sudo process group: {error}");
+                            tracing::warn!(%message);
+                            cleanup_error = Some(message);
+                        }
+                    }
+                } else if let Err(error) =
+                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                {
+                    if error != nix::errno::Errno::ESRCH {
+                        let message = format!("failed killing timed-out process group: {error}");
+                        tracing::warn!(%message);
+                        cleanup_error = Some(message);
+                    }
                 }
+            }
+            if let Err(error) = child.wait().await {
+                let message = format!("failed reaping timed-out script: {error}");
+                tracing::warn!(%message);
+                cleanup_error.get_or_insert(message);
             }
             let mut out = result(
                 ResultMeta {
@@ -379,12 +530,15 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                 "⏱️ Timeout".into(),
                 (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
                 -1,
+                None,
             );
             out.insert("timed_out".into(), Value::Bool(true));
+            if let Some(error) = cleanup_error {
+                out.insert("cleanup_error".into(), Value::String(error));
+            }
             out
         }
     };
-
     let mut outcome = outcome;
     if !cleanup {
         outcome.insert(
@@ -395,8 +549,12 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
             "workdir".into(),
             Value::String(workdir.display().to_string()),
         );
-    } else {
-        let _ = async_fs::remove_dir_all(&workdir).await;
+    } else if let Err(error) = async_fs::remove_dir_all(&workdir).await {
+        tracing::warn!(path = %workdir.display(), %error, "failed cleaning script workdir");
+        outcome.insert(
+            "cleanup_error".into(),
+            Value::String(format!("failed cleaning script workdir: {error}")),
+        );
     }
     Ok(outcome)
 }

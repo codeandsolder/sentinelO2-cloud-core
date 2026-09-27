@@ -145,6 +145,7 @@ impl CoreDispatcher {
                     .map(|values| Value::Array(values.into_iter().map(Value::from).collect()))
                     .unwrap_or(Value::Null),
             ),
+            ("tooling".into(), self.policy.tooling.report()),
         ]))
     }
 
@@ -278,6 +279,8 @@ impl CoreDispatcher {
                     json!({
                         "exec_timeout_default": self.policy.exec_timeout_default,
                         "exec_timeout_max": self.policy.exec_timeout_max,
+                        "exec_capture_max_bytes": self.policy.exec_capture_max_bytes,
+                        "exec_enforce_allowlist": self.policy.exec_enforce_allowlist,
                     }),
                 ),
                 (
@@ -725,57 +728,82 @@ impl CoreDispatcher {
         };
         let timeout_secs = timeout_secs.min(ceiling as f64);
 
-        if self.policy.exec_strict {
-            if let Some(substitution) = segment::has_substitution(command) {
-                return Err(HandlerError::with_details(
-                    "command_not_allowed",
-                    format!(
-                        "exec_strict is on and this command uses {substitution} command substitution"
-                    ),
-                    Map::from_iter([
-                        ("command".into(), Value::String(command.into())),
-                        ("substitution".into(), Value::String(substitution.into())),
-                    ]),
-                ));
-            }
-            if let Some(offending) = segment::unauthorised_segment(&self.policy, command) {
-                return Err(HandlerError::with_details(
-                    "command_not_allowed",
-                    format!(
-                        "exec_strict is on and segment {offending:?} is not covered by allowed_commands"
-                    ),
-                    Map::from_iter([
-                        ("command".into(), Value::String(command.into())),
-                        ("offending_segment".into(), Value::String(offending)),
-                    ]),
-                ));
-            }
-        }
-        if !self.policy.is_command_allowed(command) {
+        if let Some(kind) = self.policy.tooling.direct_python_violation(command) {
+            let replacement = if kind == "pip" {
+                "uv pip … (or uv sync / uv tool install)"
+            } else {
+                "uv run --no-project python …"
+            };
             return Err(HandlerError::with_details(
-                "command_not_allowed",
-                format!(
-                    "command not in allowlist: {}",
-                    command.split_whitespace().next().unwrap_or("")
-                ),
+                "use_uv",
+                format!("direct {kind} invocation is disabled; use {replacement}"),
                 Map::from_iter([
                     ("command".into(), Value::String(command.into())),
-                    (
-                        "allowed_commands".into(),
-                        Value::Array(
-                            self.policy
-                                .allowed_commands
-                                .iter()
-                                .cloned()
-                                .map(Value::String)
-                                .collect(),
-                        ),
-                    ),
+                    ("replacement".into(), Value::String(replacement.into())),
                 ]),
             ));
         }
 
-        Ok(shell::run_shell(command, Duration::from_secs_f64(timeout_secs), None, None).await)
+        if self.policy.exec_enforce_allowlist {
+            if self.policy.exec_strict {
+                if let Some(substitution) = segment::has_substitution(command) {
+                    return Err(HandlerError::with_details(
+                        "command_not_allowed",
+                        format!(
+                            "exec_strict is on and this command uses {substitution} command substitution"
+                        ),
+                        Map::from_iter([
+                            ("command".into(), Value::String(command.into())),
+                            ("substitution".into(), Value::String(substitution.into())),
+                        ]),
+                    ));
+                }
+                if let Some(offending) = segment::unauthorised_segment(&self.policy, command) {
+                    return Err(HandlerError::with_details(
+                        "command_not_allowed",
+                        format!(
+                            "exec_strict is on and segment {offending:?} is not covered by allowed_commands"
+                        ),
+                        Map::from_iter([
+                            ("command".into(), Value::String(command.into())),
+                            ("offending_segment".into(), Value::String(offending)),
+                        ]),
+                    ));
+                }
+            }
+            if !self.policy.is_command_allowed(command) {
+                return Err(HandlerError::with_details(
+                    "command_not_allowed",
+                    format!(
+                        "command not in allowlist: {}",
+                        command.split_whitespace().next().unwrap_or("")
+                    ),
+                    Map::from_iter([
+                        ("command".into(), Value::String(command.into())),
+                        (
+                            "allowed_commands".into(),
+                            Value::Array(
+                                self.policy
+                                    .allowed_commands
+                                    .iter()
+                                    .cloned()
+                                    .map(Value::String)
+                                    .collect(),
+                            ),
+                        ),
+                    ]),
+                ));
+            }
+        }
+
+        shell::run_shell(
+            &self.policy,
+            command,
+            Duration::from_secs_f64(timeout_secs),
+            None,
+            None,
+        )
+        .await
     }
 
     async fn service(&self, payload: &Map<String, Value>, force_restart: bool) -> HandlerResult {
@@ -823,12 +851,24 @@ impl CoreDispatcher {
         }
 
         let read_only = matches!(action, "status" | "is-active" | "is-enabled");
-        let command = if spec.requires_sudo && !read_only {
-            format!("sudo systemctl {action} {}", spec.unit)
+        let systemctl = self
+            .policy
+            .tooling
+            .command("systemctl")
+            .display()
+            .to_string();
+        let argv = if spec.requires_sudo && !read_only {
+            vec![
+                self.policy.tooling.command("sudo").display().to_string(),
+                "-n".into(),
+                systemctl,
+                action.into(),
+                spec.unit.clone(),
+            ]
         } else {
-            format!("systemctl {action} {}", spec.unit)
+            vec![systemctl, action.into(), spec.unit.clone()]
         };
-        Ok(shell::run_shell(&command, Duration::from_secs(30), None, None).await)
+        shell::run_argv(&self.policy, &argv, Duration::from_secs(30), None, None).await
     }
 
     async fn read_audit(&self, payload: &Map<String, Value>) -> HandlerResult {

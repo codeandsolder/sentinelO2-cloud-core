@@ -7,6 +7,7 @@ pub mod edit_upload;
 pub mod file_export;
 pub mod fileops;
 pub mod fsmutate;
+pub mod fsutil;
 pub mod git_ops;
 pub mod handler_error;
 pub mod host;
@@ -17,6 +18,7 @@ pub mod local_audit;
 pub mod pending_results;
 pub mod policy;
 pub mod preflight;
+pub mod process_output;
 pub mod progressive_help;
 pub mod project_snapshot;
 pub mod rotation;
@@ -24,6 +26,7 @@ pub mod script;
 pub mod segment;
 pub mod shell;
 pub mod staging;
+pub mod tooling;
 pub mod upload;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -339,7 +342,9 @@ impl<D: Dispatcher> Agent<D> {
 
         let first = tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = ws.close(None).await;
+                if let Err(error) = ws.close(None).await {
+                    debug!(?error, "websocket close failed during cancellation");
+                }
                 return Ok(SessionEnd::Clean);
             }
             item = timeout(self.config.welcome_timeout, ws.next()) => {
@@ -397,7 +402,9 @@ impl<D: Dispatcher> Agent<D> {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    let _ = ws.close(None).await;
+                    if let Err(error) = ws.close(None).await {
+                        debug!(?error, "websocket close failed during cancellation");
+                    }
                     return Ok(SessionEnd::Clean);
                 }
                 _ = heartbeat.tick() => {
@@ -469,7 +476,7 @@ impl<D: Dispatcher> Agent<D> {
                         let is_response = matches!(message, Message::Response { .. });
                         let mut wire = serde_json::to_value(&message)?;
                         if is_response {
-                            let _ = bound_response_default(&mut wire);
+                            let _truncation = bound_response_default(&mut wire);
                         }
                         if ws.send(WsMessage::Text(
                             serde_json::to_string(&wire)?.into()
@@ -551,7 +558,7 @@ impl<D: Dispatcher> Agent<D> {
                                             let mut response =
                                                 dispatch_safely(dispatcher, id.clone(), op, payload).await;
                                             if let Ok(mut bounded) = serde_json::to_value(&response) {
-                                                let _ = bound_response_default(&mut bounded);
+                                                let _truncation = bound_response_default(&mut bounded);
                                                 if let Ok(parsed) = serde_json::from_value(bounded) {
                                                     response = parsed;
                                                 }
@@ -579,12 +586,15 @@ impl<D: Dispatcher> Agent<D> {
                                                     None
                                                 }
                                             };
-                                            let _ = response_tx
+                                            if let Err(error) = response_tx
                                                 .send(Outbound {
                                                     message: event,
                                                     clear_after_send: pending_path,
                                                 })
-                                                .await;
+                                                .await
+                                            {
+                                                debug!(?error, %job_id, "session ended before background completion could be queued");
+                                            }
                                         });
                                     } else {
                                         tasks.spawn(async move {
@@ -604,12 +614,15 @@ impl<D: Dispatcher> Agent<D> {
                                                     }),
                                                 );
                                             }
-                                            let _ = response_tx
+                                            if let Err(error) = response_tx
                                                 .send(Outbound {
                                                     message: response,
                                                     clear_after_send: None,
                                                 })
-                                                .await;
+                                                .await
+                                            {
+                                                debug!(?error, "session ended before foreground response could be queued");
+                                            }
                                         });
                                     }
                                 }
@@ -688,7 +701,7 @@ impl<D: Dispatcher> Agent<D> {
                                     }
                                 }
 
-                                let _ = response_tx
+                                if let Err(error) = response_tx
                                     .send(Outbound {
                                         message: Message::Event {
                                             kind: "transfer_chunk_ack".into(),
@@ -697,7 +710,10 @@ impl<D: Dispatcher> Agent<D> {
                                         },
                                         clear_after_send: None,
                                     })
-                                    .await;
+                                    .await
+                                {
+                                    debug!(?error, "session ended before transfer ack could be queued");
+                                }
                             });
                         }
                         Some(Ok(_)) => {}

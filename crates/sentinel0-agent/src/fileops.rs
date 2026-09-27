@@ -19,6 +19,7 @@ use walkdir::WalkDir;
 
 const PROBE: usize = 8192;
 const PREVIEW_CHARS: usize = 200;
+const MAX_SEARCH_ERRORS: usize = 32;
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "__pycache__",
@@ -73,6 +74,23 @@ fn access_error(raw: &str, error: std::io::Error) -> HandlerError {
         ),
         _ => HandlerError::new("io_error", format!("cannot access {raw:?}: {error}")),
     }
+}
+
+fn record_search_error(
+    errors: &mut Vec<Value>,
+    count: &mut u64,
+    file: Option<&Path>,
+    message: impl Into<String>,
+) {
+    *count = count.saturating_add(1);
+    if errors.len() >= MAX_SEARCH_ERRORS {
+        return;
+    }
+    let mut error = Map::from_iter([("error".into(), Value::String(message.into()))]);
+    if let Some(file) = file {
+        error.insert("file".into(), Value::String(file.display().to_string()));
+    }
+    errors.push(Value::Object(error));
 }
 
 fn line_count(text: &str) -> usize {
@@ -613,6 +631,8 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 
     let mut matches = Vec::new();
     let mut files_searched = 0_u64;
+    let mut search_errors = Vec::new();
+    let mut search_error_count = 0_u64;
     let mut truncated = false;
     let mut walker = WalkBuilder::new(&root);
     walker
@@ -633,7 +653,18 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .build();
 
     for entry in walker.build() {
-        let Ok(entry) = entry else { continue };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_search_error(
+                    &mut search_errors,
+                    &mut search_error_count,
+                    None,
+                    format!("walk failed: {error}"),
+                );
+                continue;
+            }
+        };
         if !entry.file_type().is_some_and(|ty| ty.is_file()) || skip_search_file(entry.path()) {
             continue;
         }
@@ -643,14 +674,41 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         {
             continue;
         }
-        let Ok(mut file) = fs::File::open(entry.path()) else {
-            continue;
+        let mut file = match fs::File::open(entry.path()) {
+            Ok(file) => file,
+            Err(error) => {
+                record_search_error(
+                    &mut search_errors,
+                    &mut search_error_count,
+                    Some(entry.path()),
+                    format!("open failed: {error}"),
+                );
+                continue;
+            }
         };
         let mut probe = [0_u8; PROBE];
-        let Ok(n) = file.read(&mut probe) else {
-            continue;
+        let n = match file.read(&mut probe) {
+            Ok(n) => n,
+            Err(error) => {
+                record_search_error(
+                    &mut search_errors,
+                    &mut search_error_count,
+                    Some(entry.path()),
+                    format!("probe read failed: {error}"),
+                );
+                continue;
+            }
         };
-        if probe[..n].contains(&0) || file.rewind().is_err() {
+        if probe[..n].contains(&0) {
+            continue;
+        }
+        if let Err(error) = file.rewind() {
+            record_search_error(
+                &mut search_errors,
+                &mut search_error_count,
+                Some(entry.path()),
+                format!("rewind failed: {error}"),
+            );
             continue;
         };
         files_searched += 1;
@@ -672,26 +730,58 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             &matcher,
             &file,
             Bytes(|line_number, line| {
-                let Ok(line) = std::str::from_utf8(line) else {
-                    return Ok(true);
+                let line = match std::str::from_utf8(line) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        record_search_error(
+                            &mut search_errors,
+                            &mut search_error_count,
+                            Some(entry.path()),
+                            format!("line {line_number} is not UTF-8: {error}"),
+                        );
+                        return Ok(true);
+                    }
                 };
-                let Ok(Some(found)) = matcher.find(line.as_bytes()) else {
-                    return Ok(true);
+                let found = match matcher.find(line.as_bytes()) {
+                    Ok(Some(found)) => found,
+                    Ok(None) => return Ok(true),
+                    Err(error) => {
+                        record_search_error(
+                            &mut search_errors,
+                            &mut search_error_count,
+                            Some(entry.path()),
+                            format!("matcher failed on line {line_number}: {error}"),
+                        );
+                        return Ok(true);
+                    }
                 };
                 let mut preview = line.trim().to_owned();
                 if preview.chars().count() > PREVIEW_CHARS {
                     preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
                 }
+                let byte_column = found.start() + 1;
+                let column = line
+                    .char_indices()
+                    .take_while(|(index, _)| *index < found.start())
+                    .count()
+                    + 1;
                 matches.push(serde_json::json!({
                     "file": rel.as_str(),
                     "line": line_number,
-                    "column": found.start() + 1,
+                    "column": column,
+                    "byte_column": byte_column,
                     "text": preview,
                 }));
                 Ok(matches.len() < cap)
             }),
         );
-        if search_result.is_err() {
+        if let Err(error) = search_result {
+            record_search_error(
+                &mut search_errors,
+                &mut search_error_count,
+                Some(entry.path()),
+                format!("search failed: {error}"),
+            );
             continue;
         }
         if matches.len() >= cap {
@@ -706,6 +796,8 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("pattern".into(), Value::String(needle.into())),
         ("matches".into(), Value::Array(matches)),
         ("files_searched".into(), Value::from(files_searched)),
+        ("search_error_count".into(), Value::from(search_error_count)),
+        ("search_errors".into(), Value::Array(search_errors)),
         ("truncated".into(), Value::Bool(truncated)),
     ]))
 }
@@ -850,5 +942,15 @@ mod tests {
         let error = search(&policy(dir.path()), &payload).unwrap_err();
         assert_eq!(error.code, "invalid_payload");
         assert!(error.message.contains("valid regex"));
+    }
+
+    #[test]
+    fn search_column_is_character_based_and_byte_column_is_explicit() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("utf8.txt"), "żółw needle\n").unwrap();
+        let result = search(&policy(dir.path()), &search_payload(dir.path(), "needle")).unwrap();
+        let first = &result["matches"].as_array().unwrap()[0];
+        assert_eq!(first["column"], 6);
+        assert_eq!(first["byte_column"], 9);
     }
 }

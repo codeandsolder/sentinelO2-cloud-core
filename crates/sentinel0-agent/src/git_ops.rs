@@ -21,12 +21,13 @@ const MAX_PATCH: usize = 5 * 1024 * 1024;
 const MAX_DIFF_PATCH: usize = 128 * 1024;
 
 async fn run_git(
+    policy: &Policy,
     root: &Path,
     args: &[String],
     stdin: Option<&[u8]>,
     limit: Duration,
 ) -> Result<(i32, Vec<u8>, Vec<u8>), HandlerError> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(policy.tooling.command("git"));
     command
         .arg("-C")
         .arg(root)
@@ -43,6 +44,7 @@ async fn run_git(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    policy.tooling.configure_tokio(&mut command)?;
 
     if stdin.is_some() {
         command.stdin(Stdio::piped());
@@ -83,7 +85,12 @@ async fn run_git(
             #[cfg(unix)]
             if let Some(pid) = pid {
                 let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+                if let Err(error) =
+                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                    && error != nix::errno::Errno::ESRCH
+                {
+                    tracing::warn!(pid, %error, "failed killing timed-out git process group");
+                }
             }
             Err(HandlerError::new(
                 "git_timeout",
@@ -97,12 +104,13 @@ async fn run_git(
 }
 
 async fn run_git_capped_stdout(
+    policy: &Policy,
     root: &Path,
     args: &[String],
     cap: usize,
     limit: Duration,
 ) -> Result<(i32, Vec<u8>, Vec<u8>, bool), HandlerError> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(policy.tooling.command("git"));
     command
         .arg("-C")
         .arg(root)
@@ -120,6 +128,7 @@ async fn run_git_capped_stdout(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    policy.tooling.configure_tokio(&mut command)?;
 
     let mut child = command
         .spawn()
@@ -170,7 +179,12 @@ async fn run_git_capped_stdout(
             #[cfg(unix)]
             if let Some(pid) = pid {
                 let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+                if let Err(error) =
+                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                    && error != nix::errno::Errno::ESRCH
+                {
+                    tracing::warn!(pid, %error, "failed killing timed-out git process group");
+                }
             }
             Err(HandlerError::new(
                 "git_timeout",
@@ -214,7 +228,7 @@ async fn git_root(policy: &Policy, requested: &str, write: bool) -> Result<PathB
         ));
     }
     let args = vec!["rev-parse".into(), "--show-toplevel".into()];
-    let (rc, out, err) = run_git(&start, &args, None, LOCAL_TIMEOUT).await?;
+    let (rc, out, err) = run_git(policy, &start, &args, None, LOCAL_TIMEOUT).await?;
     if rc != 0 || out.is_empty() {
         let text = String::from_utf8_lossy(&err).to_lowercase();
         if text.contains("dubious ownership") {
@@ -361,12 +375,12 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 
     let mut args = selector.clone();
     args.extend(["--no-ext-diff".into(), "--numstat".into(), "-z".into()]);
-    let (_, numstat, _) = run_git(&root, &args, None, LOCAL_TIMEOUT).await?;
+    let (_, numstat, _) = run_git(policy, &root, &args, None, LOCAL_TIMEOUT).await?;
     let (files_total, insertions, deletions) = parse_numstat(&numstat);
 
     let mut args = selector.clone();
     args.extend(["--no-ext-diff".into(), "--name-status".into(), "-z".into()]);
-    let (_, names, _) = run_git(&root, &args, None, LOCAL_TIMEOUT).await?;
+    let (_, names, _) = run_git(policy, &root, &args, None, LOCAL_TIMEOUT).await?;
     let (changed, changed_total) = parse_name_status(&names, max_files);
 
     let (untracked, untracked_total) = if include_untracked {
@@ -376,7 +390,7 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             "--exclude-standard".into(),
             "-z".into(),
         ];
-        let (_, out, _) = run_git(&root, &args, None, LOCAL_TIMEOUT).await?;
+        let (_, out, _) = run_git(policy, &root, &args, None, LOCAL_TIMEOUT).await?;
         let decoded = String::from_utf8_lossy(&out);
         let mut kept = Vec::with_capacity(max_files);
         let mut total = 0_usize;
@@ -409,7 +423,7 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         // it exceeds that limit: retain at most max_patch + 1 bytes while
         // continuing to drain git to completion.
         let (_, patch, _, patch_exceeded) =
-            run_git_capped_stdout(&root, &patch_args, max_patch, LOCAL_TIMEOUT).await?;
+            run_git_capped_stdout(policy, &root, &patch_args, max_patch, LOCAL_TIMEOUT).await?;
         let patch_value = if patch_exceeded {
             truncated_patch = true;
             Value::Null
@@ -556,13 +570,19 @@ async fn apply_patch(policy: &Policy, payload: &Map<String, Value>) -> HandlerRe
     };
 
     let num_args = invoke(vec!["--numstat".into()]);
-    let (mut ns_rc, mut ns_out, ns_err) =
-        run_git(&root, &num_args, Some(patch.as_bytes()), LOCAL_TIMEOUT).await?;
+    let (mut ns_rc, mut ns_out, ns_err) = run_git(
+        policy,
+        &root,
+        &num_args,
+        Some(patch.as_bytes()),
+        LOCAL_TIMEOUT,
+    )
+    .await?;
     if ns_rc != 0 && String::from_utf8_lossy(&ns_err).contains("corrupt patch") {
         let mut args = vec!["apply".into(), "--recount".into(), "--numstat".into()];
         args.extend(["--no-3way".into(), "-".into()]);
         let (retry_rc, retry_out, _) =
-            run_git(&root, &args, Some(patch.as_bytes()), LOCAL_TIMEOUT).await?;
+            run_git(policy, &root, &args, Some(patch.as_bytes()), LOCAL_TIMEOUT).await?;
         ns_rc = retry_rc;
         ns_out = retry_out;
         if ns_rc == 0 {
@@ -577,7 +597,14 @@ async fn apply_patch(policy: &Policy, payload: &Map<String, Value>) -> HandlerRe
         check_args.push("--recount".into());
     }
     check_args.extend(["--check".into(), "--no-3way".into(), "-".into()]);
-    let (rc, _, err) = run_git(&root, &check_args, Some(patch.as_bytes()), LOCAL_TIMEOUT).await?;
+    let (rc, _, err) = run_git(
+        policy,
+        &root,
+        &check_args,
+        Some(patch.as_bytes()),
+        LOCAL_TIMEOUT,
+    )
+    .await?;
     if rc != 0 {
         return Err(HandlerError::new(
             "patch_does_not_apply",
@@ -591,8 +618,14 @@ async fn apply_patch(policy: &Policy, payload: &Map<String, Value>) -> HandlerRe
             apply_args.push("--recount".into());
         }
         apply_args.extend(["--no-3way".into(), "-".into()]);
-        let (rc, _, err) =
-            run_git(&root, &apply_args, Some(patch.as_bytes()), LOCAL_TIMEOUT).await?;
+        let (rc, _, err) = run_git(
+            policy,
+            &root,
+            &apply_args,
+            Some(patch.as_bytes()),
+            LOCAL_TIMEOUT,
+        )
+        .await?;
         if rc != 0 {
             return Err(HandlerError::new(
                 "patch_does_not_apply",
@@ -632,7 +665,7 @@ async fn ls_remote(policy: &Policy, payload: &Map<String, Value>) -> HandlerResu
     if let Some(pattern) = payload.get("ref_pattern").and_then(Value::as_str) {
         args.push(pattern.into());
     }
-    let (rc, out, err) = run_git(&root, &args, None, NET_TIMEOUT).await?;
+    let (rc, out, err) = run_git(policy, &root, &args, None, NET_TIMEOUT).await?;
     if rc != 0 {
         return Err(HandlerError::new(
             "remote_failed",
@@ -667,7 +700,7 @@ async fn fetch(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     if let Some(reference) = payload.get("ref").and_then(Value::as_str) {
         args.push(reference.into());
     }
-    let (rc, _, err) = run_git(&root, &args, None, NET_TIMEOUT).await?;
+    let (rc, _, err) = run_git(policy, &root, &args, None, NET_TIMEOUT).await?;
     if rc != 0 {
         return Err(HandlerError::new("remote_failed", scrub(&err, &root)));
     }
@@ -710,12 +743,20 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         args.extend(["--branch".into(), branch.into()]);
     }
     args.extend([url.into(), target.display().to_string()]);
-    let (rc, _, err) = run_git(parent, &args, None, NET_TIMEOUT).await?;
+    let (rc, _, err) = run_git(policy, parent, &args, None, NET_TIMEOUT).await?;
     if rc != 0 {
-        if target.exists() {
-            let _ = std::fs::remove_dir_all(&target);
+        let mut message = scrub(&err, parent);
+        if target.exists()
+            && let Err(error) = std::fs::remove_dir_all(&target)
+        {
+            let cleanup = format!(
+                "failed cleaning partial clone {}: {error}",
+                target.display()
+            );
+            tracing::warn!(%cleanup);
+            message = format!("{message}; {cleanup}");
         }
-        return Err(HandlerError::new("remote_failed", scrub(&err, parent)));
+        return Err(HandlerError::new("remote_failed", message));
     }
     Ok(BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
@@ -750,7 +791,7 @@ async fn push(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         args.push(format!("--force-with-lease={branch}:{expected}"));
     }
     args.extend([remote.into(), branch.into()]);
-    let (rc, _, err) = run_git(&root, &args, None, NET_TIMEOUT).await?;
+    let (rc, _, err) = run_git(policy, &root, &args, None, NET_TIMEOUT).await?;
     let output = scrub(&err, &root);
     if rc != 0 {
         if output.to_lowercase().contains("stale info") {
@@ -898,10 +939,15 @@ mod tests {
             "big.txt".into(),
         ];
 
-        let (rc, stdout, _, exceeded) =
-            run_git_capped_stdout(dir.path(), &args, 1024, Duration::from_secs(60))
-                .await
-                .unwrap();
+        let (rc, stdout, _, exceeded) = run_git_capped_stdout(
+            &Policy::default(),
+            dir.path(),
+            &args,
+            1024,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rc, 1);
         assert!(exceeded);

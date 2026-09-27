@@ -149,14 +149,27 @@ fn record_at_result_with_limit(
         {
             Ok(mut file) => {
                 if let Err(error) = file.write_all(&bytes) {
-                    let _ = fs::remove_file(&candidate);
+                    if let Err(cleanup) = fs::remove_file(&candidate)
+                        && cleanup.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(path = %candidate.display(), %cleanup, "failed cleaning partial pending-result file");
+                    }
                     return Err(error);
                 }
                 if durable {
-                    // Best-effort durability: if the connection dies after the
-                    // job completes, replay data should already be on stable
-                    // storage before we consider the result persisted.
-                    let _ = file.sync_all();
+                    if let Err(error) = file.sync_all() {
+                        drop(file);
+                        if let Err(cleanup) = fs::remove_file(&candidate)
+                            && cleanup.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(
+                                path = %candidate.display(),
+                                %cleanup,
+                                "failed cleaning pending-result temp after fsync failure"
+                            );
+                        }
+                        return Err(error);
+                    }
                 }
                 break candidate;
             }
@@ -166,15 +179,43 @@ fn record_at_result_with_limit(
     };
 
     if let Err(error) = fs::rename(&temp, &path) {
-        let _ = fs::remove_file(&temp);
+        if let Err(cleanup) = fs::remove_file(&temp)
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %temp.display(), %cleanup, "failed cleaning pending-result temp after rename failure");
+        }
         return Err(error);
+    }
+    if durable && let Err(error) = fs::File::open(&dir).and_then(|directory| directory.sync_all()) {
+        tracing::warn!(
+            path = %dir.display(),
+            %error,
+            "pending result was renamed, but directory fsync failed; crash durability is not guaranteed"
+        );
     }
 
     let existing = json_files(&dir)?;
     if existing.len() > max_pending_files {
         let remove = existing.len() - max_pending_files;
+        let mut removed_any = false;
         for stale in existing.into_iter().take(remove) {
-            let _ = fs::remove_file(stale);
+            match fs::remove_file(&stale) {
+                Ok(()) => removed_any = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(path = %stale.display(), %error, "failed pruning stale pending-result file");
+                }
+            }
+        }
+        if durable
+            && removed_any
+            && let Err(error) = fs::File::open(&dir).and_then(|directory| directory.sync_all())
+        {
+            tracing::warn!(
+                path = %dir.display(),
+                %error,
+                "pending-result prune directory fsync failed"
+            );
         }
     }
 
@@ -186,14 +227,22 @@ pub fn clear(path: Option<&Path>) {
         return;
     };
     let Some(dir) = path.parent() else {
-        let _ = fs::remove_file(path);
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "failed clearing pending result");
+        }
         return;
     };
     let store = store_lock(dir);
     let _guard = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = fs::remove_file(path);
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), %error, "failed clearing pending result");
+    }
 }
 
 pub fn drain(upload_base: &Path) -> Vec<(PathBuf, Value)> {
@@ -203,6 +252,19 @@ pub fn drain(upload_base: &Path) -> Vec<(PathBuf, Value)> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     drain_at(upload_base, unix_seconds_now())
+}
+
+fn remove_pending_best_effort(path: &Path, reason: &'static str) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            reason,
+            "failed removing unusable pending-result file"
+        );
+    }
 }
 
 fn drain_at(upload_base: &Path, now: f64) -> Vec<(PathBuf, Value)> {
@@ -218,16 +280,16 @@ fn drain_at(upload_base: &Path, now: f64) -> Vec<(PathBuf, Value)> {
             .and_then(|text| serde_json::from_str::<Value>(&text).ok());
 
         let Some(data) = parsed else {
-            let _ = fs::remove_file(&path);
+            remove_pending_best_effort(&path, "unparseable");
             continue;
         };
         let Some(event) = data.get("event").filter(|event| event.is_object()).cloned() else {
-            let _ = fs::remove_file(&path);
+            remove_pending_best_effort(&path, "missing event");
             continue;
         };
         let at = data.get("at").and_then(Value::as_f64).unwrap_or(0.0);
         if now - at > PENDING_TTL.as_secs_f64() {
-            let _ = fs::remove_file(&path);
+            remove_pending_best_effort(&path, "expired");
             continue;
         }
         out.push((path, event));
