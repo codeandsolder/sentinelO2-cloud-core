@@ -483,17 +483,12 @@ mod tests {
     #[test]
     fn deleting_our_backup_is_terminal() {
         let dir = tempdir().unwrap();
-        let backup = dir
-            .path()
-            .join("model.gguf.bak.20260924-142530.123456");
+        let backup = dir.path().join("model.gguf.bak.20260924-142530.123456");
         fs::write(&backup, "backup bytes").unwrap();
 
         let result = delete(
             &policy(dir.path()),
-            &Map::from_iter([(
-                "path".into(),
-                Value::String(backup.display().to_string()),
-            )]),
+            &Map::from_iter([("path".into(), Value::String(backup.display().to_string()))]),
         )
         .unwrap();
 
@@ -517,10 +512,7 @@ mod tests {
 
         let result = delete(
             &policy(dir.path()),
-            &Map::from_iter([(
-                "path".into(),
-                Value::String(file.display().to_string()),
-            )]),
+            &Map::from_iter([("path".into(), Value::String(file.display().to_string()))]),
         )
         .unwrap();
 
