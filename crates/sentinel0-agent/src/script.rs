@@ -498,7 +498,10 @@ mod tests {
             &Map::from_iter([
                 ("interpreter".into(), Value::String("powershell".into())),
                 ("content".into(), Value::String("Write-Output hi".into())),
-                ("cwd".into(), Value::String(dir.path().display().to_string())),
+                (
+                    "cwd".into(),
+                    Value::String(dir.path().display().to_string()),
+                ),
             ]),
         )
         .await
