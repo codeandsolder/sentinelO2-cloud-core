@@ -1022,4 +1022,37 @@ mod tests {
         assert_eq!(error.code, "invalid_payload");
         assert_eq!(fs::read_to_string(source).unwrap(), "keep me");
     }
+    #[test]
+    fn directory_copy_preserves_nested_symlink_without_reading_target() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        let secret = outside.path().join("secret");
+        fs::write(&secret, "outside").unwrap();
+        symlink(&secret, source.join("nested-link")).unwrap();
+
+        let result = copy_path(
+            &policy(root.path()),
+            &Map::from_iter([
+                ("src".into(), Value::String(source.display().to_string())),
+                (
+                    "dst".into(),
+                    Value::String(destination.display().to_string()),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(result["kind"], "dir");
+        let copied_link = destination.join("nested-link");
+        assert!(
+            fs::symlink_metadata(&copied_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(copied_link).unwrap(), secret);
+    }
 }

@@ -477,40 +477,53 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         WaitOutcome::TimedOut => {
             let mut cleanup_error = None;
             #[cfg(unix)]
-            if let Some(pid) = pid
-                && !matches!(child.try_wait(), Ok(Some(_)))
-            {
-                let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                if sudo {
-                    let status = Command::new(policy.tooling.command("sudo"))
-                        .args(["-n", "kill", "-9", "--", &format!("-{}", pgid.as_raw())])
-                        .env("PATH", policy.tooling.path_env()?)
-                        .status()
-                        .await;
-                    match status {
-                        Ok(status) if status.success() => {}
-                        Ok(status) => {
-                            let message = format!(
-                                "sudo kill of timed-out process group {} exited with {status}",
-                                pgid.as_raw()
-                            );
-                            tracing::warn!(%message);
-                            cleanup_error = Some(message);
-                        }
-                        Err(error) => {
-                            let message =
-                                format!("failed killing timed-out sudo process group: {error}");
-                            tracing::warn!(%message);
-                            cleanup_error = Some(message);
-                        }
-                    }
-                } else if let Err(error) =
-                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                {
-                    if error != nix::errno::Errno::ESRCH {
-                        let message = format!("failed killing timed-out process group: {error}");
+            if let Some(pid) = pid {
+                let child_is_live = match child.try_wait() {
+                    Ok(Some(_)) => false,
+                    Ok(None) => true,
+                    Err(state_error) => {
+                        let message = format!(
+                            "failed checking timed-out script state: {state_error}; refusing PID-based group signal"
+                        );
                         tracing::warn!(%message);
                         cleanup_error = Some(message);
+                        false
+                    }
+                };
+                if child_is_live {
+                    let pgid = nix::unistd::Pid::from_raw(pid as i32);
+                    if sudo {
+                        let status = Command::new(policy.tooling.command("sudo"))
+                            .args(["-n", "kill", "-9", "--", &format!("-{}", pgid.as_raw())])
+                            .env("PATH", policy.tooling.path_env()?)
+                            .status()
+                            .await;
+                        match status {
+                            Ok(status) if status.success() => {}
+                            Ok(status) => {
+                                let message = format!(
+                                    "sudo kill of timed-out process group {} exited with {status}",
+                                    pgid.as_raw()
+                                );
+                                tracing::warn!(%message);
+                                cleanup_error = Some(message);
+                            }
+                            Err(error) => {
+                                let message =
+                                    format!("failed killing timed-out sudo process group: {error}");
+                                tracing::warn!(%message);
+                                cleanup_error = Some(message);
+                            }
+                        }
+                    } else if let Err(error) =
+                        nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                    {
+                        if error != nix::errno::Errno::ESRCH {
+                            let message =
+                                format!("failed killing timed-out process group: {error}");
+                            tracing::warn!(%message);
+                            cleanup_error = Some(message);
+                        }
                     }
                 }
             }

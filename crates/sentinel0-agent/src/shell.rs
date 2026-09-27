@@ -143,7 +143,7 @@ pub async fn run_argv(
         match wait_bounded(&mut child, timeout_duration, policy.exec_capture_max_bytes).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                let kill_error = kill_group(pid);
+                let kill_error = kill_live_group(&mut child, pid);
                 if let Err(wait_error) = child.wait().await {
                     tracing::warn!(%wait_error, "failed reaping child after output-capture error");
                 }
