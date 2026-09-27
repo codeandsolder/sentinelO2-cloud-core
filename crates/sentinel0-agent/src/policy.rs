@@ -1,6 +1,6 @@
 use crate::tooling::Tooling;
 use sentinel0_proto::ConfigSummary;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use soft_canonicalize::soft_canonicalize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,6 +19,12 @@ pub enum FileAccess {
 pub struct FileOpsPath {
     pub path: PathBuf,
     pub access: FileAccess,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocationSpec {
+    pub path: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +58,7 @@ pub struct Policy {
     pub file_ops_max_list_entries: usize,
     pub file_ops_max_search_results: usize,
     pub local_apis: BTreeMap<String, yaml_serde::Value>,
-    pub locations: BTreeMap<String, yaml_serde::Value>,
+    pub locations: BTreeMap<String, LocationSpec>,
     pub tooling: Tooling,
 }
 
@@ -98,22 +104,29 @@ pub enum PolicyError {
         #[source]
         source: yaml_serde::Error,
     },
-    #[error("config.yaml contains key {key:?}; did you mean {suggestion:?}?")]
-    KnownTypo {
-        key: String,
-        suggestion: &'static str,
+    #[error("invalid config value for {field}: {message}")]
+    InvalidValue {
+        field: &'static str,
+        message: String,
     },
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawPolicy {
     agent: RawAgent,
     exec: RawExec,
     allowed_commands: Vec<String>,
     services: BTreeMap<String, RawService>,
-    locations: BTreeMap<String, yaml_serde::Value>,
+    locations: BTreeMap<String, RawLocation>,
     playbooks: BTreeMap<String, yaml_serde::Value>,
+    // Upstream recognizes these top-level compatibility keys, but hub routing
+    // comes from CLI/identity and Rust logging is configured by CLI/env.
+    // Parse them so valid upstream configs do not produce false unknown-key warnings.
+    #[serde(rename = "hub_url")]
+    _hub_url: Option<String>,
+    #[serde(rename = "log")]
+    _log: RawLog,
     upload_base: Option<PathBuf>,
     security: RawSecurity,
     file_ops: RawFileOps,
@@ -121,19 +134,39 @@ struct RawPolicy {
     tooling: RawTooling,
     disabled_ops: Vec<String>,
     exec_strict: bool,
-    #[serde(flatten)]
-    unknown: BTreeMap<String, yaml_serde::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawLog {
+    #[serde(rename = "path")]
+    _path: Option<PathBuf>,
+    #[serde(rename = "level")]
+    _level: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(untagged)]
+enum RawLocation {
+    Path(String),
+    Detailed(RawLocationDetailed),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLocationDetailed {
+    path: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct RawTooling {
     path: Option<Vec<PathBuf>>,
     executables: BTreeMap<String, PathBuf>,
     uv_python: String,
     forbid_direct_python: bool,
-    #[serde(flatten)]
-    unknown: BTreeMap<String, yaml_serde::Value>,
 }
 
 impl Default for RawTooling {
@@ -143,20 +176,19 @@ impl Default for RawTooling {
             executables: BTreeMap::new(),
             uv_python: "3".into(),
             forbid_direct_python: true,
-            unknown: BTreeMap::new(),
         }
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawAgent {
     hostname_label: Option<String>,
     preferred_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawExec {
     timeout_default: u64,
     timeout_max: u64,
@@ -176,7 +208,7 @@ impl Default for RawExec {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawSecurity {
     trusted_fetch_hosts: Vec<String>,
     file_url_timeout_seconds: u64,
@@ -192,7 +224,7 @@ impl Default for RawSecurity {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawFileOps {
     paths: Option<Vec<RawFilePath>>,
     allowed_read_paths: Option<Vec<String>>,
@@ -217,15 +249,19 @@ impl Default for RawFileOps {
 #[serde(untagged)]
 enum RawFilePath {
     Path(String),
-    Detailed {
-        path: String,
-        #[serde(default)]
-        access: Option<String>,
-    },
+    Detailed(RawFilePathDetailed),
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
+struct RawFilePathDetailed {
+    path: String,
+    #[serde(default)]
+    access: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct RawService {
     unit: Option<String>,
     actions: Vec<String>,
@@ -267,29 +303,117 @@ impl Policy {
     }
 
     fn from_raw(raw: RawPolicy) -> Result<Self, PolicyError> {
-        const TYPO_HINTS: &[(&str, &str)] = &[
-            ("allow", "allowed_commands"),
-            ("allowedCommands", "allowed_commands"),
-            ("commands", "allowed_commands"),
-            ("service", "services"),
-            ("location", "locations"),
-            ("playbook", "playbooks"),
-            ("hub", "hub_url"),
-        ];
-
-        for (key, suggestion) in TYPO_HINTS {
-            if raw.unknown.contains_key(*key) {
-                return Err(PolicyError::KnownTypo {
-                    key: (*key).into(),
-                    suggestion,
+        if raw.exec.timeout_default == 0 {
+            return Err(PolicyError::InvalidValue {
+                field: "exec.timeout_default",
+                message: "must be greater than zero".into(),
+            });
+        }
+        if raw.exec.timeout_max < raw.exec.timeout_default {
+            return Err(PolicyError::InvalidValue {
+                field: "exec.timeout_max",
+                message: format!(
+                    "must be >= exec.timeout_default ({})",
+                    raw.exec.timeout_default
+                ),
+            });
+        }
+        if raw.exec.capture_max_bytes < 64 * 1024 {
+            return Err(PolicyError::InvalidValue {
+                field: "exec.capture_max_bytes",
+                message: "must be at least 65536 bytes".into(),
+            });
+        }
+        if raw.security.file_url_timeout_seconds == 0 {
+            return Err(PolicyError::InvalidValue {
+                field: "security.file_url_timeout_seconds",
+                message: "must be greater than zero".into(),
+            });
+        }
+        for (field, value) in [
+            ("file_ops.max_read_bytes", raw.file_ops.max_read_bytes),
+            ("file_ops.max_list_entries", raw.file_ops.max_list_entries),
+            (
+                "file_ops.max_search_results",
+                raw.file_ops.max_search_results,
+            ),
+        ] {
+            if value == 0 {
+                return Err(PolicyError::InvalidValue {
+                    field,
+                    message: "must be greater than zero".into(),
                 });
             }
         }
-        if !raw.unknown.is_empty() {
-            warn!(
-                unknown_keys = ?raw.unknown.keys().collect::<Vec<_>>(),
-                "policy contains unknown top-level keys"
-            );
+        for op in &raw.disabled_ops {
+            let op = op.trim();
+            if !op.is_empty()
+                && !sentinel0_proto::Op::ALL
+                    .iter()
+                    .any(|known| known.as_str() == op)
+            {
+                return Err(PolicyError::InvalidValue {
+                    field: "disabled_ops",
+                    message: format!("unknown operation {op:?}"),
+                });
+            }
+        }
+        crate::local_api::validate_config(&raw.local_apis).map_err(|message| {
+            PolicyError::InvalidValue {
+                field: "local_apis",
+                message,
+            }
+        })?;
+
+        for (name, value) in &raw.playbooks {
+            if !matches!(value, yaml_serde::Value::Mapping(_)) {
+                return Err(PolicyError::InvalidValue {
+                    field: "playbooks",
+                    message: format!("playbook {name:?} must be an object"),
+                });
+            }
+            let json = serde_json::to_value(value).map_err(|error| PolicyError::InvalidValue {
+                field: "playbooks",
+                message: format!("playbook {name:?} is not JSON-representable: {error}"),
+            })?;
+            let object = json.as_object().ok_or_else(|| PolicyError::InvalidValue {
+                field: "playbooks",
+                message: format!("playbook {name:?} must be an object"),
+            })?;
+            const PLAYBOOK_KEYS: &[&str] = &[
+                "description",
+                "commands",
+                "when",
+                "steps",
+                "requires",
+                "notes",
+            ];
+            if let Some(key) = object
+                .keys()
+                .find(|key| !PLAYBOOK_KEYS.contains(&key.as_str()))
+            {
+                return Err(PolicyError::InvalidValue {
+                    field: "playbooks",
+                    message: format!("playbook {name:?} contains unknown key {key:?}"),
+                });
+            }
+        }
+
+        let mut locations = BTreeMap::new();
+        for (name, location) in raw.locations {
+            let (path, description) = match location {
+                RawLocation::Path(path) => (path, String::new()),
+                RawLocation::Detailed(RawLocationDetailed { path, description }) => {
+                    (path, description)
+                }
+            };
+            if path.trim().is_empty() {
+                return Err(PolicyError::InvalidValue {
+                    field: "locations",
+                    message: format!("location {name:?} has an empty path"),
+                });
+            }
+            locations.insert(name, LocationSpec { path, description });
         }
 
         let services = raw
@@ -320,41 +444,51 @@ impl Policy {
             {
                 warn!("file_ops has both paths and allowed_read_paths; using paths");
             }
-            paths
-                .into_iter()
-                .filter_map(|entry| match entry {
-                    RawFilePath::Path(path) if !path.trim().is_empty() => Some(FileOpsPath {
-                        path: PathBuf::from(path),
-                        access: FileAccess::Read,
-                    }),
-                    RawFilePath::Detailed { path, access } if !path.trim().is_empty() => {
-                        let access = if access.as_deref() == Some("rw") {
-                            FileAccess::ReadWrite
-                        } else {
-                            FileAccess::Read
+            let mut parsed = Vec::with_capacity(paths.len());
+            for entry in paths {
+                let (path, access) = match entry {
+                    RawFilePath::Path(path) => (path, FileAccess::Read),
+                    RawFilePath::Detailed(RawFilePathDetailed { path, access }) => {
+                        let access = match access.as_deref().map(str::trim) {
+                            None | Some("") | Some("r") => FileAccess::Read,
+                            Some("rw") => FileAccess::ReadWrite,
+                            Some(other) => {
+                                return Err(PolicyError::InvalidValue {
+                                    field: "file_ops.paths[].access",
+                                    message: format!("must be \"r\" or \"rw\", got {other:?}"),
+                                });
+                            }
                         };
-                        Some(FileOpsPath {
-                            path: PathBuf::from(path),
-                            access,
-                        })
+                        (path, access)
                     }
-                    _ => {
-                        warn!("invalid empty file_ops path entry skipped");
-                        None
-                    }
-                })
-                .collect()
+                };
+                if path.trim().is_empty() {
+                    return Err(PolicyError::InvalidValue {
+                        field: "file_ops.paths[].path",
+                        message: "must not be empty".into(),
+                    });
+                }
+                parsed.push(FileOpsPath {
+                    path: PathBuf::from(path),
+                    access,
+                });
+            }
+            parsed
         } else {
-            raw.file_ops
-                .allowed_read_paths
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|path| !path.trim().is_empty())
-                .map(|path| FileOpsPath {
+            let mut parsed = Vec::new();
+            for path in raw.file_ops.allowed_read_paths.unwrap_or_default() {
+                if path.trim().is_empty() {
+                    return Err(PolicyError::InvalidValue {
+                        field: "file_ops.allowed_read_paths[]",
+                        message: "must not be empty".into(),
+                    });
+                }
+                parsed.push(FileOpsPath {
                     path: PathBuf::from(path),
                     access: FileAccess::Read,
-                })
-                .collect()
+                });
+            }
+            parsed
         };
 
         let preferred_profile = match raw.agent.preferred_profile.as_deref() {
@@ -362,17 +496,12 @@ impl Policy {
             Some("full") => Some("full".into()),
             None => None,
             Some(other) => {
-                warn!(value = %other, "invalid agent.preferred_profile ignored");
-                None
+                return Err(PolicyError::InvalidValue {
+                    field: "agent.preferred_profile",
+                    message: format!("must be \"compact\" or \"full\", got {other:?}"),
+                });
             }
         };
-
-        if !raw.tooling.unknown.is_empty() {
-            warn!(
-                unknown_keys = ?raw.tooling.unknown.keys().collect::<Vec<_>>(),
-                "tooling config contains unknown keys"
-            );
-        }
 
         let upload_base = raw
             .upload_base
@@ -409,7 +538,7 @@ impl Policy {
             preferred_profile,
             exec_timeout_default: raw.exec.timeout_default,
             exec_timeout_max: raw.exec.timeout_max,
-            exec_capture_max_bytes: raw.exec.capture_max_bytes.max(64 * 1024),
+            exec_capture_max_bytes: raw.exec.capture_max_bytes,
             upload_base,
             trusted_fetch_hosts: raw.security.trusted_fetch_hosts,
             file_url_timeout_seconds: raw.security.file_url_timeout_seconds,
@@ -418,7 +547,7 @@ impl Policy {
             file_ops_max_list_entries: raw.file_ops.max_list_entries,
             file_ops_max_search_results: raw.file_ops.max_search_results,
             local_apis: raw.local_apis,
-            locations: raw.locations,
+            locations,
             tooling,
         };
 
@@ -547,6 +676,9 @@ security:
   trusted_fetch_hosts: [drop.pensa.ar]
 agent:
   preferred_profile: compact
+hub_url: https://ignored.example
+log:
+  level: INFO
 upload_base: /var/lib/sentinelx/uploads
 "#,
         );
@@ -588,12 +720,130 @@ exec_strict: true
     }
 
     #[test]
-    fn known_typo_fails_loudly() {
-        let raw: RawPolicy = yaml_serde::from_str("allow: [git]").unwrap();
+    fn unknown_top_level_keys_fail_at_parse_boundary() {
+        for text in [
+            "allow: [git]\n",
+            "allowedCommands: [git]\n",
+            "commands: [git]\n",
+            "service: {}\n",
+            "location: {}\n",
+            "playbook: {}\n",
+            "hub: https://example.invalid\n",
+            "future_magic: true\n",
+        ] {
+            assert!(
+                yaml_serde::from_str::<RawPolicy>(text).is_err(),
+                "unknown top-level key unexpectedly parsed: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_file_access_fails_loudly() {
+        let raw: RawPolicy = yaml_serde::from_str(
+            "file_ops:
+  paths:
+    - path: /tmp
+      access: wr
+",
+        )
+        .unwrap();
         assert!(matches!(
             Policy::from_raw(raw),
-            Err(PolicyError::KnownTypo { .. })
+            Err(PolicyError::InvalidValue {
+                field: "file_ops.paths[].access",
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn malformed_local_api_fails_config_load() {
+        let raw: RawPolicy = yaml_serde::from_str(
+            "local_apis:
+  x:
+    transport: stdio
+    protocol: jsonrpc
+    path: /tmp/x
+    actions:
+      ping: { method: ping }
+",
+        )
+        .unwrap();
+        assert!(matches!(
+            Policy::from_raw(raw),
+            Err(PolicyError::InvalidValue {
+                field: "local_apis",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn impossible_exec_limits_fail_loudly() {
+        let raw: RawPolicy = yaml_serde::from_str(
+            "exec:
+  timeout_default: 60
+  timeout_max: 10
+",
+        )
+        .unwrap();
+        assert!(matches!(
+            Policy::from_raw(raw),
+            Err(PolicyError::InvalidValue {
+                field: "exec.timeout_max",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compatibility_blocks_are_strictly_typed() {
+        for text in [
+            "log:
+  path: /tmp/x.log
+  levle: INFO
+",
+            "locations:
+  x:
+    path: /tmp
+    descrption: nope
+",
+            "playbooks:
+  broken: [one, two]
+",
+            "playbooks:
+  broken:
+    description: x
+    stepps: []
+",
+        ] {
+            let parsed = yaml_serde::from_str::<RawPolicy>(text);
+            if let Ok(raw) = parsed {
+                assert!(
+                    Policy::from_raw(raw).is_err(),
+                    "invalid compatibility block unexpectedly loaded: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_config_typos_fail_at_parse_boundary() {
+        for text in [
+            "exec:\n  timeout_defualt: 30\n",
+            "security:\n  file_url_timeout_second: 15\n",
+            "file_ops:\n  max_read_byte: 123\n",
+            "services:\n  nginx:\n    action: [status]\n",
+            "agent:\n  prefered_profile: compact\n",
+            "tooling:\n  uv_pythn: 3\n",
+            "file_ops:\n  paths:\n    - path: /tmp\n      acces: rw\n",
+        ] {
+            assert!(
+                yaml_serde::from_str::<RawPolicy>(text).is_err(),
+                "nested typo unexpectedly parsed: {text:?}"
+            );
+        }
     }
 
     #[test]

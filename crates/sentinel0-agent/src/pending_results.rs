@@ -81,24 +81,26 @@ fn unix_seconds_now() -> f64 {
 }
 
 fn json_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
     let mut out = Vec::new();
-    for entry in fs::read_dir(dir)? {
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "json") {
-            out.push(path);
+            let modified = entry.metadata()?.modified()?;
+            out.push((path, modified));
         }
     }
-    out.sort_by(|left, right| {
-        let left_time = fs::metadata(left)
-            .and_then(|meta| meta.modified())
-            .unwrap_or(UNIX_EPOCH);
-        let right_time = fs::metadata(right)
-            .and_then(|meta| meta.modified())
-            .unwrap_or(UNIX_EPOCH);
-        left_time.cmp(&right_time).then_with(|| left.cmp(right))
+    out.sort_by(|(left_path, left_time), (right_path, right_time)| {
+        left_time
+            .cmp(right_time)
+            .then_with(|| left_path.cmp(right_path))
     });
-    Ok(out)
+    Ok(out.into_iter().map(|(path, _)| path).collect())
 }
 
 pub fn record(upload_base: &Path, job_id: &str, event: &Value) -> Option<PathBuf> {
@@ -192,27 +194,36 @@ fn record_at_result_with_limit(
         );
     }
 
-    let existing = json_files(&dir)?;
-    if existing.len() > max_pending_files {
-        let remove = existing.len() - max_pending_files;
-        let mut removed_any = false;
-        for stale in existing.into_iter().take(remove) {
-            match fs::remove_file(&stale) {
-                Ok(()) => removed_any = true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    tracing::warn!(path = %stale.display(), %error, "failed pruning stale pending-result file");
+    match json_files(&dir) {
+        Ok(existing) if existing.len() > max_pending_files => {
+            let remove = existing.len() - max_pending_files;
+            let mut removed_any = false;
+            for stale in existing.into_iter().take(remove) {
+                match fs::remove_file(&stale) {
+                    Ok(()) => removed_any = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(path = %stale.display(), %error, "failed pruning stale pending-result file");
+                    }
                 }
             }
+            if durable
+                && removed_any
+                && let Err(error) = fs::File::open(&dir).and_then(|directory| directory.sync_all())
+            {
+                tracing::warn!(
+                    path = %dir.display(),
+                    %error,
+                    "pending-result prune directory fsync failed"
+                );
+            }
         }
-        if durable
-            && removed_any
-            && let Err(error) = fs::File::open(&dir).and_then(|directory| directory.sync_all())
-        {
+        Ok(_) => {}
+        Err(error) => {
             tracing::warn!(
                 path = %dir.display(),
                 %error,
-                "pending-result prune directory fsync failed"
+                "pending result was committed, but backlog pruning could not enumerate the store"
             );
         }
     }
@@ -249,7 +260,17 @@ pub fn drain(upload_base: &Path) -> Vec<(PathBuf, Value)> {
     let _guard = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    drain_at(upload_base, unix_seconds_now())
+    match drain_at(upload_base, unix_seconds_now()) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                path = %dir.display(),
+                %error,
+                "could not enumerate pending results; leaving them in place for a later retry"
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn remove_pending_best_effort(path: &Path, reason: &'static str) {
@@ -265,34 +286,63 @@ fn remove_pending_best_effort(path: &Path, reason: &'static str) {
     }
 }
 
-fn drain_at(upload_base: &Path, now: f64) -> Vec<(PathBuf, Value)> {
+fn drain_at(upload_base: &Path, now: f64) -> std::io::Result<Vec<(PathBuf, Value)>> {
     let dir = pending_dir(upload_base);
-    let Ok(paths) = json_files(&dir) else {
-        return Vec::new();
-    };
+    let paths = json_files(&dir)?;
 
     let mut out = Vec::new();
     for path in paths {
-        let parsed = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-
-        let Some(data) = parsed else {
-            remove_pending_best_effort(&path, "unparseable");
-            continue;
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not read pending-result file; preserving it for a later retry"
+                );
+                continue;
+            }
+        };
+        let data = match serde_json::from_str::<Value>(&text) {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "pending-result file contains invalid JSON; removing corrupt entry"
+                );
+                remove_pending_best_effort(&path, "invalid_json");
+                continue;
+            }
         };
         let Some(event) = data.get("event").filter(|event| event.is_object()).cloned() else {
-            remove_pending_best_effort(&path, "missing event");
+            tracing::warn!(
+                path = %path.display(),
+                "pending-result file is missing an event object; removing corrupt entry"
+            );
+            remove_pending_best_effort(&path, "missing_event");
             continue;
         };
-        let at = data.get("at").and_then(Value::as_f64).unwrap_or(0.0);
+        let Some(at) = data
+            .get("at")
+            .and_then(Value::as_f64)
+            .filter(|at| at.is_finite())
+        else {
+            tracing::warn!(
+                path = %path.display(),
+                "pending-result file has no valid timestamp; removing corrupt entry"
+            );
+            remove_pending_best_effort(&path, "invalid_timestamp");
+            continue;
+        };
         if now - at > PENDING_TTL.as_secs_f64() {
             remove_pending_best_effort(&path, "expired");
             continue;
         }
         out.push((path, event));
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

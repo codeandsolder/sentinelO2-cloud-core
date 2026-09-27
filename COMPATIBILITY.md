@@ -79,9 +79,10 @@ Reference surfaces:
 - Upload URL fetching preserves the official HTTPS-only + trusted-host + public
   DNS/IP + no-redirect SSRF policy.
 - Local API supports declared-action Unix-socket HTTP/JSON-RPC, field
-  projection, declared parameter schemas, compatibility probes cached per
-  endpoint epoch, and `run_as` through a deliberately narrow `sudo -n -u`
-  relay implemented by the same Rust binary.
+  projection, declared parameter schemas, compatibility probes rechecked on
+  each call so service restarts cannot inherit stale verdicts, and `run_as`
+  through a deliberately narrow `sudo -n -u` relay implemented by the same
+  Rust binary.
 - `upload_init.land_in_place` matches upstream 0.19.0: an opted-in transfer may
   land directly under an rw path; otherwise it falls back to staging.
 - `read`/`list` distinguish host permission errors from missing paths, matching
@@ -112,6 +113,11 @@ Reference surfaces:
 - Legacy `script_run.interpreter=python3` remains accepted for the hosted Hub,
   but executes through `uv run`; direct Python/pip `exec` requests can be
   rejected with `use_uv` while preserving the old request schema.
+- `allowed_commands` remains config-compatible but is not treated as a security
+  boundary by default. `exec.enforce_allowlist: true` opts into the legacy
+  prefix check; `exec_strict: true` implies enforcement and adds segment /
+  substitution checks. `script_run` remains independent of this list, matching
+  its historical contract.
 - `exec` and `script_run` capture child output with bounded head/tail buffers,
   report exact stdout/stderr byte counts when truncated, and kill process
   groups on timeout.

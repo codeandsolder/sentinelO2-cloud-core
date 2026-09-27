@@ -114,11 +114,11 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
-pub async fn wait_bounded(
+pub(crate) async fn capture_bounded(
     child: &mut Child,
-    timeout_duration: Duration,
-    capture_limit: usize,
-) -> io::Result<WaitOutcome> {
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> io::Result<CapturedOutput> {
     let stdout = child
         .stdout
         .take()
@@ -127,23 +127,42 @@ pub async fn wait_bounded(
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
-    let per_stream = (capture_limit / 2).max(1024);
-    let work = async {
-        let (stdout, stderr, status) = tokio::try_join!(
-            read_bounded_async(stdout, per_stream),
-            read_bounded_async(stderr, per_stream),
-            child.wait(),
-        )?;
-        Ok::<_, io::Error>(CapturedOutput {
-            status,
-            stdout,
-            stderr,
-        })
-    };
-    match timeout(timeout_duration, work).await {
+    let (stdout, stderr, status) = tokio::try_join!(
+        read_bounded_async(stdout, stdout_limit),
+        read_bounded_async(stderr, stderr_limit),
+        child.wait(),
+    )?;
+    Ok(CapturedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+pub(crate) async fn wait_bounded_with_limits(
+    child: &mut Child,
+    timeout_duration: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> io::Result<WaitOutcome> {
+    match timeout(
+        timeout_duration,
+        capture_bounded(child, stdout_limit, stderr_limit),
+    )
+    .await
+    {
         Ok(result) => result.map(WaitOutcome::Completed),
         Err(_) => Ok(WaitOutcome::TimedOut),
     }
+}
+
+pub async fn wait_bounded(
+    child: &mut Child,
+    timeout_duration: Duration,
+    capture_limit: usize,
+) -> io::Result<WaitOutcome> {
+    let per_stream = (capture_limit / 2).max(1024);
+    wait_bounded_with_limits(child, timeout_duration, per_stream, per_stream).await
 }
 
 async fn read_bounded_async<R>(mut reader: R, limit: usize) -> io::Result<CapturedStream>

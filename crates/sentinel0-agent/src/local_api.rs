@@ -1,13 +1,13 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
+    process_output::capture_bounded,
 };
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     io::{Read as _, Write as _},
     path::Path,
-    sync::{Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{
@@ -18,24 +18,6 @@ use tokio::{
 };
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-
-#[derive(Debug, Clone)]
-enum CompatVerdict {
-    Passed,
-    Failed { code: String, message: String },
-}
-
-fn compat_cache() -> &'static Mutex<HashMap<String, CompatVerdict>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, CompatVerdict>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn forget_compatibility(endpoint_name: &str) {
-    let mut cache = compat_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.remove(endpoint_name);
-}
 
 fn relay_command(
     policy: &Policy,
@@ -108,12 +90,16 @@ pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
             match stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(count) => {
-                    reply.extend_from_slice(&chunk[..count]);
+                    let take = chunk[..count]
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(count, |index| index + 1);
+                    reply.extend_from_slice(&chunk[..take]);
                     if reply.len() > MAX_RESPONSE_BYTES {
                         eprintln!("reply exceeded the cap");
                         return 4;
                     }
-                    if reply.ends_with(b"\n") {
+                    if take < count || reply.ends_with(b"\n") {
                         break;
                     }
                 }
@@ -160,26 +146,61 @@ struct Endpoint {
     compatibility: Option<Value>,
 }
 
-fn yaml_to_json(value: &yaml_serde::Value) -> Option<Value> {
-    serde_json::to_value(value).ok()
+fn reject_unknown_keys(
+    map: &Map<String, Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    if let Some(key) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("{context} contains unknown key {key:?}"));
+    }
+    Ok(())
 }
 
-fn valid_compatibility(value: Option<&Value>, protocol: &str) -> Option<Value> {
-    let value = value?.as_object()?;
-    let probe = value.get("probe")?.as_object()?;
-    let extract = value.get("extract")?.as_str()?;
-    if extract.trim().is_empty() {
-        return None;
+fn yaml_to_json(value: &yaml_serde::Value) -> Result<Value, String> {
+    serde_json::to_value(value)
+        .map_err(|error| format!("could not decode endpoint config: {error}"))
+}
+
+fn valid_compatibility(value: Option<&Value>, protocol: &str) -> Result<Option<Value>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .as_object()
+        .ok_or_else(|| "compatibility must be an object".to_owned())?;
+    reject_unknown_keys(value, &["probe", "extract", "accept"], "compatibility")?;
+    let probe = value
+        .get("probe")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "compatibility.probe must be an object".to_owned())?;
+    let probe_keys: &[&str] = match protocol {
+        "http" => &["request"],
+        "jsonrpc" => &["method"],
+        _ => &[],
+    };
+    reject_unknown_keys(probe, probe_keys, "compatibility.probe")?;
+    let extract = value
+        .get("extract")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "compatibility.extract must be a non-empty string".to_owned())?;
+    let accept = value
+        .get("accept")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "compatibility.accept must be an object".to_owned())?;
+    reject_unknown_keys(accept, &["exact", "allowed"], "compatibility.accept")?;
+    let has_exact = accept.contains_key("exact");
+    let has_allowed = accept
+        .get("allowed")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
+    if has_exact == has_allowed {
+        return Err(
+            "compatibility.accept must contain exactly one of: exact, non-empty allowed".into(),
+        );
     }
-    let accept = value.get("accept")?.as_object()?;
-    let has_accept = accept.contains_key("exact")
-        || accept
-            .get("allowed")
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty());
-    if !has_accept {
-        return None;
-    }
+
     let probe_ok = match protocol {
         "http" => probe
             .get("request")
@@ -191,25 +212,83 @@ fn valid_compatibility(value: Option<&Value>, protocol: &str) -> Option<Value> {
             .is_some_and(|method| !method.trim().is_empty()),
         _ => false,
     };
-    probe_ok.then(|| Value::Object(value.clone()))
+    if !probe_ok {
+        return Err(format!(
+            "compatibility.probe is missing the field required by protocol {protocol:?}"
+        ));
+    }
+    let _ = extract;
+    Ok(Some(Value::Object(value.clone())))
 }
 
-fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Option<Endpoint> {
+fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, String> {
     let value = yaml_to_json(raw)?;
-    let map = value.as_object()?;
-    let transport = map.get("transport")?.as_str()?.trim().to_owned();
-    let protocol = map.get("protocol")?.as_str()?.trim().to_owned();
-    let path = map.get("path")?.as_str()?.trim().to_owned();
-    if !matches!(transport.as_str(), "unix" | "stdio")
-        || !matches!(protocol.as_str(), "http" | "jsonrpc")
-        || path.is_empty()
-    {
-        return None;
+    let map = value
+        .as_object()
+        .ok_or_else(|| format!("local_apis.{name} must be an object"))?;
+    reject_unknown_keys(
+        map,
+        &[
+            "transport",
+            "protocol",
+            "path",
+            "timeout_s",
+            "run_as",
+            "compatibility",
+            "actions",
+        ],
+        &format!("local_apis.{name}"),
+    )?;
+    let transport = map
+        .get("transport")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("local_apis.{name}.transport is required"))?
+        .to_owned();
+    if transport != "unix" {
+        return Err(format!(
+            "local_apis.{name}.transport={transport:?} is unsupported; the Rust agent currently supports only unix"
+        ));
     }
-    let raw_actions = map.get("actions")?.as_object()?;
+    let protocol = map
+        .get("protocol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("local_apis.{name}.protocol is required"))?
+        .to_owned();
+    if !matches!(protocol.as_str(), "http" | "jsonrpc") {
+        return Err(format!(
+            "local_apis.{name}.protocol must be http or jsonrpc, got {protocol:?}"
+        ));
+    }
+    let path = map
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("local_apis.{name}.path is required"))?
+        .to_owned();
+
+    let raw_actions = map
+        .get("actions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("local_apis.{name}.actions must be an object"))?;
+    if raw_actions.is_empty() {
+        return Err(format!("local_apis.{name}.actions must not be empty"));
+    }
+
     let mut actions = BTreeMap::new();
     for (action_name, raw_action) in raw_actions {
-        let action = raw_action.as_object()?;
+        let action = raw_action
+            .as_object()
+            .ok_or_else(|| format!("local_apis.{name}.actions.{action_name} must be an object"))?;
+        reject_unknown_keys(
+            action,
+            &["request", "method", "select", "description", "params"],
+            &format!("local_apis.{name}.actions.{action_name}"),
+        )?;
         let request = action
             .get("request")
             .and_then(Value::as_str)
@@ -218,74 +297,132 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Option<Endpoint> {
             .get("method")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        if protocol == "http" && request.is_none() {
-            continue;
+        if protocol == "http"
+            && request
+                .as_deref()
+                .is_none_or(|request| request.trim().is_empty())
+        {
+            return Err(format!(
+                "local_apis.{name}.actions.{action_name}.request is required for HTTP"
+            ));
         }
-        if protocol == "jsonrpc" && method.is_none() {
-            continue;
+        if protocol == "jsonrpc"
+            && method
+                .as_deref()
+                .is_none_or(|method| method.trim().is_empty())
+        {
+            return Err(format!(
+                "local_apis.{name}.actions.{action_name}.method is required for JSON-RPC"
+            ));
         }
-        let select = action
-            .get("select")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+
+        let select = match action.get("select") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str().map(str::to_owned).ok_or_else(|| {
+                        format!(
+                            "local_apis.{name}.actions.{action_name}.select must contain only strings"
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(format!(
+                    "local_apis.{name}.actions.{action_name}.select must be an array"
+                ));
+            }
+        };
+        let params_schema = match action.get("params") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(_)) => action.get("params").cloned(),
+            Some(_) => {
+                return Err(format!(
+                    "local_apis.{name}.actions.{action_name}.params must be an object"
+                ));
+            }
+        };
         actions.insert(
             action_name.clone(),
             Action {
                 request,
                 method,
                 select,
-                description: action
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                params_schema: action.get("params").cloned().filter(Value::is_object),
+                description: match action.get("description") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(value)) => Some(value.clone()),
+                    Some(_) => {
+                        return Err(format!(
+                            "local_apis.{name}.actions.{action_name}.description must be a string"
+                        ));
+                    }
+                },
+                params_schema,
             },
         );
     }
-    if actions.is_empty() {
-        return None;
-    }
 
-    let timeout_seconds = map
-        .get("timeout_s")
-        .and_then(Value::as_f64)
-        .unwrap_or(30.0)
-        .clamp(0.1, 300.0);
-    let compatibility = valid_compatibility(map.get("compatibility"), &protocol);
-    Some(Endpoint {
+    let timeout_seconds = match map.get("timeout_s") {
+        None | Some(Value::Null) => 30.0,
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.1 && *value <= 300.0)
+            .ok_or_else(|| {
+                format!("local_apis.{name}.timeout_s must be between 0.1 and 300 seconds")
+            })?,
+    };
+    let compatibility = valid_compatibility(map.get("compatibility"), &protocol)
+        .map_err(|error| format!("local_apis.{name}.{error}"))?;
+    Ok(Endpoint {
         name: name.to_owned(),
         transport,
         protocol,
         path,
         timeout: Duration::from_secs_f64(timeout_seconds),
-        run_as: map.get("run_as").and_then(Value::as_str).map(str::to_owned),
+        run_as: match map.get("run_as") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_owned()),
+            Some(Value::String(_)) => None,
+            Some(_) => {
+                return Err(format!("local_apis.{name}.run_as must be a string"));
+            }
+        },
         actions,
         compatibility,
     })
 }
 
-fn endpoints(policy: &Policy) -> BTreeMap<String, Endpoint> {
+fn endpoints(policy: &Policy) -> Result<BTreeMap<String, Endpoint>, HandlerError> {
     policy
         .local_apis
         .iter()
-        .filter_map(|(name, raw)| {
-            endpoint_from_raw(name, raw).map(|endpoint| (name.clone(), endpoint))
+        .map(|(name, raw)| {
+            endpoint_from_raw(name, raw)
+                .map(|endpoint| (name.clone(), endpoint))
+                .map_err(|message| HandlerError::new("invalid_config", message))
         })
         .collect()
 }
 
+pub(crate) fn validate_config(
+    local_apis: &BTreeMap<String, yaml_serde::Value>,
+) -> Result<(), String> {
+    for (name, raw) in local_apis {
+        endpoint_from_raw(name, raw)?;
+    }
+    Ok(())
+}
+
 #[must_use]
 pub fn has_usable_endpoints(policy: &Policy) -> bool {
-    endpoints(policy)
-        .values()
-        .any(|endpoint| endpoint.transport == "unix")
+    match endpoints(policy) {
+        Ok(endpoints) => !endpoints.is_empty(),
+        Err(error) => {
+            tracing::error!(message = %error.message, "invalid local_api config reached runtime");
+            false
+        }
+    }
 }
 
 fn param_names(action: &Action) -> Vec<String> {
@@ -428,29 +565,73 @@ async fn connect(endpoint: &Endpoint) -> Result<UnixStream, HandlerError> {
     })
 }
 
+async fn read_until_bounded<R>(
+    reader: &mut R,
+    delimiter: u8,
+    max_bytes: usize,
+    label: &'static str,
+) -> Result<Vec<u8>, HandlerError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut out = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+        if available.is_empty() {
+            return Ok(out);
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == delimiter)
+            .map_or(available.len(), |index| index + 1);
+        if out.len().saturating_add(take) > max_bytes {
+            return Err(HandlerError::new(
+                "too_large",
+                format!("{label} exceeded the cap of {max_bytes} bytes"),
+            ));
+        }
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if out.last() == Some(&delimiter) {
+            return Ok(out);
+        }
+    }
+}
+
 async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
+    const MAX_HEADER_BYTES: usize = 128 * 1024;
+    const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
+
     let mut reader = BufReader::new(stream);
     let mut header = Vec::new();
     loop {
-        let mut line = Vec::new();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .await
-            .map_err(|e| HandlerError::new("bad_response", e.to_string()))?;
-        if read == 0 {
+        let remaining = MAX_HEADER_BYTES.saturating_sub(header.len());
+        if remaining == 0 {
+            return Err(HandlerError::new("too_large", "HTTP headers exceeded cap"));
+        }
+        let line = read_until_bounded(
+            &mut reader,
+            b'\n',
+            remaining.min(MAX_HEADER_LINE_BYTES),
+            "HTTP header line",
+        )
+        .await?;
+        if line.is_empty() {
             return Err(HandlerError::new(
                 "bad_response",
                 "endpoint closed before HTTP headers completed",
             ));
         }
-        header.extend(&line);
-        if header.ends_with(b"\r\n\r\n") || header.ends_with(b"\n\n") {
+        let blank = line == b"\r\n" || line == b"\n";
+        header.extend_from_slice(&line);
+        if blank {
             break;
         }
-        if header.len() > 128 * 1024 {
-            return Err(HandlerError::new("too_large", "HTTP headers exceeded cap"));
-        }
     }
+
     let head = String::from_utf8_lossy(&header);
     let mut lines = head.lines();
     let status_line = lines.next().unwrap_or("");
@@ -464,40 +645,70 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
                 format!("unparseable HTTP status: {status_line:?}"),
             )
         })?;
+
     let mut content_length = None;
     let mut chunked = false;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse::<usize>().ok();
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| HandlerError::new("bad_response", "invalid Content-Length header"))?;
+            if content_length.is_some_and(|existing| existing != parsed) {
+                return Err(HandlerError::new(
+                    "bad_response",
+                    "conflicting Content-Length headers",
+                ));
             }
-            if name.eq_ignore_ascii_case("transfer-encoding")
-                && value.trim().eq_ignore_ascii_case("chunked")
-            {
-                chunked = true;
-            }
+            content_length = Some(parsed);
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
         }
     }
 
     let body = if chunked {
         let mut body = Vec::new();
         loop {
-            let mut size_line = String::new();
-            reader
-                .read_line(&mut size_line)
-                .await
-                .map_err(|e| HandlerError::new("bad_response", e.to_string()))?;
+            let size_line =
+                read_until_bounded(&mut reader, b'\n', 8192, "HTTP chunk-size line").await?;
+            if size_line.is_empty() {
+                return Err(HandlerError::new(
+                    "bad_response",
+                    "endpoint closed before chunk size",
+                ));
+            }
+            let size_line = String::from_utf8_lossy(&size_line);
             let size_text = size_line.trim().split(';').next().unwrap_or("0");
             let size = usize::from_str_radix(size_text, 16)
                 .map_err(|_| HandlerError::new("bad_response", "invalid chunk size"))?;
             if size == 0 {
-                let mut trailer = String::new();
-                reader.read_line(&mut trailer).await.map_err(|e| {
-                    HandlerError::new(
-                        "bad_response",
-                        format!("failed reading chunked trailer: {e}"),
-                    )
-                })?;
+                let mut trailer_bytes = 0_usize;
+                loop {
+                    let trailer =
+                        read_until_bounded(&mut reader, b'\n', 16 * 1024, "HTTP trailer line")
+                            .await?;
+                    if trailer.is_empty() {
+                        return Err(HandlerError::new(
+                            "bad_response",
+                            "endpoint closed inside HTTP trailers",
+                        ));
+                    }
+                    trailer_bytes = trailer_bytes.saturating_add(trailer.len());
+                    if trailer_bytes > MAX_HEADER_BYTES {
+                        return Err(HandlerError::new("too_large", "HTTP trailers exceeded cap"));
+                    }
+                    if trailer == b"\r\n" || trailer == b"\n" {
+                        break;
+                    }
+                }
                 break;
             }
             if body.len().saturating_add(size) > MAX_RESPONSE_BYTES {
@@ -511,16 +722,21 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
             reader
                 .read_exact(&mut body[start..])
                 .await
-                .map_err(|e| HandlerError::new("bad_response", e.to_string()))?;
+                .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
             let mut crlf = [0_u8; 2];
             reader
                 .read_exact(&mut crlf)
                 .await
-                .map_err(|e| HandlerError::new("bad_response", e.to_string()))?;
+                .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+            if crlf != *b"\r\n" {
+                return Err(HandlerError::new(
+                    "bad_response",
+                    "chunk payload was not followed by CRLF",
+                ));
+            }
         }
         body
-    } else {
-        let length = content_length.unwrap_or(0);
+    } else if let Some(length) = content_length {
         if length > MAX_RESPONSE_BYTES {
             return Err(HandlerError::new(
                 "too_large",
@@ -532,7 +748,21 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
             reader
                 .read_exact(&mut body)
                 .await
-                .map_err(|e| HandlerError::new("bad_response", e.to_string()))?;
+                .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+        }
+        body
+    } else {
+        let mut body = Vec::new();
+        let mut limited = reader.take((MAX_RESPONSE_BYTES + 1) as u64);
+        limited
+            .read_to_end(&mut body)
+            .await
+            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(HandlerError::new(
+                "too_large",
+                "endpoint response exceeded the cap",
+            ));
         }
         body
     };
@@ -585,11 +815,65 @@ async fn call_http(
         .map_err(|_| HandlerError::new("timeout", "endpoint did not answer in time"))?
 }
 
+async fn kill_and_reap_relay(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    reason: &'static str,
+) -> Option<String> {
+    let mut cleanup_error = None;
+    let should_kill = match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            let message = format!(
+                "failed checking local-api relay state after {reason}: {error}; refusing PID-based group signal"
+            );
+            tracing::warn!(%message);
+            cleanup_error = Some(message);
+            false
+        }
+    };
+
+    #[cfg(unix)]
+    if should_kill {
+        if let Some(pid) = pid {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                && error != nix::errno::Errno::ESRCH
+            {
+                let message = format!("failed killing local-api relay process group: {error}");
+                tracing::warn!(%message);
+                cleanup_error.get_or_insert(message);
+            }
+        } else {
+            cleanup_error.get_or_insert_with(|| {
+                "local-api relay PID was unavailable; process group could not be killed".into()
+            });
+        }
+    }
+
+    #[cfg(not(unix))]
+    if should_kill && let Err(error) = child.kill().await {
+        let message = format!("failed killing local-api relay: {error}");
+        tracing::warn!(%message);
+        cleanup_error.get_or_insert(message);
+    }
+
+    if let Err(error) = child.wait().await {
+        let message = format!("failed reaping local-api relay: {error}");
+        tracing::warn!(%message);
+        cleanup_error.get_or_insert(message);
+    }
+    cleanup_error
+}
+
 async fn call_via_run_as(
     policy: &Policy,
     endpoint: &Endpoint,
     payload: &[u8],
 ) -> Result<Vec<u8>, HandlerError> {
+    const RELAY_STDERR_BYTES: usize = 64 * 1024;
+
     let executable = std::env::current_exe()
         .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
     let argv = relay_command(policy, endpoint, &executable)?;
@@ -612,52 +896,61 @@ async fn call_via_run_as(
     })?;
     let pid = child.id();
 
-    let work = async {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            HandlerError::new("internal_error", "run_as relay stdin was not piped")
-        })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HandlerError::new("internal_error", "run_as relay stdin was not piped"))?;
+    let write = async move {
         stdin
             .write_all(payload)
             .await
-            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+            .map_err(|error| std::io::Error::other(format!("relay stdin write failed: {error}")))?;
         drop(stdin);
-
-        child
-            .wait_with_output()
-            .await
-            .map_err(|error| HandlerError::new("bad_response", error.to_string()))
+        Ok::<(), std::io::Error>(())
     };
-
-    let output = match timeout(endpoint.timeout + Duration::from_secs(5), work).await {
-        Ok(result) => result?,
+    let work = async {
+        let capture = capture_bounded(&mut child, MAX_RESPONSE_BYTES, RELAY_STDERR_BYTES);
+        let (_, captured) = tokio::try_join!(write, capture)?;
+        Ok::<_, std::io::Error>(captured)
+    };
+    let captured = match timeout(endpoint.timeout + Duration::from_secs(5), work).await {
+        Ok(Ok(captured)) => captured,
+        Ok(Err(error)) => {
+            let cleanup_error = kill_and_reap_relay(&mut child, pid, "I/O failure").await;
+            return Err(HandlerError::with_details(
+                "bad_response",
+                format!("local-api relay I/O failed: {error}"),
+                cleanup_error
+                    .map(|error| Map::from_iter([("cleanup_error".into(), Value::String(error))]))
+                    .unwrap_or_default(),
+            ));
+        }
         Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                if let Err(error) =
-                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                    && error != nix::errno::Errno::ESRCH
-                {
-                    tracing::warn!(
-                        pid,
-                        %error,
-                        "failed killing timed-out local-api relay process group"
-                    );
-                }
-            }
-            return Err(HandlerError::new(
+            let cleanup_error = kill_and_reap_relay(&mut child, pid, "timeout").await;
+            return Err(HandlerError::with_details(
                 "timeout",
                 format!("{} did not answer in time", endpoint.name),
+                cleanup_error
+                    .map(|error| Map::from_iter([("cleanup_error".into(), Value::String(error))]))
+                    .unwrap_or_default(),
             ));
         }
     };
 
-    if output.status.success() && !output.stdout.is_empty() {
-        return Ok(output.stdout);
+    if captured.stdout.truncated() {
+        return Err(HandlerError::new(
+            "too_large",
+            "local-api relay response exceeded the cap",
+        ));
     }
 
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let rc = output.status.code().unwrap_or(-1);
+    let stdout = captured.stdout.rendered();
+    if captured.status.success() && !stdout.is_empty() {
+        return Ok(stdout);
+    }
+
+    let detail = captured.stderr.rendered_trimmed_lossy();
+    let rc = captured.status.code().unwrap_or(-1);
     if detail.contains("a password is required")
         || detail.contains("not allowed to execute")
         || (rc == 1 && detail.to_ascii_lowercase().contains("sudo"))
@@ -720,20 +1013,14 @@ async fn call_jsonrpc(
             .map_err(|e| HandlerError::new("endpoint_unreachable", e.to_string()))?;
 
         let mut reader = BufReader::new(stream);
-        let mut line = Vec::new();
-        timeout(endpoint.timeout, reader.read_until(b'\n', &mut line))
-            .await
-            .map_err(|_| HandlerError::new("timeout", "endpoint did not answer in time"))?
-            .map_err(|e| HandlerError::new("bad_response", e.to_string()))?;
-        line
+        timeout(
+            endpoint.timeout,
+            read_until_bounded(&mut reader, b'\n', MAX_RESPONSE_BYTES, "JSON-RPC response"),
+        )
+        .await
+        .map_err(|_| HandlerError::new("timeout", "endpoint did not answer in time"))??
     };
 
-    if line.len() > MAX_RESPONSE_BYTES {
-        return Err(HandlerError::new(
-            "too_large",
-            "endpoint response exceeded the cap",
-        ));
-    }
     if line.is_empty() {
         return Err(HandlerError::new(
             "bad_response",
@@ -760,22 +1047,11 @@ async fn ensure_compatible(policy: &Policy, endpoint: &Endpoint) -> Result<(), H
     let Some(constraint) = endpoint.compatibility.as_ref().and_then(Value::as_object) else {
         return Ok(());
     };
-    if constraint.is_empty() {
-        return Ok(());
-    }
 
-    if let Some(verdict) = compat_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&endpoint.name)
-        .cloned()
-    {
-        return match verdict {
-            CompatVerdict::Passed => Ok(()),
-            CompatVerdict::Failed { code, message } => Err(HandlerError::new(code, message)),
-        };
-    }
-
+    // Probe on every call. Each action opens a fresh local connection, so there
+    // is no reliable longer-lived "endpoint epoch" on which a cached verdict
+    // could be based. Re-probing prevents a restarted/upgraded service from
+    // inheriting a stale compatibility decision indefinitely.
     let probe = constraint
         .get("probe")
         .and_then(Value::as_object)
@@ -823,40 +1099,24 @@ async fn ensure_compatible(policy: &Policy, endpoint: &Endpoint) -> Result<(), H
             return Err(error);
         }
         Err(error) => {
-            let message = format!(
-                "could not read compatibility metadata {extract_path:?} from {:?}: {}",
-                endpoint.name, error.message
-            );
-            compat_cache()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(
-                    endpoint.name.clone(),
-                    CompatVerdict::Failed {
-                        code: "compatibility_unknown".into(),
-                        message: message.clone(),
-                    },
-                );
-            return Err(HandlerError::new("compatibility_unknown", message));
+            return Err(HandlerError::new(
+                "compatibility_unknown",
+                format!(
+                    "could not read compatibility metadata {extract_path:?} from {:?}: {}",
+                    endpoint.name, error.message
+                ),
+            ));
         }
     };
 
     let Some(found) = extract(&response, extract_path) else {
-        let message = format!(
-            "{:?} did not report {extract_path:?}, so its compatibility cannot be established",
-            endpoint.name
-        );
-        compat_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                endpoint.name.clone(),
-                CompatVerdict::Failed {
-                    code: "compatibility_unknown".into(),
-                    message: message.clone(),
-                },
-            );
-        return Err(HandlerError::new("compatibility_unknown", message));
+        return Err(HandlerError::new(
+            "compatibility_unknown",
+            format!(
+                "{:?} did not report {extract_path:?}, so its compatibility cannot be established",
+                endpoint.name
+            ),
+        ));
     };
 
     let accepted = if let Some(exact) = accept.get("exact") {
@@ -867,25 +1127,16 @@ async fn ensure_compatible(policy: &Policy, endpoint: &Endpoint) -> Result<(), H
         false
     };
 
-    let mut cache = compat_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if accepted {
-        cache.insert(endpoint.name.clone(), CompatVerdict::Passed);
         Ok(())
     } else {
-        let message = format!(
-            "{:?} reports {extract_path}={found}, which is not accepted by this profile",
-            endpoint.name
-        );
-        cache.insert(
-            endpoint.name.clone(),
-            CompatVerdict::Failed {
-                code: "compatibility_mismatch".into(),
-                message: message.clone(),
-            },
-        );
-        Err(HandlerError::new("compatibility_mismatch", message))
+        Err(HandlerError::new(
+            "compatibility_mismatch",
+            format!(
+                "{:?} reports {extract_path}={found}, which is not accepted by this profile",
+                endpoint.name
+            ),
+        ))
     }
 }
 
@@ -911,18 +1162,13 @@ async fn call_action(
         call_jsonrpc(policy, endpoint, action, params).await
     } {
         Ok(raw) => raw,
-        Err(error) => {
-            if matches!(error.code.as_str(), "endpoint_unreachable" | "timeout") {
-                forget_compatibility(&endpoint.name);
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     Ok(project(raw, &action.select))
 }
 
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    let endpoints = endpoints(policy);
+    let endpoints = endpoints(policy)?;
     let operation = payload
         .get("operation")
         .and_then(Value::as_str)
@@ -1059,13 +1305,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn half_written_compatibility_constraint_is_dropped() {
+    fn unknown_local_api_keys_fail_at_config_boundary() {
+        for text in [
+            "transport: unix
+protocol: jsonrpc
+path: /tmp/x.sock
+timeot_s: 2
+actions:
+  a: { method: a }
+",
+            "transport: unix
+protocol: jsonrpc
+path: /tmp/x.sock
+actions:
+  a: { method: a, descrption: nope }
+",
+            "transport: unix
+protocol: jsonrpc
+path: /tmp/x.sock
+compatibility:
+  probe: { method: version, methd: typo }
+  extract: protocol
+  accept: { exact: 1 }
+actions:
+  a: { method: a }
+",
+            "transport: unix
+protocol: jsonrpc
+path: /tmp/x.sock
+compatibility:
+  probe: { method: version }
+  extract: protocol
+  accept: { exact: 1, typo: 2 }
+actions:
+  a: { method: a }
+",
+        ] {
+            let raw: yaml_serde::Value = yaml_serde::from_str(text).unwrap();
+            assert!(
+                endpoint_from_raw("x", &raw).is_err(),
+                "unknown local_api key unexpectedly parsed: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn half_written_compatibility_constraint_is_rejected() {
         let raw: yaml_serde::Value = yaml_serde::from_str(
             "transport: unix\nprotocol: jsonrpc\npath: /tmp/x.sock\ncompatibility:\n  accept: { exact: 20 }\nactions:\n  a: { method: a }\n",
         )
         .unwrap();
-        let endpoint = endpoint_from_raw("x", &raw).unwrap();
-        assert!(endpoint.compatibility.is_none());
+        let error = endpoint_from_raw("x", &raw).unwrap_err();
+        assert!(error.contains("compatibility.probe"));
     }
 
     #[test]

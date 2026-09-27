@@ -2,7 +2,6 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sentinel0_proto::TRANSFER_CHUNK_BYTES;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -16,6 +15,7 @@ use std::{
 };
 
 const SESSION_TTL: Duration = Duration::from_secs(3600);
+const MAX_EXPORT_SESSIONS: usize = 256;
 
 #[derive(Debug)]
 struct ExportSession {
@@ -30,6 +30,11 @@ struct ExportSession {
 }
 
 type SessionMap = HashMap<String, Arc<Mutex<ExportSession>>>;
+
+pub struct ExportChunk {
+    pub result: BTreeMap<String, Value>,
+    pub binary_frame: Vec<u8>,
+}
 
 fn sessions() -> &'static Mutex<SessionMap> {
     static SESSIONS: OnceLock<Mutex<SessionMap>> = OnceLock::new();
@@ -54,6 +59,20 @@ fn sweep(map: &mut SessionMap) {
             .map(|session| session.created_at.elapsed() <= SESSION_TTL)
             .unwrap_or(false)
     });
+}
+
+fn ensure_session_capacity(map: &SessionMap, transfer_id: &str) -> Result<(), HandlerError> {
+    if map.contains_key(transfer_id) || map.len() < MAX_EXPORT_SESSIONS {
+        return Ok(());
+    }
+    Err(HandlerError::with_details(
+        "busy",
+        format!("too many active file-export sessions (limit {MAX_EXPORT_SESSIONS}); retry later"),
+        Map::from_iter([
+            ("retryable".into(), Value::Bool(true)),
+            ("limit".into(), Value::from(MAX_EXPORT_SESSIONS as u64)),
+        ]),
+    ))
 }
 
 pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -120,6 +139,7 @@ pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .lock()
         .map_err(|_| HandlerError::new("internal_error", "export session lock poisoned"))?;
     sweep(&mut map);
+    ensure_session_capacity(&map, &transfer_id)?;
     map.insert(transfer_id.clone(), Arc::new(Mutex::new(session)));
 
     Ok(BTreeMap::from([
@@ -135,7 +155,7 @@ pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
-pub async fn chunk(payload: &Map<String, Value>) -> HandlerResult {
+pub async fn chunk(payload: &Map<String, Value>) -> Result<ExportChunk, HandlerError> {
     let transfer_id = valid_transfer_id(payload)?;
     let index = payload
         .get("chunk_index")
@@ -147,7 +167,14 @@ pub async fn chunk(payload: &Map<String, Value>) -> HandlerResult {
             "chunk_index must be >= 0",
         ));
     }
-    let index = index as u64;
+    let index = u64::try_from(index)
+        .map_err(|_| HandlerError::new("invalid_payload", "chunk_index must be >= 0"))?;
+    let frame_index = u32::try_from(index).map_err(|_| {
+        HandlerError::new(
+            "invalid_payload",
+            "chunk_index exceeds the binary transfer protocol limit",
+        )
+    })?;
 
     let session = {
         let map = sessions()
@@ -197,16 +224,19 @@ pub async fn chunk(payload: &Map<String, Value>) -> HandlerResult {
     .await
     .map_err(|e| HandlerError::new("internal_error", format!("export worker failed: {e}")))??;
 
-    Ok(BTreeMap::from([
-        ("transfer_id".into(), Value::String(transfer_id)),
-        ("chunk_index".into(), Value::from(index)),
-        (
-            "__binary_payload__".into(),
-            Value::String(STANDARD.encode(&data)),
-        ),
-        ("bytes".into(), Value::from(bytes as u64)),
-        ("eof".into(), Value::Bool(eof)),
-    ]))
+    let transfer_bytes = crate::decode_transfer_id_hex(&transfer_id)
+        .map_err(|error| HandlerError::new("invalid_payload", error))?;
+    let binary_frame = sentinel0_proto::encode_binary_frame(transfer_bytes, frame_index, &data);
+
+    Ok(ExportChunk {
+        result: BTreeMap::from([
+            ("transfer_id".into(), Value::String(transfer_id)),
+            ("chunk_index".into(), Value::from(index)),
+            ("bytes".into(), Value::from(bytes as u64)),
+            ("eof".into(), Value::Bool(eof)),
+        ]),
+        binary_frame,
+    })
 }
 
 pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
@@ -258,6 +288,27 @@ mod tests {
     use crate::policy::{FileAccess, FileOpsPath};
     use tempfile::tempdir;
 
+    #[test]
+    fn export_session_store_is_bounded_but_replacement_is_allowed() {
+        let session = Arc::new(Mutex::new(ExportSession {
+            path: PathBuf::from("/tmp/x"),
+            size: 0,
+            chunk_size: 1,
+            num_chunks: 1,
+            filename: "x".into(),
+            created_at: Instant::now(),
+            hasher: Sha256::new(),
+            next_index: 0,
+        }));
+        let mut map = SessionMap::new();
+        for index in 0..MAX_EXPORT_SESSIONS {
+            map.insert(format!("{index:032x}"), Arc::clone(&session));
+        }
+        let error = ensure_session_capacity(&map, "ffffffffffffffffffffffffffffffff").unwrap_err();
+        assert_eq!(error.code, "busy");
+        assert!(ensure_session_capacity(&map, &format!("{:032x}", 0)).is_ok());
+    }
+
     #[tokio::test]
     async fn export_hashes_only_in_order_and_returns_binary_payload() {
         let dir = tempdir().unwrap();
@@ -291,12 +342,10 @@ mod tests {
         ]))
         .await
         .unwrap();
-        assert_eq!(
-            STANDARD
-                .decode(first["__binary_payload__"].as_str().unwrap())
-                .unwrap(),
-            b"abc"
-        );
+        let frame = sentinel0_proto::decode_binary_frame(&first.binary_frame).unwrap();
+        assert_eq!(frame.payload, b"abc");
+        assert_eq!(first.result["chunk_index"], 0);
+
         let _ = chunk(&Map::from_iter([
             ("transfer_id".into(), Value::String(transfer_id.into())),
             ("chunk_index".into(), Value::from(1)),

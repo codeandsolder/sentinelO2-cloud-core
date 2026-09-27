@@ -29,7 +29,6 @@ pub mod staging;
 pub mod tooling;
 pub mod upload;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
@@ -53,6 +52,33 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+const MAX_IN_FLIGHT_TASKS: usize = 64;
+
+fn overloaded_response(id: String, in_flight: usize) -> Message {
+    Message::Response {
+        id,
+        ok: false,
+        result: None,
+        error: Some(sentinel0_proto::ResponseError {
+            code: "busy".into(),
+            message: format!(
+                "agent is handling {in_flight} operations (limit {MAX_IN_FLIGHT_TASKS}); retry later"
+            ),
+            details: Some(BTreeMap::from([
+                ("retryable".into(), serde_json::Value::Bool(true)),
+                (
+                    "in_flight".into(),
+                    serde_json::Value::from(in_flight as u64),
+                ),
+                (
+                    "limit".into(),
+                    serde_json::Value::from(MAX_IN_FLIGHT_TASKS as u64),
+                ),
+            ])),
+        }),
+    }
+}
 
 #[derive(Clone)]
 pub struct AuthToken(String);
@@ -127,13 +153,37 @@ impl ReconnectPolicy {
     }
 }
 
+#[derive(Debug)]
+pub struct DispatchResponse {
+    pub message: Message,
+    pub binary_frame: Option<Vec<u8>>,
+}
+
+impl DispatchResponse {
+    #[must_use]
+    pub fn message(message: Message) -> Self {
+        Self {
+            message,
+            binary_frame: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_binary(message: Message, binary_frame: Vec<u8>) -> Self {
+        Self {
+            message,
+            binary_frame: Some(binary_frame),
+        }
+    }
+}
+
 pub trait Dispatcher: Send + Sync + 'static {
     fn dispatch(
         &self,
         id: &str,
         op: Op,
         payload: serde_json::Map<String, serde_json::Value>,
-    ) -> impl std::future::Future<Output = Message> + Send;
+    ) -> impl std::future::Future<Output = DispatchResponse> + Send;
 }
 
 #[derive(Debug, Default)]
@@ -145,8 +195,8 @@ impl Dispatcher for UnsupportedDispatcher {
         id: &str,
         op: Op,
         _payload: serde_json::Map<String, serde_json::Value>,
-    ) -> Message {
-        Message::Response {
+    ) -> DispatchResponse {
+        DispatchResponse::message(Message::Response {
             id: id.into(),
             ok: false,
             result: None,
@@ -155,7 +205,7 @@ impl Dispatcher for UnsupportedDispatcher {
                 message: format!("agent does not support op: {op}"),
                 details: None,
             }),
-        }
+        })
     }
 }
 
@@ -232,6 +282,7 @@ enum SessionEnd {
 
 struct Outbound {
     message: Message,
+    binary_frame: Option<Vec<u8>>,
     clear_after_send: Option<PathBuf>,
 }
 
@@ -384,11 +435,11 @@ impl<D: Dispatcher> Agent<D> {
         }
 
         for (path, event) in drain_pending(self.config.upload_base.clone()).await {
-            if ws
+            if let Err(error) = ws
                 .send(WsMessage::Text(serde_json::to_string(&event)?.into()))
                 .await
-                .is_err()
             {
+                debug!(?error, path = %path.display(), "pending-result replay interrupted by session loss");
                 break;
             }
             clear_pending(Some(path)).await;
@@ -416,61 +467,21 @@ impl<D: Dispatcher> Agent<D> {
                         return Ok(SessionEnd::Lost(None));
                     }
                 }
+                completed = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = completed
+                        && !error.is_cancelled()
+                    {
+                        warn!(?error, "request task failed");
+                    }
+                }
                 outbound = response_rx.recv() => {
                     if let Some(outbound) = outbound {
-                        let mut message = outbound.message;
+                        let message = outbound.message;
 
-                        if let Message::Response {
-                            id,
-                            ok: true,
-                            result: Some(result),
-                            ..
-                        } = &mut message
-                            && let Some(encoded) = result
-                                .remove("__binary_payload__")
-                                .and_then(|value| value.as_str().map(str::to_owned))
+                        if let Some(frame) = outbound.binary_frame
+                            && ws.send(WsMessage::Binary(frame.into())).await.is_err()
                         {
-                                let binary = (|| -> Result<Vec<u8>, String> {
-                                    let transfer_id = result
-                                        .get("transfer_id")
-                                        .and_then(serde_json::Value::as_str)
-                                        .ok_or_else(|| "missing transfer_id".to_string())?;
-                                    let chunk_index = result
-                                        .get("chunk_index")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .ok_or_else(|| "missing chunk_index".to_string())?;
-                                    let chunk_index = u32::try_from(chunk_index)
-                                        .map_err(|_| "chunk_index exceeds u32".to_string())?;
-                                    let transfer_id = decode_transfer_id_hex(transfer_id)?;
-                                    let payload = STANDARD
-                                        .decode(encoded)
-                                        .map_err(|error| format!("invalid internal binary payload: {error}"))?;
-                                    Ok(sentinel0_proto::encode_binary_frame(
-                                        transfer_id,
-                                        chunk_index,
-                                        &payload,
-                                    ))
-                                })();
-
-                                match binary {
-                                    Ok(frame) => {
-                                        if ws.send(WsMessage::Binary(frame.into())).await.is_err() {
-                                            return Ok(SessionEnd::Lost(None));
-                                        }
-                                    }
-                                    Err(error) => {
-                                        message = Message::Response {
-                                            id: id.clone(),
-                                            ok: false,
-                                            result: None,
-                                            error: Some(sentinel0_proto::ResponseError {
-                                                code: "binary_emit_error".into(),
-                                                message: error,
-                                                details: None,
-                                            }),
-                                        };
-                                    }
-                                }
+                            return Ok(SessionEnd::Lost(None));
                         }
 
                         let is_response = matches!(message, Message::Response { .. });
@@ -499,8 +510,16 @@ impl<D: Dispatcher> Agent<D> {
                             });
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            let Ok(msg) = serde_json::from_str::<Message>(&text) else {
-                                continue;
+                            let msg = match serde_json::from_str::<Message>(&text) {
+                                Ok(msg) => msg,
+                                Err(error) => {
+                                    warn!(
+                                        %error,
+                                        bytes = text.len(),
+                                        "discarding malformed hub JSON message"
+                                    );
+                                    continue;
+                                }
                             };
                             match msg {
                                 Message::Ping { .. } => {
@@ -511,6 +530,25 @@ impl<D: Dispatcher> Agent<D> {
                                     }
                                 }
                                 Message::Request { id, op, payload, .. } => {
+                                    if tasks.len() >= MAX_IN_FLIGHT_TASKS {
+                                        let response = overloaded_response(id, tasks.len());
+                                        warn!(
+                                            in_flight = tasks.len(),
+                                            limit = MAX_IN_FLIGHT_TASKS,
+                                            %op,
+                                            "rejecting request while agent is overloaded"
+                                        );
+                                        if ws
+                                            .send(WsMessage::Text(
+                                                serde_json::to_string(&response)?.into(),
+                                            ))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return Ok(SessionEnd::Lost(None));
+                                        }
+                                        continue;
+                                    }
                                     let received_at = unix_time_seconds();
                                     let background = payload
                                         .get("background")
@@ -520,6 +558,29 @@ impl<D: Dispatcher> Agent<D> {
                                     let response_tx = response_tx.clone();
                                     let payload: serde_json::Map<String, serde_json::Value> =
                                         payload.into_iter().collect();
+
+                                    if background && op == Op::FileExportChunk {
+                                        let response = Message::Response {
+                                            id,
+                                            ok: false,
+                                            result: None,
+                                            error: Some(sentinel0_proto::ResponseError {
+                                                code: "background_not_supported".into(),
+                                                message: "file_export_chunk returns a binary frame and cannot run as a background job".into(),
+                                                details: None,
+                                            }),
+                                        };
+                                        if ws
+                                            .send(WsMessage::Text(
+                                                serde_json::to_string(&response)?.into(),
+                                            ))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return Ok(SessionEnd::Lost(None));
+                                        }
+                                        continue;
+                                    }
 
                                     if background {
                                         let job_id = payload
@@ -555,13 +616,38 @@ impl<D: Dispatcher> Agent<D> {
                                         let host_id = self.config.host.id.clone();
                                         let upload_base = self.config.upload_base.clone();
                                         tasks.spawn(async move {
-                                            let mut response =
+                                            let dispatched =
                                                 dispatch_safely(dispatcher, id.clone(), op, payload).await;
-                                            if let Ok(mut bounded) = serde_json::to_value(&response) {
-                                                let _truncation = bound_response_default(&mut bounded);
-                                                if let Ok(parsed) = serde_json::from_value(bounded) {
-                                                    response = parsed;
+                                            let mut response = dispatched.message;
+                                            if dispatched.binary_frame.is_some() {
+                                                response = Message::Response {
+                                                    id: id.clone(),
+                                                    ok: false,
+                                                    result: None,
+                                                    error: Some(sentinel0_proto::ResponseError {
+                                                        code: "background_not_supported".into(),
+                                                        message: "binary responses cannot be persisted as background jobs".into(),
+                                                        details: None,
+                                                    }),
+                                                };
+                                            }
+                                            match serde_json::to_value(&response) {
+                                                Ok(mut bounded) => {
+                                                    let _truncation = bound_response_default(&mut bounded);
+                                                    match serde_json::from_value(bounded) {
+                                                        Ok(parsed) => response = parsed,
+                                                        Err(error) => warn!(
+                                                            ?error,
+                                                            %job_id,
+                                                            "failed to decode bounded background completion"
+                                                        ),
+                                                    }
                                                 }
+                                                Err(error) => warn!(
+                                                    ?error,
+                                                    %job_id,
+                                                    "failed to encode background completion for bounding"
+                                                ),
                                             }
                                             let finished_at = Utc::now();
                                             let data = jobs::build_completed_event_data(
@@ -589,6 +675,7 @@ impl<D: Dispatcher> Agent<D> {
                                             if let Err(error) = response_tx
                                                 .send(Outbound {
                                                     message: event,
+                                                    binary_frame: None,
                                                     clear_after_send: pending_path,
                                                 })
                                                 .await
@@ -598,13 +685,12 @@ impl<D: Dispatcher> Agent<D> {
                                         });
                                     } else {
                                         tasks.spawn(async move {
-                                            let mut response =
+                                            let mut dispatched =
                                                 dispatch_safely(dispatcher, id.clone(), op, payload).await;
                                             if let Message::Response {
                                                 result: Some(result),
                                                 ..
-                                            } = &mut response
-                                                && !result.contains_key("__binary_payload__")
+                                            } = &mut dispatched.message
                                             {
                                                 result.insert(
                                                     "_sx_timing".into(),
@@ -616,7 +702,8 @@ impl<D: Dispatcher> Agent<D> {
                                             }
                                             if let Err(error) = response_tx
                                                 .send(Outbound {
-                                                    message: response,
+                                                    message: dispatched.message,
+                                                    binary_frame: dispatched.binary_frame,
                                                     clear_after_send: None,
                                                 })
                                                 .await
@@ -646,6 +733,47 @@ impl<D: Dispatcher> Agent<D> {
                                 .map(|byte| format!("{byte:02x}"))
                                 .collect::<String>();
                             let chunk_index = frame.chunk_index;
+                            if tasks.len() >= MAX_IN_FLIGHT_TASKS {
+                                let data = BTreeMap::from([
+                                    (
+                                        "transfer_id".into(),
+                                        serde_json::Value::String(transfer_id),
+                                    ),
+                                    (
+                                        "chunk_index".into(),
+                                        serde_json::Value::from(chunk_index),
+                                    ),
+                                    ("ok".into(), serde_json::Value::Bool(false)),
+                                    (
+                                        "error".into(),
+                                        serde_json::Value::String(format!(
+                                            "busy: agent has {} in-flight operations (limit {})",
+                                            tasks.len(),
+                                            MAX_IN_FLIGHT_TASKS
+                                        )),
+                                    ),
+                                ]);
+                                warn!(
+                                    in_flight = tasks.len(),
+                                    limit = MAX_IN_FLIGHT_TASKS,
+                                    "rejecting transfer chunk while agent is overloaded"
+                                );
+                                if ws
+                                    .send(WsMessage::Text(
+                                        serde_json::to_string(&Message::Event {
+                                            kind: "transfer_chunk_ack".into(),
+                                            data,
+                                            timestamp: Utc::now(),
+                                        })?
+                                        .into(),
+                                    ))
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(SessionEnd::Lost(None));
+                                }
+                                continue;
+                            }
                             let payload = frame.payload.to_vec();
                             let upload_base = self.config.upload_base.clone();
                             let response_tx = response_tx.clone();
@@ -708,6 +836,7 @@ impl<D: Dispatcher> Agent<D> {
                                             data,
                                             timestamp: Utc::now(),
                                         },
+                                        binary_frame: None,
                                         clear_after_send: None,
                                     })
                                     .await
@@ -729,7 +858,7 @@ async fn dispatch_safely<D: Dispatcher>(
     id: String,
     op: Op,
     payload: serde_json::Map<String, serde_json::Value>,
-) -> Message {
+) -> DispatchResponse {
     match AssertUnwindSafe(dispatcher.dispatch(&id, op, payload))
         .catch_unwind()
         .await
@@ -737,7 +866,7 @@ async fn dispatch_safely<D: Dispatcher>(
         Ok(response) => response,
         Err(_) => {
             warn!(%id, %op, "dispatcher panicked; converting panic into internal_error");
-            Message::Response {
+            DispatchResponse::message(Message::Response {
                 id,
                 ok: false,
                 result: None,
@@ -746,7 +875,7 @@ async fn dispatch_safely<D: Dispatcher>(
                     message: "operation handler panicked".into(),
                     details: None,
                 }),
-            }
+            })
         }
     }
 }

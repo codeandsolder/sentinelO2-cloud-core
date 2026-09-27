@@ -505,11 +505,17 @@ pub fn upload_chunk(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     if index < 0 {
         return Err(HandlerError::new("invalid_payload", "index must be >= 0"));
     }
+    let index = u32::try_from(index).map_err(|_| {
+        HandlerError::new(
+            "invalid_payload",
+            "index exceeds the chunked upload protocol limit",
+        )
+    })?;
     let encoded = require_str(payload, "content_base64")?;
     let bytes = STANDARD
         .decode(encoded)
         .map_err(|e| HandlerError::new("invalid_payload", format!("bad base64: {e}")))?;
-    write_transfer_part(policy, id, index as u32, &bytes)?;
+    write_transfer_part(policy, id, index, &bytes)?;
 
     Ok(BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
@@ -664,6 +670,34 @@ mod tests {
             upload_base: root.to_owned(),
             ..Policy::default()
         }
+    }
+
+    #[test]
+    fn legacy_json_chunk_index_must_fit_binary_protocol_width() {
+        let dir = tempdir().unwrap();
+        let policy = policy(dir.path());
+        let init = upload_init(
+            &policy,
+            &Map::from_iter([
+                ("target_path".into(), Value::String("x.bin".into())),
+                ("total_size".into(), Value::from(1)),
+            ]),
+        )
+        .unwrap();
+        let id = init["upload_id"].as_str().unwrap();
+        let error = upload_chunk(
+            &policy,
+            &Map::from_iter([
+                ("upload_id".into(), Value::String(id.into())),
+                ("index".into(), Value::from(u64::from(u32::MAX) + 1)),
+                (
+                    "content_base64".into(),
+                    Value::String(STANDARD.encode(b"x")),
+                ),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_payload");
     }
 
     #[test]

@@ -161,9 +161,9 @@ fn persist_rotated_to(
         hub,
     })?;
     let temp = parent.join(format!(
-        ".idrot-{}-{}",
+        ".idrot-{}-{:016x}",
         std::process::id(),
-        chrono::Utc::now().timestamp_micros()
+        rand::random::<u64>()
     ));
 
     let write_result = (|| -> Result<(), std::io::Error> {
@@ -176,13 +176,28 @@ fn persist_rotated_to(
         file.write_all(b"\n")?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
+        if let Err(error) = fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "rotated credential was committed, but parent-directory fsync failed; crash durability is not guaranteed"
+            );
+        }
         Ok(())
     })();
 
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp);
+    if let Err(error) = write_result {
+        if let Err(cleanup) = fs::remove_file(&temp)
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %temp.display(),
+                %cleanup,
+                "failed cleaning credential-rotation temp file"
+            );
+        }
+        return Err(error.into());
     }
-    write_result?;
     Ok(())
 }
 
