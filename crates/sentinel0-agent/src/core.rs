@@ -1,5 +1,5 @@
 use crate::{
-    Dispatcher, edit, fileops,
+    DispatchResponse, Dispatcher, edit, fileops,
     handler_error::{HandlerError, HandlerResult, require_str},
     host,
     policy::Policy,
@@ -14,40 +14,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-
-pub const IMPLEMENTED_OPS: &[Op] = &[
-    Op::Ping,
-    Op::Capabilities,
-    Op::Help,
-    Op::State,
-    Op::Exec,
-    Op::ScriptRun,
-    Op::Service,
-    Op::Restart,
-    Op::Edit,
-    Op::EditUploadInit,
-    Op::EditUploadFile,
-    Op::EditUploadComplete,
-    Op::Git,
-    Op::Read,
-    Op::List,
-    Op::Search,
-    Op::Move,
-    Op::Copy,
-    Op::Delete,
-    Op::Chmod,
-    Op::Chown,
-    Op::UploadInit,
-    Op::UploadChunk,
-    Op::UploadComplete,
-    Op::UploadFile,
-    Op::FileExportInit,
-    Op::FileExportChunk,
-    Op::FileExportComplete,
-    Op::ProjectSnapshot,
-    Op::ReadAudit,
-    Op::LocalApi,
-];
 
 #[derive(Clone)]
 pub struct CoreDispatcher {
@@ -72,7 +38,7 @@ impl CoreDispatcher {
 
     #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
-        IMPLEMENTED_OPS
+        Op::ALL
             .iter()
             .filter(|op| self.op_enabled(**op))
             .map(|op| op.as_str().to_owned())
@@ -345,23 +311,33 @@ impl CoreDispatcher {
             .policy
             .playbooks
             .iter()
-            .filter_map(|(name, value)| {
+            .map(|(name, value)| {
                 serde_json::to_value(value)
-                    .ok()
                     .map(|value| (name.clone(), value))
+                    .map_err(|error| {
+                        HandlerError::new(
+                            "internal_error",
+                            format!("playbook {name:?} could not be serialized: {error}"),
+                        )
+                    })
             })
-            .collect::<Map<String, Value>>();
+            .collect::<Result<Map<String, Value>, HandlerError>>()?;
 
         let mut locations = self
             .policy
             .locations
             .iter()
-            .filter_map(|(name, value)| {
+            .map(|(name, value)| {
                 serde_json::to_value(value)
-                    .ok()
                     .map(|value| (name.clone(), value))
+                    .map_err(|error| {
+                        HandlerError::new(
+                            "internal_error",
+                            format!("location {name:?} could not be serialized: {error}"),
+                        )
+                    })
             })
-            .collect::<Map<String, Value>>();
+            .collect::<Result<Map<String, Value>, HandlerError>>()?;
         locations.entry("config").or_insert_with(|| {
             json!({
                 "path": self.config_path.display().to_string(),
@@ -941,30 +917,36 @@ impl CoreDispatcher {
 }
 
 impl Dispatcher for CoreDispatcher {
-    async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> Message {
-        if !IMPLEMENTED_OPS.contains(&op) || !self.op_enabled(op) {
-            return Self::response(
+    async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> DispatchResponse {
+        if !self.op_enabled(op) {
+            return DispatchResponse::message(Self::response(
                 id,
                 Err(HandlerError::new(
                     "unsupported_op",
                     format!("agent does not support op: {op}"),
                 )),
-            );
+            ));
         }
 
         let started = Instant::now();
         let audit_payload = crate::local_audit::summarize_payload(&payload);
-        let result = match op {
-            Op::Ping => self.ping(),
-            Op::Capabilities => self.capabilities_result(&payload),
-            Op::Help => self.help(&payload),
-            Op::State => self.state(),
-            Op::Exec => self.exec(&payload).await,
-            Op::ScriptRun => crate::script::handle(&self.policy, &payload).await,
-            Op::UploadFile => crate::upload::upload_file(&self.policy, &payload).await,
-            Op::FileExportChunk => crate::file_export::chunk(&payload).await,
-            Op::Service => self.service(&payload, false).await,
-            Op::Restart => self.service(&payload, true).await,
+        let (result, binary_frame) = match op {
+            Op::Ping => (self.ping(), None),
+            Op::Capabilities => (self.capabilities_result(&payload), None),
+            Op::Help => (self.help(&payload), None),
+            Op::State => (self.state(), None),
+            Op::Exec => (self.exec(&payload).await, None),
+            Op::ScriptRun => (crate::script::handle(&self.policy, &payload).await, None),
+            Op::UploadFile => (
+                crate::upload::upload_file(&self.policy, &payload).await,
+                None,
+            ),
+            Op::FileExportChunk => match crate::file_export::chunk(&payload).await {
+                Ok(chunk) => (Ok(chunk.result), Some(chunk.binary_frame)),
+                Err(error) => (Err(error), None),
+            },
+            Op::Service => (self.service(&payload, false).await, None),
+            Op::Restart => (self.service(&payload, true).await, None),
             Op::Read
             | Op::List
             | Op::Search
@@ -981,11 +963,14 @@ impl Dispatcher for CoreDispatcher {
             | Op::Copy
             | Op::Delete
             | Op::Chmod
-            | Op::Chown => self.blocking_file_op(op, payload).await,
-            Op::Git => crate::git_ops::handle(&self.policy, &payload).await,
-            Op::ProjectSnapshot => crate::project_snapshot::handle(&self.policy, &payload).await,
-            Op::ReadAudit => self.read_audit(&payload).await,
-            Op::LocalApi => crate::local_api::handle(&self.policy, &payload).await,
+            | Op::Chown => (self.blocking_file_op(op, payload).await, None),
+            Op::Git => (crate::git_ops::handle(&self.policy, &payload).await, None),
+            Op::ProjectSnapshot => (
+                crate::project_snapshot::handle(&self.policy, &payload).await,
+                None,
+            ),
+            Op::ReadAudit => (self.read_audit(&payload).await, None),
+            Op::LocalApi => (crate::local_api::handle(&self.policy, &payload).await, None),
         };
 
         let message = Self::response(id, result);
@@ -1029,7 +1014,10 @@ impl Dispatcher for CoreDispatcher {
         if let Err(error) = audit_task.await {
             tracing::warn!(?error, "local audit task failed");
         }
-        message
+        match binary_frame {
+            Some(frame) => DispatchResponse::with_binary(message, frame),
+            None => DispatchResponse::message(message),
+        }
     }
 }
 
@@ -1045,12 +1033,15 @@ mod tests {
         let Message::Response {
             result: Some(result),
             ..
-        } = dispatcher.dispatch("x", Op::Capabilities, Map::new()).await
+        } = dispatcher
+            .dispatch("x", Op::Capabilities, Map::new())
+            .await
+            .message
         else {
             panic!("expected capabilities response");
         };
         let advertised = result["ops_supported"].as_array().unwrap();
-        assert_eq!(advertised.len(), IMPLEMENTED_OPS.len() - 1);
+        assert_eq!(advertised.len(), Op::ALL.len() - 1);
         assert!(!advertised.iter().any(|value| value == "local_api"));
 
         let mut policy = Policy::default();
@@ -1068,7 +1059,7 @@ mod tests {
                 .iter()
                 .filter(|name| name.as_str() != "opaque_ref")
                 .count(),
-            IMPLEMENTED_OPS.len()
+            Op::ALL.len()
         );
         assert!(capabilities.iter().any(|name| name == "local_api"));
     }
@@ -1245,6 +1236,7 @@ mod tests {
                 Map::from_iter([("command".into(), Value::String("printf ok".into()))]),
             )
             .await
+            .message
         else {
             panic!("exec failed");
         };
@@ -1259,6 +1251,7 @@ mod tests {
                 Map::from_iter([("path".into(), Value::String(file.display().to_string()))]),
             )
             .await
+            .message
         else {
             panic!("read failed");
         };

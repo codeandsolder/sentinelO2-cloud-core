@@ -6,7 +6,8 @@
 use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{
-    Agent, AgentConfig, AgentError, AuthToken, Dispatcher, ReconnectPolicy, UnsupportedDispatcher,
+    Agent, AgentConfig, AgentError, AuthToken, DispatchResponse, Dispatcher, ReconnectPolicy,
+    UnsupportedDispatcher,
     core::CoreDispatcher,
     pending_results,
     policy::{FileAccess, FileOpsPath, Policy},
@@ -280,16 +281,16 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() {
 struct EchoDispatcher;
 
 impl Dispatcher for EchoDispatcher {
-    async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> Message {
+    async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> DispatchResponse {
         let mut result = BTreeMap::new();
         result.insert("op".into(), Value::String(op.as_str().into()));
         result.insert("payload".into(), Value::Object(payload));
-        Message::Response {
+        DispatchResponse::message(Message::Response {
             id: id.into(),
             ok: true,
             result: Some(result),
             error: None,
-        }
+        })
     }
 }
 
@@ -361,14 +362,14 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
 struct SlowDispatcher;
 
 impl Dispatcher for SlowDispatcher {
-    async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> Message {
+    async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> DispatchResponse {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        Message::Response {
+        DispatchResponse::message(Message::Response {
             id: id.into(),
             ok: true,
             result: Some(BTreeMap::new()),
             error: None,
-        }
+        })
     }
 }
 
@@ -508,9 +509,9 @@ async fn held_job_completion_replays_after_welcome_and_is_cleared() {
 struct JobDispatcher;
 
 impl Dispatcher for JobDispatcher {
-    async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> Message {
+    async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> DispatchResponse {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        Message::Response {
+        DispatchResponse::message(Message::Response {
             id: id.into(),
             ok: true,
             result: Some(BTreeMap::from([
@@ -518,7 +519,7 @@ impl Dispatcher for JobDispatcher {
                 ("output".into(), Value::String("job done".into())),
             ])),
             error: None,
-        }
+        })
     }
 }
 
@@ -826,7 +827,7 @@ async fn unrelated_application_traffic_does_not_mask_missing_heartbeat_pong() {
 struct PanickingDispatcher;
 
 impl Dispatcher for PanickingDispatcher {
-    async fn dispatch(&self, _id: &str, _op: Op, _payload: Map<String, Value>) -> Message {
+    async fn dispatch(&self, _id: &str, _op: Op, _payload: Map<String, Value>) -> DispatchResponse {
         panic!("intentional dispatcher panic fixture");
     }
 }

@@ -1,6 +1,7 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
+    process_output::capture_bounded,
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -9,16 +10,65 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    time::timeout,
-};
+use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
 const NET_TIMEOUT: Duration = Duration::from_secs(50);
 const MAX_PATCH: usize = 5 * 1024 * 1024;
 const MAX_DIFF_PATCH: usize = 128 * 1024;
+const MAX_GIT_STDOUT: usize = 32 * 1024 * 1024;
+const MAX_GIT_STDERR: usize = 1024 * 1024;
+
+async fn cleanup_git_child(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    reason: &'static str,
+) -> Option<String> {
+    let mut cleanup_error = None;
+    let should_kill = match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            let message = format!(
+                "failed checking git child state after {reason}: {error}; refusing PID-based group signal"
+            );
+            tracing::warn!(%message);
+            cleanup_error = Some(message);
+            false
+        }
+    };
+
+    #[cfg(unix)]
+    if should_kill {
+        if let Some(pid) = pid {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                && error != nix::errno::Errno::ESRCH
+            {
+                let message = format!("failed killing git process group: {error}");
+                tracing::warn!(pid, %message);
+                cleanup_error.get_or_insert(message);
+            }
+        } else {
+            cleanup_error
+                .get_or_insert_with(|| "git PID unavailable; process group not killed".into());
+        }
+    }
+
+    #[cfg(not(unix))]
+    if should_kill && let Err(error) = child.kill().await {
+        let message = format!("failed killing git child: {error}");
+        tracing::warn!(%message);
+        cleanup_error.get_or_insert(message);
+    }
+
+    if let Err(error) = child.wait().await {
+        let message = format!("failed reaping git child: {error}");
+        tracing::warn!(%message);
+        cleanup_error.get_or_insert(message);
+    }
+    cleanup_error
+}
 
 async fn run_git(
     policy: &Policy,
@@ -56,51 +106,77 @@ async fn run_git(
         .spawn()
         .map_err(|e| HandlerError::new("git_failed", format!("failed to start git: {e}")))?;
     let pid = child.id();
+    let mut stdin_pipe = child.stdin.take();
 
     let work = async {
+        let capture = capture_bounded(&mut child, MAX_GIT_STDOUT, MAX_GIT_STDERR);
         if let Some(input) = stdin {
-            let Some(mut pipe) = child.stdin.take() else {
-                return Err(HandlerError::new("git_failed", "git stdin was unavailable"));
+            let mut pipe = stdin_pipe
+                .take()
+                .ok_or_else(|| std::io::Error::other("git stdin was unavailable"))?;
+            let write = async move {
+                pipe.write_all(input).await?;
+                drop(pipe);
+                Ok::<(), std::io::Error>(())
             };
-            pipe.write_all(input).await.map_err(|e| {
-                HandlerError::new("git_failed", format!("failed writing git stdin: {e}"))
-            })?;
-            drop(pipe);
+            let (_, captured) = tokio::try_join!(write, capture)?;
+            Ok::<_, std::io::Error>(captured)
+        } else {
+            capture.await
         }
-
-        child
-            .wait_with_output()
-            .await
-            .map_err(|e| HandlerError::new("git_failed", format!("git failed: {e}")))
     };
 
-    match timeout(limit, work).await {
-        Ok(Ok(output)) => Ok((
-            output.status.code().unwrap_or(-1),
-            output.stdout,
-            output.stderr,
-        )),
-        Ok(Err(error)) => Err(error),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                if let Err(error) =
-                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                    && error != nix::errno::Errno::ESRCH
-                {
-                    tracing::warn!(pid, %error, "failed killing timed-out git process group");
-                }
+    let captured = match timeout(limit, work).await {
+        Ok(Ok(captured)) => captured,
+        Ok(Err(error)) => {
+            let cleanup_error = cleanup_git_child(&mut child, pid, "I/O failure").await;
+            let mut details = Map::new();
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
             }
-            Err(HandlerError::new(
+            return Err(HandlerError::with_details(
+                "git_failed",
+                format!("git I/O failed: {error}"),
+                details,
+            ));
+        }
+        Err(_) => {
+            let cleanup_error = cleanup_git_child(&mut child, pid, "timeout").await;
+            let mut details = Map::new();
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
+            }
+            return Err(HandlerError::with_details(
                 "git_timeout",
                 format!(
                     "git {} timed out",
                     args.first().map(String::as_str).unwrap_or("?")
                 ),
-            ))
+                details,
+            ));
         }
+    };
+
+    if captured.stdout.truncated() {
+        return Err(HandlerError::with_details(
+            "git_output_too_large",
+            format!(
+                "git {} stdout exceeded the {} byte capture ceiling",
+                args.first().map(String::as_str).unwrap_or("?"),
+                MAX_GIT_STDOUT
+            ),
+            Map::from_iter([(
+                "stdout_bytes".into(),
+                Value::from(captured.stdout.total_bytes()),
+            )]),
+        ));
     }
+
+    Ok((
+        captured.status.code().unwrap_or(-1),
+        captured.stdout.rendered(),
+        captured.stderr.rendered(),
+    ))
 }
 
 async fn run_git_capped_stdout(
@@ -134,67 +210,49 @@ async fn run_git_capped_stdout(
         .spawn()
         .map_err(|e| HandlerError::new("git_failed", format!("failed to start git: {e}")))?;
     let pid = child.id();
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| HandlerError::new("git_failed", "git stdout was unavailable"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| HandlerError::new("git_failed", "git stderr was unavailable"))?;
-
-    let work = async {
-        let stdout_task = async {
-            let keep_limit = cap.saturating_add(1);
-            let mut kept = Vec::with_capacity(keep_limit.min(64 * 1024));
-            let mut buffer = [0_u8; 16 * 1024];
-            loop {
-                let read = stdout.read(&mut buffer).await?;
-                if read == 0 {
-                    break;
-                }
-                let room = keep_limit.saturating_sub(kept.len());
-                if room != 0 {
-                    kept.extend_from_slice(&buffer[..read.min(room)]);
-                }
+    let captured = match timeout(
+        limit,
+        capture_bounded(&mut child, cap.saturating_add(1), MAX_GIT_STDERR),
+    )
+    .await
+    {
+        Ok(Ok(captured)) => captured,
+        Ok(Err(error)) => {
+            let cleanup_error = cleanup_git_child(&mut child, pid, "I/O failure").await;
+            let mut details = Map::new();
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
             }
-            Ok::<Vec<u8>, std::io::Error>(kept)
-        };
-        let stderr_task = async {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).await?;
-            Ok::<Vec<u8>, std::io::Error>(bytes)
-        };
-        let (stdout, stderr, status) = tokio::try_join!(stdout_task, stderr_task, child.wait())?;
-        Ok::<_, std::io::Error>((status, stdout, stderr))
-    };
-
-    match timeout(limit, work).await {
-        Ok(Ok((status, stdout, stderr))) => {
-            let exceeded = stdout.len() > cap;
-            Ok((status.code().unwrap_or(-1), stdout, stderr, exceeded))
+            return Err(HandlerError::with_details(
+                "git_failed",
+                format!("git I/O failed: {error}"),
+                details,
+            ));
         }
-        Ok(Err(e)) => Err(HandlerError::new("git_failed", format!("git failed: {e}"))),
         Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                if let Err(error) =
-                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                    && error != nix::errno::Errno::ESRCH
-                {
-                    tracing::warn!(pid, %error, "failed killing timed-out git process group");
-                }
+            let cleanup_error = cleanup_git_child(&mut child, pid, "timeout").await;
+            let mut details = Map::new();
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
             }
-            Err(HandlerError::new(
+            return Err(HandlerError::with_details(
                 "git_timeout",
                 format!(
                     "git {} timed out",
                     args.first().map(String::as_str).unwrap_or("?")
                 ),
-            ))
+                details,
+            ));
         }
-    }
+    };
+
+    let exceeded = captured.stdout.total_bytes() > cap as u64;
+    Ok((
+        captured.status.code().unwrap_or(-1),
+        captured.stdout.rendered(),
+        captured.stderr.rendered(),
+        exceeded,
+    ))
 }
 
 fn scrub(bytes: &[u8], root: &Path) -> String {
@@ -951,7 +1009,14 @@ mod tests {
 
         assert_eq!(rc, 1);
         assert!(exceeded);
-        assert_eq!(stdout.len(), 1025);
+        assert!(
+            stdout.len() <= 1024 + 128,
+            "rendered bounded output should retain roughly the cap plus a small omission marker"
+        );
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("bytes omitted by SentinelO2"),
+            "truncated output should explain the omission"
+        );
     }
 
     #[test]

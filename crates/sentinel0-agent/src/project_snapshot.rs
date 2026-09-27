@@ -1,6 +1,7 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
+    process_output::{WaitOutcome, wait_bounded_with_limits},
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -10,12 +11,66 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::{process::Command, time::timeout};
+use tokio::process::Command;
 
 const MAX_TOP_DIRS: usize = 40;
 const MAX_EXTENSIONS: usize = 40;
 const MAX_RECENT_COMMITS: usize = 10;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_GIT_STDOUT: usize = 32 * 1024 * 1024;
+const MAX_GIT_STDERR: usize = 1024 * 1024;
+
+async fn cleanup_git_child(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    reason: &'static str,
+) -> Option<String> {
+    let mut cleanup_error = None;
+    let should_kill = match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(error) => {
+            let message = format!(
+                "failed checking project-snapshot git state after {reason}: {error}; refusing PID-based group signal"
+            );
+            tracing::warn!(%message);
+            cleanup_error = Some(message);
+            false
+        }
+    };
+
+    #[cfg(unix)]
+    if should_kill {
+        if let Some(pid) = pid {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                && error != nix::errno::Errno::ESRCH
+            {
+                let message = format!("failed killing project-snapshot git process group: {error}");
+                tracing::warn!(pid, %message);
+                cleanup_error.get_or_insert(message);
+            }
+        } else {
+            cleanup_error.get_or_insert_with(|| {
+                "project-snapshot git PID unavailable; process group not killed".into()
+            });
+        }
+    }
+
+    #[cfg(not(unix))]
+    if should_kill && let Err(error) = child.kill().await {
+        let message = format!("failed killing project-snapshot git child: {error}");
+        tracing::warn!(%message);
+        cleanup_error.get_or_insert(message);
+    }
+
+    if let Err(error) = child.wait().await {
+        let message = format!("failed reaping project-snapshot git child: {error}");
+        tracing::warn!(%message);
+        cleanup_error.get_or_insert(message);
+    }
+    cleanup_error
+}
 
 async fn run_git(
     policy: &Policy,
@@ -41,31 +96,75 @@ async fn run_git(
     command.process_group(0);
     policy.tooling.configure_tokio(&mut command)?;
 
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|e| HandlerError::new("git_failed", e.to_string()))?;
     let pid = child.id();
-    match timeout(GIT_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(out)) => Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr)),
-        Ok(Err(e)) => Err(HandlerError::new("git_failed", e.to_string())),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                if let Err(error) =
-                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                    && error != nix::errno::Errno::ESRCH
-                {
-                    tracing::warn!(
-                        pid,
-                        %error,
-                        "failed killing timed-out project-snapshot git process group"
-                    );
+    let captured =
+        match wait_bounded_with_limits(&mut child, GIT_TIMEOUT, MAX_GIT_STDOUT, MAX_GIT_STDERR)
+            .await
+        {
+            Ok(WaitOutcome::Completed(captured)) => captured,
+            Ok(WaitOutcome::TimedOut) => {
+                let cleanup_error = cleanup_git_child(&mut child, pid, "timeout").await;
+                let mut details = Map::new();
+                if let Some(error) = cleanup_error {
+                    details.insert("cleanup_error".into(), Value::String(error));
                 }
+                return Err(HandlerError::with_details(
+                    "git_timeout",
+                    "git command timed out",
+                    details,
+                ));
             }
-            Err(HandlerError::new("git_timeout", "git command timed out"))
-        }
+            Err(error) => {
+                let cleanup_error = cleanup_git_child(&mut child, pid, "I/O failure").await;
+                let mut details = Map::new();
+                if let Some(error) = cleanup_error {
+                    details.insert("cleanup_error".into(), Value::String(error));
+                }
+                return Err(HandlerError::with_details(
+                    "git_failed",
+                    format!("git output capture failed: {error}"),
+                    details,
+                ));
+            }
+        };
+
+    if captured.stdout.truncated() {
+        return Err(HandlerError::with_details(
+            "git_output_too_large",
+            format!(
+                "git {} output exceeded capture ceiling",
+                args.first().unwrap_or(&"?")
+            ),
+            Map::from_iter([(
+                "stdout_bytes".into(),
+                Value::from(captured.stdout.total_bytes()),
+            )]),
+        ));
     }
+
+    Ok((
+        captured.status.code().unwrap_or(-1),
+        captured.stdout.rendered(),
+        captured.stderr.rendered(),
+    ))
+}
+
+fn require_git_success(operation: &str, rc: i32, stderr: &[u8]) -> Result<(), HandlerError> {
+    if rc == 0 {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(stderr)
+        .trim()
+        .chars()
+        .take(2000)
+        .collect::<String>();
+    Err(HandlerError::new(
+        "git_failed",
+        format!("git {operation} failed (rc={rc}): {detail}"),
+    ))
 }
 
 fn extension(name: &str) -> &str {
@@ -203,38 +302,38 @@ async fn git_snapshot(
     policy: &Policy,
     root: &Path,
 ) -> Result<BTreeMap<String, Value>, HandlerError> {
-    let (_, status_raw, _) = run_git(
+    let (status_rc, status_raw, status_err) = run_git(
         policy,
         root,
         &["status", "--porcelain=v2", "--branch", "-z"],
     )
     .await?;
+    require_git_success("status", status_rc, &status_err)?;
     let status = parse_status(&status_raw);
 
-    let (_, unstaged_raw, _) =
+    let (unstaged_rc, unstaged_raw, unstaged_err) =
         run_git(policy, root, &["diff", "--no-ext-diff", "--numstat", "-z"]).await?;
-    let (_, staged_raw, _) = run_git(
+    require_git_success("diff --numstat", unstaged_rc, &unstaged_err)?;
+    let (staged_rc, staged_raw, staged_err) = run_git(
         policy,
         root,
         &["diff", "--cached", "--no-ext-diff", "--numstat", "-z"],
     )
     .await?;
+    require_git_success("diff --cached --numstat", staged_rc, &staged_err)?;
     let (_, ui, ud) = sum_numstat(&unstaged_raw);
     let (_, si, sd) = sum_numstat(&staged_raw);
 
-    let (rc, files_raw, _) = run_git(policy, root, &["ls-files", "-z"]).await?;
+    let (files_rc, files_raw, files_err) = run_git(policy, root, &["ls-files", "-z"]).await?;
+    require_git_success("ls-files", files_rc, &files_err)?;
     let decoded_files = String::from_utf8_lossy(&files_raw);
-    let (tracked_files, top_dirs, extensions, top_truncated) = if rc == 0 {
-        top_counts(
-            decoded_files
-                .split(char::from(0))
-                .filter(|path| !path.is_empty()),
-        )
-    } else {
-        (0, Vec::new(), BTreeMap::new(), false)
-    };
+    let (tracked_files, top_dirs, extensions, top_truncated) = top_counts(
+        decoded_files
+            .split(char::from(0))
+            .filter(|path| !path.is_empty()),
+    );
 
-    let (_, log_raw, _) = run_git(
+    let (log_rc, log_raw, log_err) = run_git(
         policy,
         root,
         &[
@@ -246,6 +345,9 @@ async fn git_snapshot(
         ],
     )
     .await?;
+    if log_rc != 0 && !status.get("head").is_some_and(|head| head.is_null()) {
+        require_git_success("log", log_rc, &log_err)?;
+    }
     let commits = String::from_utf8_lossy(&log_raw)
         .lines()
         .filter_map(|line| {
@@ -308,20 +410,39 @@ async fn git_snapshot(
 }
 
 fn directory_snapshot(root: &Path) -> HandlerResult {
+    const MAX_SCAN_ERRORS: usize = 32;
     let mut dirs: HashMap<String, usize> = HashMap::new();
     let mut exts: HashMap<String, usize> = HashMap::new();
     let mut files = 0_usize;
     let mut truncated = false;
+    let mut scan_error_count = 0_u64;
+    let mut scan_errors = Vec::new();
     for entry in fs::read_dir(root).map_err(|e| {
         HandlerError::new("permission_denied", format!("cannot read directory: {e}"))
     })? {
-        let Ok(entry) = entry else { continue };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                scan_error_count = scan_error_count.saturating_add(1);
+                if scan_errors.len() < MAX_SCAN_ERRORS {
+                    scan_errors.push(Value::String(format!("directory entry: {error}")));
+                }
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
-        let Ok(kind) = entry.file_type() else {
-            continue;
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                scan_error_count = scan_error_count.saturating_add(1);
+                if scan_errors.len() < MAX_SCAN_ERRORS {
+                    scan_errors.push(Value::String(format!("{name}: {error}")));
+                }
+                continue;
+            }
         };
         if kind.is_dir() {
             *dirs.entry(name).or_default() += 1;
@@ -353,6 +474,8 @@ fn directory_snapshot(root: &Path) -> HandlerResult {
                 "file_count": files,
             }),
         ),
+        ("scan_error_count".into(), Value::from(scan_error_count)),
+        ("scan_errors".into(), Value::Array(scan_errors)),
         ("truncated".into(), json!({"file_count": truncated})),
     ]))
 }
