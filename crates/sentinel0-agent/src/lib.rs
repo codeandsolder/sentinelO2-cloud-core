@@ -367,7 +367,9 @@ impl<D: Dispatcher> Agent<D> {
         if let Some(rotation_config) = self.rotation.as_ref() {
             match rotation::maybe_rotate(rotation_config, &self.config.token).await {
                 Ok(true) => {
-                    info!("credential rotated; new credential will be preferred on next process start");
+                    info!(
+                        "credential rotated; new credential will be preferred on next process start"
+                    );
                 }
                 Ok(false) => {}
                 Err(error) => {
