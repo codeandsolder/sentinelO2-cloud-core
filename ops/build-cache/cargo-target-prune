@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+CONF="${SENTINELX_BUILD_SCRATCH_CONF:-/etc/sentinelx/build-scratch.conf}"
+[[ -r "$CONF" ]] && . "$CONF"
+
+ROOT="${SENTINELX_CARGO_TARGET_ROOT:-/var/cache/sentinelx/cargo-target}"
+MAX="${SENTINELX_CARGO_TARGET_MAX_BYTES:-4294967296}"
+
+[[ -d "$ROOT" ]] || exit 0
+exec 8>"$ROOT/../.cargo-target-prune.lock"
+flock -n 8 || exit 0
+
+size() {
+    du -s -B1 "$ROOT" 2>/dev/null | awk '{print $1+0}'
+}
+
+lru_targets() {
+    find "$ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null |
+        while IFS= read -r -d '' dir; do
+            stamp="$dir/.last-used"
+            if [[ -e "$stamp" ]]; then
+                used="$(stat -c %Y "$stamp" 2>/dev/null || echo 0)"
+            else
+                used="$(stat -c %Y "$dir" 2>/dev/null || echo 0)"
+            fi
+            printf '%020d\t%s\n' "$used" "$dir"
+        done |
+        sort -n -k1,1 |
+        cut -f2-
+}
+
+total="$(size)"
+(( total <= MAX )) && exit 0
+
+while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    lock="$dir/.sentinelx-build.lock"
+
+    # Delete only if no Cargo wrapper currently holds the workspace lock.
+    if flock -n "$lock" rm -rf -- "$dir"; then
+        total="$(size)"
+        (( total <= MAX )) && break
+    fi
+done < <(lru_targets)

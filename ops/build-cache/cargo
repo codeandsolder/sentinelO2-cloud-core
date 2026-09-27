@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+CONF="${SENTINELX_BUILD_SCRATCH_CONF:-/etc/sentinelx/build-scratch.conf}"
+[[ -r "$CONF" ]] && . "$CONF"
+
+REAL_CARGO="${SENTINELX_REAL_CARGO:-/opt/toolchains/cargo/bin/cargo}"
+TARGET_ROOT="${SENTINELX_CARGO_TARGET_ROOT:-/var/cache/sentinelx/cargo-target}"
+PRUNER="${SENTINELX_CARGO_TARGET_PRUNER:-/usr/local/libexec/sentinelx-bin/cargo-target-prune}"
+
+compile=0
+toolchain=""
+for arg in "$@"; do
+    if [[ -z "$toolchain" && "$arg" == +* ]]; then
+        toolchain="$arg"
+        continue
+    fi
+    case "$arg" in
+        build|check|test|run|bench|rustc|doc|clippy|fix|clean)
+            compile=1
+            break
+            ;;
+    esac
+done
+
+if (( ! compile )); then
+    exec "$REAL_CARGO" "$@"
+fi
+
+mkdir -p "$TARGET_ROOT"
+
+locate=( "$REAL_CARGO" )
+[[ -n "$toolchain" ]] && locate+=( "$toolchain" )
+locate+=( locate-project --workspace --message-format plain )
+manifest="$("${locate[@]}" 2>/dev/null || true)"
+
+if [[ -n "$manifest" ]]; then
+    workspace="$(dirname "$(readlink -f "$manifest")")"
+else
+    workspace="$(pwd -P)"
+fi
+
+hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
+name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
+target="$TARGET_ROOT/${name}-${hash}"
+mkdir -p "$target"
+touch "$target/.last-used"
+
+# Several Cargo processes may legitimately share one workspace target. Pruning
+# takes an exclusive lock and therefore never removes an active target tree.
+exec 9>"$target/.sentinelx-build.lock"
+flock -s 9
+
+"$PRUNER" >/dev/null 2>&1 || true
+
+min_free="${SENTINELX_NVME_MIN_FREE_BYTES:-3221225472}"
+avail="$(df -B1 --output=avail "$TARGET_ROOT" 2>/dev/null | tail -n1 | tr -d ' ')"
+if [[ "$avail" =~ ^[0-9]+$ ]] && (( avail < min_free )); then
+    echo "cargo: NVMe scratch has only $avail bytes free; reserve is $min_free. Refusing to fill the root filesystem." >&2
+    flock -u 9
+    exit 75
+fi
+
+# Compiler/build-script temporary files are hot scratch too. Keep them beside
+# the NVMe target tree and remove them when this Cargo invocation exits instead
+# of sending them through the HDD-backed global /tmp.
+build_tmp="$target/.tmp-$$"
+mkdir -p "$build_tmp"
+export TMPDIR="$build_tmp"
+export TMP="$build_tmp"
+export TEMP="$build_tmp"
+export CARGO_TARGET_DIR="$target"
+
+cleanup() {
+    rc=$?
+    rm -rf -- "$build_tmp" 2>/dev/null || true
+    touch "$target/.last-used" 2>/dev/null || true
+
+    # Keep the just-used target's shared lock held through pruning. This makes
+    # self-eviction impossible even if the LRU metadata is stale or malformed.
+    "$PRUNER" >/dev/null 2>&1 || true
+    flock -u 9 2>/dev/null || true
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM HUP
+
+"$REAL_CARGO" "$@"
