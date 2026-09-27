@@ -8,7 +8,11 @@ pub const STAGING_DIRNAME: &str = ".sentinelx_uploads";
 
 fn writable_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)?;
-    let probe = path.join(format!(".write-probe-{}", std::process::id()));
+    let probe = path.join(format!(
+        ".write-probe-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)

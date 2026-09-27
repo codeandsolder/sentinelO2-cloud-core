@@ -310,10 +310,13 @@ pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> Handl
                 "decoded file exceeds upload cap",
             ));
         }
-        async_fs::write(&temp, &bytes)
-            .await
-            .map_err(|e| HandlerError::new("io_error", format!("failed staging upload: {e}")))?;
-        Ok((bytes.len() as u64, hash_bytes(&bytes)))
+        match async_fs::write(&temp, &bytes).await {
+            Ok(()) => Ok((bytes.len() as u64, hash_bytes(&bytes))),
+            Err(error) => Err(HandlerError::new(
+                "io_error",
+                format!("failed staging upload: {error}"),
+            )),
+        }
     } else {
         fetch_to(policy, file_url.unwrap_or_default(), &temp).await
     };
@@ -325,9 +328,13 @@ pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> Handl
             return Err(error);
         }
     };
-    async_fs::rename(&temp, &destination)
-        .await
-        .map_err(|e| HandlerError::new("io_error", format!("failed finalizing upload: {e}")))?;
+    if let Err(error) = async_fs::rename(&temp, &destination).await {
+        let _ = async_fs::remove_file(&temp).await;
+        return Err(HandlerError::new(
+            "io_error",
+            format!("failed finalizing upload: {error}"),
+        ));
+    }
 
     Ok(BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
@@ -813,5 +820,35 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "path_traversal");
+    }
+
+    #[tokio::test]
+    async fn single_upload_finalize_failure_cleans_staged_file() {
+        let dir = tempdir().unwrap();
+        let policy = policy(dir.path());
+        fs::create_dir(dir.path().join("target-dir")).unwrap();
+
+        let error = upload_file(
+            &policy,
+            &Map::from_iter([
+                ("target_path".into(), Value::String("target-dir".into())),
+                ("overwrite".into(), Value::Bool(true)),
+                (
+                    "content_base64".into(),
+                    Value::String(STANDARD.encode(b"payload")),
+                ),
+            ]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "io_error");
+
+        let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
+        let leaked = fs::read_dir(staging)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".upload"))
+            .collect::<Vec<_>>();
+        assert!(leaked.is_empty(), "failed upload leaked staged file");
     }
 }

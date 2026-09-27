@@ -243,12 +243,20 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         .await
         .map_err(|e| staging_oserror(e, &workdir))?;
     let script_path = workdir.join(filename);
-    async_fs::write(&script_path, content)
-        .await
-        .map_err(|e| staging_oserror(e, &script_path))?;
-    async_fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|e| staging_oserror(e, &script_path))?;
+    if let Err(error) = async_fs::write(&script_path, content).await {
+        if cleanup {
+            let _ = async_fs::remove_dir_all(&workdir).await;
+        }
+        return Err(staging_oserror(error, &script_path));
+    }
+    if let Err(error) =
+        async_fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).await
+    {
+        if cleanup {
+            let _ = async_fs::remove_dir_all(&workdir).await;
+        }
+        return Err(staging_oserror(error, &script_path));
+    }
 
     let (argv, spawn_cwd) = build_command(interpreter, &script_path, &args, sudo, cwd);
     let started = Instant::now();
@@ -269,43 +277,52 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         }
     }
 
-    let child = command.spawn().map_err(|e| {
-        if let Some(cwd) = spawn_cwd.as_deref() {
-            // With a non-sudo script, Command changes into cwd before exec. Name
-            // cwd failures explicitly instead of surfacing an opaque spawn error.
-            // A missing interpreter is still distinguished when cwd itself exists.
-            match e.kind() {
-                std::io::ErrorKind::PermissionDenied => {
-                    return HandlerError::new(
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let handler_error = if let Some(cwd) = spawn_cwd.as_deref() {
+                // With a non-sudo script, Command changes into cwd before exec.
+                // Preserve the upstream 0.19.3 diagnostics while still honoring
+                // cleanup=true for the staging workdir on every spawn failure.
+                match error.kind() {
+                    std::io::ErrorKind::PermissionDenied => HandlerError::new(
                         "permission_denied",
                         format!(
                             "cannot enter cwd {:?}: the agent's OS user lacks permission to change into it. Being inside an rw file_ops path does not grant Unix access. Either run with sudo=true -- the directory is then entered after elevation -- or grant the agent's user execute (+x) on it and its parents.",
                             cwd.display()
                         ),
-                    );
-                }
-                std::io::ErrorKind::NotFound if !cwd.exists() => {
-                    return HandlerError::new(
+                    ),
+                    std::io::ErrorKind::NotFound if !cwd.exists() => HandlerError::new(
                         "not_found",
                         format!("cwd {:?} does not exist.", cwd.display()),
-                    );
-                }
-                std::io::ErrorKind::NotADirectory if !cwd.is_dir() => {
-                    return HandlerError::new(
+                    ),
+                    std::io::ErrorKind::NotADirectory if !cwd.is_dir() => HandlerError::new(
                         "not_a_directory",
                         format!("cwd {:?} is not a directory.", cwd.display()),
-                    );
+                    ),
+                    _ => {
+                        let code = if error.kind() == std::io::ErrorKind::NotFound {
+                            "interpreter_missing"
+                        } else {
+                            "io_error"
+                        };
+                        HandlerError::new(code, format!("failed starting script: {error}"))
+                    }
                 }
-                _ => {}
+            } else {
+                let code = if error.kind() == std::io::ErrorKind::NotFound {
+                    "interpreter_missing"
+                } else {
+                    "io_error"
+                };
+                HandlerError::new(code, format!("failed starting script: {error}"))
+            };
+            if cleanup {
+                let _ = async_fs::remove_dir_all(&workdir).await;
             }
+            return Err(handler_error);
         }
-        let code = if e.kind() == std::io::ErrorKind::NotFound {
-            "interpreter_missing"
-        } else {
-            "io_error"
-        };
-        HandlerError::new(code, format!("failed starting script: {e}"))
-    })?;
+    };
     let pid = child.id();
 
     let outcome = match timeout(
@@ -533,5 +550,39 @@ mod tests {
         assert_eq!(result["timed_out"], true);
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn missing_interpreter_cleans_workdir_by_default() {
+        let dir = tempdir().unwrap();
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let error = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("powershell".into())),
+                ("content".into(), Value::String("Write-Output ok".into())),
+                (
+                    "env".into(),
+                    serde_json::json!({"PATH": "/definitely/not/a/real/bin"}),
+                ),
+            ]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "interpreter_missing");
+
+        let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
+        let leftovers = fs::read_dir(staging)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "failed script launch leaked workdir: {leftovers:?}"
+        );
     }
 }

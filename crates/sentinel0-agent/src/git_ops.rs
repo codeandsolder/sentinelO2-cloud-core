@@ -9,7 +9,11 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    time::timeout,
+};
 
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
 const NET_TIMEOUT: Duration = Duration::from_secs(50);
@@ -37,6 +41,9 @@ async fn run_git(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     } else {
@@ -46,31 +53,133 @@ async fn run_git(
     let mut child = command
         .spawn()
         .map_err(|e| HandlerError::new("git_failed", format!("failed to start git: {e}")))?;
+    let pid = child.id();
 
-    if let Some(input) = stdin {
-        let Some(mut pipe) = child.stdin.take() else {
-            return Err(HandlerError::new("git_failed", "git stdin was unavailable"));
-        };
-        pipe.write_all(input).await.map_err(|e| {
-            HandlerError::new("git_failed", format!("failed writing git stdin: {e}"))
-        })?;
-        drop(pipe);
-    }
+    let work = async {
+        if let Some(input) = stdin {
+            let Some(mut pipe) = child.stdin.take() else {
+                return Err(HandlerError::new("git_failed", "git stdin was unavailable"));
+            };
+            pipe.write_all(input).await.map_err(|e| {
+                HandlerError::new("git_failed", format!("failed writing git stdin: {e}"))
+            })?;
+            drop(pipe);
+        }
 
-    match timeout(limit, child.wait_with_output()).await {
+        child
+            .wait_with_output()
+            .await
+            .map_err(|e| HandlerError::new("git_failed", format!("git failed: {e}")))
+    };
+
+    match timeout(limit, work).await {
         Ok(Ok(output)) => Ok((
             output.status.code().unwrap_or(-1),
             output.stdout,
             output.stderr,
         )),
+        Ok(Err(error)) => Err(error),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let pgid = nix::unistd::Pid::from_raw(pid as i32);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            }
+            Err(HandlerError::new(
+                "git_timeout",
+                format!(
+                    "git {} timed out",
+                    args.first().map(String::as_str).unwrap_or("?")
+                ),
+            ))
+        }
+    }
+}
+
+async fn run_git_capped_stdout(
+    root: &Path,
+    args: &[String],
+    cap: usize,
+    limit: Duration,
+) -> Result<(i32, Vec<u8>, Vec<u8>, bool), HandlerError> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| HandlerError::new("git_failed", format!("failed to start git: {e}")))?;
+    let pid = child.id();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HandlerError::new("git_failed", "git stdout was unavailable"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| HandlerError::new("git_failed", "git stderr was unavailable"))?;
+
+    let work = async {
+        let stdout_task = async {
+            let keep_limit = cap.saturating_add(1);
+            let mut kept = Vec::with_capacity(keep_limit.min(64 * 1024));
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                let read = stdout.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                let room = keep_limit.saturating_sub(kept.len());
+                if room != 0 {
+                    kept.extend_from_slice(&buffer[..read.min(room)]);
+                }
+            }
+            Ok::<Vec<u8>, std::io::Error>(kept)
+        };
+        let stderr_task = async {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await?;
+            Ok::<Vec<u8>, std::io::Error>(bytes)
+        };
+        let (stdout, stderr, status) = tokio::try_join!(stdout_task, stderr_task, child.wait())?;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
+    };
+
+    match timeout(limit, work).await {
+        Ok(Ok((status, stdout, stderr))) => {
+            let exceeded = stdout.len() > cap;
+            Ok((status.code().unwrap_or(-1), stdout, stderr, exceeded))
+        }
         Ok(Err(e)) => Err(HandlerError::new("git_failed", format!("git failed: {e}"))),
-        Err(_) => Err(HandlerError::new(
-            "git_timeout",
-            format!(
-                "git {} timed out",
-                args.first().map(String::as_str).unwrap_or("?")
-            ),
-        )),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let pgid = nix::unistd::Pid::from_raw(pid as i32);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            }
+            Err(HandlerError::new(
+                "git_timeout",
+                format!(
+                    "git {} timed out",
+                    args.first().map(String::as_str).unwrap_or("?")
+                ),
+            ))
+        }
     }
 }
 
@@ -168,38 +277,37 @@ fn status_name(letter: char) -> &'static str {
     }
 }
 
-fn parse_name_status(raw: &[u8]) -> Vec<(String, String, Option<String>)> {
-    let tokens = raw
-        .split(|byte| *byte == 0)
-        .map(|token| String::from_utf8_lossy(token).into_owned())
-        .collect::<Vec<_>>();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < tokens.len() {
-        if tokens[i].is_empty() {
-            i += 1;
+fn parse_name_status(raw: &[u8], keep: usize) -> (Vec<(String, String, Option<String>)>, usize) {
+    let mut tokens = raw.split(|byte| *byte == 0);
+    let mut out = Vec::with_capacity(keep);
+    let mut total = 0_usize;
+
+    while let Some(status_raw) = tokens.next() {
+        if status_raw.is_empty() {
             continue;
         }
-        let letter = tokens[i].chars().next().unwrap_or('?');
-        if matches!(letter, 'R' | 'C') {
-            if i + 2 >= tokens.len() {
-                break;
-            }
-            out.push((
-                tokens[i + 2].clone(),
-                status_name(letter).into(),
-                Some(tokens[i + 1].clone()),
-            ));
-            i += 3;
+        let status = String::from_utf8_lossy(status_raw);
+        let letter = status.chars().next().unwrap_or('?');
+
+        let (path, old_path) = if matches!(letter, 'R' | 'C') {
+            let Some(old_raw) = tokens.next() else { break };
+            let Some(path_raw) = tokens.next() else { break };
+            (
+                String::from_utf8_lossy(path_raw).into_owned(),
+                Some(String::from_utf8_lossy(old_raw).into_owned()),
+            )
         } else {
-            if i + 1 >= tokens.len() {
-                break;
-            }
-            out.push((tokens[i + 1].clone(), status_name(letter).into(), None));
-            i += 2;
+            let Some(path_raw) = tokens.next() else { break };
+            (String::from_utf8_lossy(path_raw).into_owned(), None)
+        };
+
+        total += 1;
+        if out.len() < keep {
+            out.push((path, status_name(letter).into(), old_path));
         }
     }
-    out
+
+    (out, total)
 }
 
 async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -259,9 +367,9 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let mut args = selector.clone();
     args.extend(["--no-ext-diff".into(), "--name-status".into(), "-z".into()]);
     let (_, names, _) = run_git(&root, &args, None, LOCAL_TIMEOUT).await?;
-    let changed = parse_name_status(&names);
+    let (changed, changed_total) = parse_name_status(&names, max_files);
 
-    let untracked = if include_untracked {
+    let (untracked, untracked_total) = if include_untracked {
         let args = vec![
             "ls-files".into(),
             "--others".into(),
@@ -269,19 +377,23 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             "-z".into(),
         ];
         let (_, out, _) = run_git(&root, &args, None, LOCAL_TIMEOUT).await?;
-        String::from_utf8_lossy(&out)
-            .split('\0')
-            .filter(|path| !path.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
+        let decoded = String::from_utf8_lossy(&out);
+        let mut kept = Vec::with_capacity(max_files);
+        let mut total = 0_usize;
+        for path in decoded.split(char::from(0)).filter(|path| !path.is_empty()) {
+            total += 1;
+            if kept.len() < max_files {
+                kept.push(path.to_owned());
+            }
+        }
+        (kept, total)
     } else {
-        Vec::new()
+        (Vec::new(), 0)
     };
-
     let mut entries = Vec::new();
-    let mut truncated_files = changed.len() > max_files;
+    let mut truncated_files = changed_total > max_files;
     let mut truncated_patch = false;
-    for (path, status, old_path) in changed.into_iter().take(max_files) {
+    for (path, status, old_path) in changed {
         let mut patch_args = selector.clone();
         patch_args.extend([
             "--no-ext-diff".into(),
@@ -292,12 +404,17 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             patch_args.push(old.clone());
         }
         patch_args.push(path.clone());
-        let (_, patch, _) = run_git(&root, &patch_args, None, LOCAL_TIMEOUT).await?;
-        let patch_value = if patch.len() <= max_patch {
-            Value::String(String::from_utf8_lossy(&patch).into_owned())
-        } else {
+        // The API already promises to omit patches larger than max_patch.
+        // Do not first buffer an arbitrarily large diff just to discover that
+        // it exceeds that limit: retain at most max_patch + 1 bytes while
+        // continuing to drain git to completion.
+        let (_, patch, _, patch_exceeded) =
+            run_git_capped_stdout(&root, &patch_args, max_patch, LOCAL_TIMEOUT).await?;
+        let patch_value = if patch_exceeded {
             truncated_patch = true;
             Value::Null
+        } else {
+            Value::String(String::from_utf8_lossy(&patch).into_owned())
         };
         let mut entry = Map::from_iter([
             ("path".into(), Value::String(path)),
@@ -321,7 +438,7 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             "patch": null,
         }));
     }
-    if untracked.len() > room {
+    if untracked_total > room {
         truncated_files = true;
     }
 
@@ -336,7 +453,7 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
                 "files": files_total,
                 "insertions": insertions,
                 "deletions": deletions,
-                "untracked": untracked.len(),
+                "untracked": untracked_total,
             }),
         ),
         ("files".into(), Value::Array(entries)),
@@ -767,5 +884,40 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, "force_requires_lease");
+    }
+
+    #[tokio::test]
+    async fn capped_git_stdout_drains_without_retaining_the_full_patch() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("big.txt"), "changed line\n".repeat(10_000)).unwrap();
+        let args = vec![
+            "diff".into(),
+            "--no-index".into(),
+            "--".into(),
+            "/dev/null".into(),
+            "big.txt".into(),
+        ];
+
+        let (rc, stdout, _, exceeded) =
+            run_git_capped_stdout(dir.path(), &args, 1024, Duration::from_secs(60))
+                .await
+                .unwrap();
+
+        assert_eq!(rc, 1);
+        assert!(exceeded);
+        assert_eq!(stdout.len(), 1025);
+    }
+
+    #[test]
+    fn name_status_parser_counts_all_but_keeps_only_requested_prefix() {
+        let raw = b"M\0a.txt\0R100\0old.txt\0new.txt\0A\0z.txt\0";
+        let (rows, total) = parse_name_status(raw, 2);
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("a.txt".into(), "modified".into(), None));
+        assert_eq!(
+            rows[1],
+            ("new.txt".into(), "renamed".into(), Some("old.txt".into()))
+        );
     }
 }

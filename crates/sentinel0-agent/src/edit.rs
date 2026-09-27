@@ -400,6 +400,14 @@ fn unified_diff(old: &str, new: &str, path: &Path) -> String {
     out
 }
 
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
     let base = backup_dir
         .map(PathBuf::from)
@@ -425,7 +433,7 @@ fn atomic_replace(
     fs::create_dir_all(parent)
         .map_err(|e| HandlerError::new("write_failed", format!("failed creating parent: {e}")))?;
 
-    let temp = loop {
+    let (temp, mut file) = loop {
         let candidate = parent.join(format!(
             ".{}.sentinel0-{:016x}.tmp",
             target
@@ -439,44 +447,7 @@ fn atomic_replace(
             .create_new(true)
             .open(&candidate)
         {
-            Ok(mut file) => {
-                file.write_all(content.as_bytes()).map_err(|e| {
-                    HandlerError::new("write_failed", format!("failed writing temp file: {e}"))
-                })?;
-                if let Some(meta) = original_meta {
-                    fs::set_permissions(&candidate, fs::Permissions::from_mode(meta.mode()))
-                        .map_err(|e| {
-                            HandlerError::new(
-                                "write_failed",
-                                format!("failed preserving permissions: {e}"),
-                            )
-                        })?;
-
-                    let candidate_meta = fs::metadata(&candidate).map_err(|e| {
-                        HandlerError::new(
-                            "write_failed",
-                            format!("failed reading replacement metadata: {e}"),
-                        )
-                    })?;
-                    if candidate_meta.uid() != meta.uid() || candidate_meta.gid() != meta.gid() {
-                        nix::unistd::chown(
-                            &candidate,
-                            Some(nix::unistd::Uid::from_raw(meta.uid())),
-                            Some(nix::unistd::Gid::from_raw(meta.gid())),
-                        )
-                        .map_err(|e| {
-                            HandlerError::new(
-                                "write_failed",
-                                format!("failed preserving owner/group: {e}"),
-                            )
-                        })?;
-                    }
-                }
-                file.sync_all().map_err(|e| {
-                    HandlerError::new("write_failed", format!("failed syncing temp file: {e}"))
-                })?;
-                break candidate;
-            }
+            Ok(file) => break (candidate, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(HandlerError::new(
@@ -486,13 +457,43 @@ fn atomic_replace(
             }
         }
     };
+    let _temp_cleanup = RemoveFileOnDrop(temp.clone());
 
-    let result = fs::rename(&temp, target)
-        .map_err(|e| HandlerError::new("write_failed", format!("atomic replace failed: {e}")));
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    file.write_all(content.as_bytes())
+        .map_err(|e| HandlerError::new("write_failed", format!("failed writing temp file: {e}")))?;
+    if let Some(meta) = original_meta {
+        fs::set_permissions(&temp, fs::Permissions::from_mode(meta.mode())).map_err(|e| {
+            HandlerError::new(
+                "write_failed",
+                format!("failed preserving permissions: {e}"),
+            )
+        })?;
+
+        let candidate_meta = fs::metadata(&temp).map_err(|e| {
+            HandlerError::new(
+                "write_failed",
+                format!("failed reading replacement metadata: {e}"),
+            )
+        })?;
+        if candidate_meta.uid() != meta.uid() || candidate_meta.gid() != meta.gid() {
+            nix::unistd::chown(
+                &temp,
+                Some(nix::unistd::Uid::from_raw(meta.uid())),
+                Some(nix::unistd::Gid::from_raw(meta.gid())),
+            )
+            .map_err(|e| {
+                HandlerError::new(
+                    "write_failed",
+                    format!("failed preserving owner/group: {e}"),
+                )
+            })?;
+        }
     }
-    result
+    file.sync_all()
+        .map_err(|e| HandlerError::new("write_failed", format!("failed syncing temp file: {e}")))?;
+    drop(file);
+    fs::rename(&temp, target)
+        .map_err(|e| HandlerError::new("write_failed", format!("atomic replace failed: {e}")))
 }
 
 fn sudo_replace(
@@ -529,6 +530,7 @@ fn sudo_replace(
         .status()
         .map_err(|e| HandlerError::new("write_failed", format!("sudo install failed: {e}")))?;
     if !status.success() {
+        let _ = Command::new("sudo").arg("rm").arg("-f").arg(&temp).status();
         return Err(HandlerError::new("write_failed", "sudo install failed"));
     }
     let status = Command::new("sudo")
@@ -613,6 +615,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             .unwrap_or("file"),
         rand::rng().random::<u64>()
     ));
+    let _staged_cleanup = RemoveFileOnDrop(staged.clone());
     fs::write(&staged, &updated)
         .map_err(|e| HandlerError::new("write_failed", format!("failed staging edit: {e}")))?;
 
@@ -659,7 +662,6 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         }
     }
 
-    let _ = fs::remove_file(&staged);
     let duration = (started.elapsed().as_secs_f64() * 100.0).round() / 100.0;
     let mut result = BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
@@ -705,6 +707,7 @@ mod tests {
 
     fn policy(root: &Path) -> Policy {
         Policy {
+            upload_base: root.to_owned(),
             file_ops_paths: vec![FileOpsPath {
                 path: root.to_owned(),
                 access: FileAccess::ReadWrite,
@@ -753,5 +756,15 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, "validation_failed");
         assert_eq!(fs::read_to_string(&path).unwrap(), "ok: true\n");
+        let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
+        let leftovers = fs::read_dir(staging)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "failed edit leaked staged files: {leftovers:?}"
+        );
     }
 }

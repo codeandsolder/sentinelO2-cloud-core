@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
@@ -36,20 +37,40 @@ pub fn pending_dir(upload_base: &Path) -> PathBuf {
 }
 
 fn safe_name(job_id: &str) -> String {
-    let mut kept = String::with_capacity(job_id.len().min(64));
-    for ch in job_id.chars() {
-        if ch.is_alphanumeric() || matches!(ch, '-' | '_') {
-            kept.push(ch);
-            if kept.chars().count() == 64 {
+    // Preserve every filename the old scheme represented losslessly, so an
+    // upgrade does not create a second path for an already-pending ordinary
+    // Hub job ID. Inputs that previously needed sanitizing or truncation get a
+    // digest suffix so distinct IDs cannot collapse onto one pending result.
+    if !job_id.is_empty()
+        && job_id.len() <= 64
+        && job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return job_id.to_owned();
+    }
+
+    // '~' is outside the preserved safe-ID alphabet, so hashed names cannot
+    // collide with any literal safe ID. '~' + 30-byte prefix + '-' + 32 hex = 64 bytes.
+    let mut prefix = String::with_capacity(30);
+    for byte in job_id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            if prefix.len() == 30 {
                 break;
             }
+            prefix.push(char::from(byte));
         }
     }
-    if kept.is_empty() {
-        "unnamed".into()
-    } else {
-        kept
+    if prefix.is_empty() {
+        prefix.push_str("unnamed");
     }
+
+    let digest = Sha256::digest(job_id.as_bytes());
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("~{prefix}-{suffix}")
 }
 
 fn unix_seconds_now() -> f64 {
@@ -415,5 +436,25 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
             .collect();
         assert!(temps.is_empty());
+    }
+
+    #[test]
+    fn sanitized_job_ids_do_not_alias_pending_paths() {
+        assert_ne!(safe_name("job/a"), safe_name("joba"));
+        assert_ne!(
+            safe_name(&format!("{}x", "a".repeat(64))),
+            safe_name(&format!("{}y", "a".repeat(64)))
+        );
+        assert_eq!(safe_name("job_0123-abcd"), "job_0123-abcd");
+        let safe_64 = "a".repeat(64);
+        assert_eq!(safe_name(&safe_64), safe_64);
+    }
+
+    #[test]
+    fn unicode_job_id_stays_within_safe_ascii_filename_shape() {
+        let name = safe_name(&"ą".repeat(100));
+        assert!(name.is_ascii());
+        assert!(name.len() < 100);
+        assert!(!name.contains('/'));
     }
 }
