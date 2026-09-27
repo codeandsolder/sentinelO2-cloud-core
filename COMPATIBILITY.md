@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.20.0 behavior at reviewed upstream commit
-  `ab48abc0a90fbbe5ced0d49958078344df3e30be`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.21.0 behavior at reviewed upstream commit
+  `75dcfd790a7ccab0a77dcad2f85e3058ace0a4f2`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -96,6 +96,11 @@ Reference surfaces:
   query surface while retaining concise fork-specific project prose.
 - Native edit is atomic, keeps permissions where appropriate, backs up the old
   file and deliberately advances mtime.
+- Upstream 0.21.0 terminal backup deletion is matched: files whose names exactly
+  match the timestamped backup artifacts produced by this Rust agent may be
+  deleted without creating a backup-of-a-backup. The response reports
+  `backup=null` and `terminal=true`; ordinary user files such as `config.bak`
+  retain the mandatory-backup guarantee.
 
 ### Verification
 
