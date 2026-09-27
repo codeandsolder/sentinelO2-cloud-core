@@ -116,7 +116,7 @@ impl Tooling {
             return None;
         }
         for segment in crate::segment::split_top_level(command) {
-            let Ok(argv) = shlex::try_split(&segment) else {
+            let Some(argv) = shlex::split(&segment) else {
                 continue;
             };
             let Some(program) = effective_program(&argv) else {

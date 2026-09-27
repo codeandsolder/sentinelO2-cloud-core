@@ -5,6 +5,7 @@ use crate::{
 };
 use chrono::Utc;
 use flate2::{Compression, write::GzEncoder};
+use rand::RngExt;
 use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,

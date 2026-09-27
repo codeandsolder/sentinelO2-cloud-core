@@ -351,7 +351,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         }
     }
 
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             let handler_error = if let Some(cwd) = spawn_cwd.as_deref() {
