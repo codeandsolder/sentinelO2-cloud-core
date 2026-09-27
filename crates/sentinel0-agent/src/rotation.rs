@@ -7,7 +7,7 @@ use nix::unistd::{AccessFlags, access};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -170,7 +170,6 @@ fn persist_rotated_to(
         file.write_all(b"\n")?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
-        File::open(parent)?.sync_all()?;
         Ok(())
     })();
 
