@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.19.3 behavior at reviewed upstream commit
-  `84df791a30794abcd95d1c999aa43dd839ec4380`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.20.0 behavior at reviewed upstream commit
+  `ab48abc0a90fbbe5ced0d49958078344df3e30be`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -62,6 +62,11 @@ Reference surfaces:
 
 - Existing `/etc/sentinelx/identity.json` and YAML policy/config are consumed
   directly; no host re-enrollment or config migration is required.
+- Upstream 0.20.0 credential rotation is matched: after a proven-good session,
+  credentials past half-life rotate through `POST /agent/rotate`, are written
+  atomically to a separate mode-0600 `identity.rotated.json`, and are preferred
+  only when they parse, are unexpired and match the enrolled host. The original
+  enrollment identity is never overwritten, so rotation failure cannot strand a host.
 - Linux host/OS/kernel/CPU/memory/uptime/load metadata used by hello/state.
 - Capabilities are derived from the dispatcher surface rather than maintained
   as a second drifting list. Full capabilities include upstream policy evidence
