@@ -2,7 +2,9 @@
 
 use clap::Parser;
 use sentinel0_agent::{
-    Agent, AgentConfig, ReconnectPolicy, core::CoreDispatcher, host,
+    Agent, AgentConfig, ReconnectPolicy,
+    core::CoreDispatcher,
+    host,
     identity::load_identity,
     policy::Policy,
     rotation::{RotationConfig, load_effective_identity},
@@ -93,11 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let identity = load_effective_identity(&args.identity, load_identity(&args.identity)?);
     let capabilities = dispatcher.capabilities();
     let host = host::gather_host_info(identity.host_id.clone(), Some(policy.config_summary()));
-    let hub = args
-        .hub
-        .as_deref()
-        .unwrap_or(&identity.hub)
-        .to_owned();
+    let hub = args.hub.as_deref().unwrap_or(&identity.hub).to_owned();
     let rotation = RotationConfig {
         identity_path: args.identity.clone(),
         host_id: identity.host_id.clone(),
