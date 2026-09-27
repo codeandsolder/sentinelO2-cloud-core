@@ -1,4 +1,7 @@
-use crate::{AuthToken, identity::{Identity, load_identity}};
+use crate::{
+    AuthToken,
+    identity::{Identity, load_identity},
+};
 use base64::{
     Engine as _,
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
@@ -147,7 +150,10 @@ fn persist_rotated_to(
     hub: &str,
 ) -> Result<(), RotationError> {
     let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "rotated identity has no parent")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rotated identity has no parent",
+        )
     })?;
     let bytes = serde_json::to_vec(&RotatedIdentity {
         host_id,
@@ -220,12 +226,7 @@ pub async fn maybe_rotate(
         })
         .ok_or(RotationError::InvalidCredential)?;
 
-    persist_rotated_to(
-        &path,
-        &config.host_id,
-        credential,
-        &config.persisted_hub,
-    )?;
+    persist_rotated_to(&path, &config.host_id, credential, &config.persisted_hub)?;
     Ok(true)
 }
 
@@ -289,11 +290,13 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(
-            fs::read_dir(dir.path())
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
                 .unwrap()
-                .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".idrot-"))
-        );
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".idrot-")
+        }));
     }
 
     #[test]
