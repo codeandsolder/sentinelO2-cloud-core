@@ -19,6 +19,7 @@ pub mod policy;
 pub mod preflight;
 pub mod progressive_help;
 pub mod project_snapshot;
+pub mod rotation;
 pub mod script;
 pub mod segment;
 pub mod shell;
@@ -48,7 +49,7 @@ use tokio_tungstenite::{
     },
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct AuthToken(String);
@@ -60,6 +61,10 @@ impl AuthToken {
 
     fn bearer_header(&self) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
         HeaderValue::from_str(&format!("Bearer {}", self.0))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
     }
 }
 
@@ -230,6 +235,7 @@ struct Outbound {
 pub struct Agent<D> {
     config: AgentConfig,
     dispatcher: Arc<D>,
+    rotation: Option<rotation::RotationConfig>,
 }
 
 impl<D: Dispatcher> Agent<D> {
@@ -238,7 +244,13 @@ impl<D: Dispatcher> Agent<D> {
         Ok(Self {
             config,
             dispatcher: Arc::new(dispatcher),
+            rotation: None,
         })
+    }
+
+    pub fn with_credential_rotation(mut self, config: rotation::RotationConfig) -> Self {
+        self.rotation = Some(config);
+        self
     }
 
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), AgentError> {
@@ -350,6 +362,20 @@ impl<D: Dispatcher> Agent<D> {
                 return Err(AgentError::Rejected { code, message });
             }
             _ => return Err(AgentError::ExpectedWelcome),
+        }
+
+        if let Some(rotation_config) = self.rotation.as_ref() {
+            match rotation::maybe_rotate(rotation_config, &self.config.token).await {
+                Ok(true) => {
+                    info!(
+                        "credential rotated; new credential will be preferred on next process start"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(%error, "credential rotation skipped");
+                }
+            }
         }
 
         for (path, event) in drain_pending(self.config.upload_base.clone()).await {

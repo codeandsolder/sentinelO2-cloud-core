@@ -2,15 +2,19 @@
 
 use clap::Parser;
 use sentinel0_agent::{
-    Agent, AgentConfig, ReconnectPolicy, core::CoreDispatcher, host, identity::load_identity,
+    Agent, AgentConfig, ReconnectPolicy,
+    core::CoreDispatcher,
+    host,
+    identity::load_identity,
     policy::Policy,
+    rotation::{RotationConfig, load_effective_identity},
 };
 use sentinel0_proto::PreferredProfile;
 use std::{error::Error, path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-const AGENT_VERSION: &str = "0.19.2-rust.1";
+const AGENT_VERSION: &str = "0.20.0-rust.1";
 
 #[derive(Debug, Parser)]
 #[command(name = "sentinelx-core")]
@@ -38,6 +42,16 @@ fn ws_base(hub: &str) -> String {
         format!("wss://{rest}")
     } else if let Some(rest) = hub.strip_prefix("http://") {
         format!("ws://{rest}")
+    } else {
+        hub.to_owned()
+    }
+}
+
+fn http_base(hub: &str) -> String {
+    if let Some(rest) = hub.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = hub.strip_prefix("ws://") {
+        format!("http://{rest}")
     } else {
         hub.to_owned()
     }
@@ -78,14 +92,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let identity = load_identity(&args.identity)?;
+    let identity = load_effective_identity(&args.identity, load_identity(&args.identity)?);
     let capabilities = dispatcher.capabilities();
     let host = host::gather_host_info(identity.host_id.clone(), Some(policy.config_summary()));
-    let hub = args.hub.as_deref().unwrap_or(&identity.hub);
+    let hub = args.hub.as_deref().unwrap_or(&identity.hub).to_owned();
+    let rotation = RotationConfig {
+        identity_path: args.identity.clone(),
+        host_id: identity.host_id.clone(),
+        hub_http_base: http_base(&hub),
+        persisted_hub: identity.hub.clone(),
+    };
 
     if args.verify_enrollment {
         let result =
-            sentinel0_agent::preflight::verify_enrollment(&ws_base(hub), &identity.token).await;
+            sentinel0_agent::preflight::verify_enrollment(&ws_base(&hub), &identity.token).await;
         if result.ok {
             info!(hub = %hub, "enrollment token accepted");
             return Ok(());
@@ -98,7 +118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let config = AgentConfig {
-        hub_ws_base: ws_base(hub),
+        hub_ws_base: ws_base(&hub),
         token: identity.token.clone(),
         host,
         agent_version: AGENT_VERSION.into(),
@@ -115,7 +135,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         heartbeat_interval: Duration::from_secs(30),
         heartbeat_timeout: Duration::from_secs(90),
     };
-    let agent = Agent::new(config, dispatcher)?;
+    let agent = Agent::new(config, dispatcher)?.with_credential_rotation(rotation);
 
     let cancel = CancellationToken::new();
     let signal_cancel = cancel.clone();
