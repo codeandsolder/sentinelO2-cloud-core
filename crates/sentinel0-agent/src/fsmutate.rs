@@ -41,8 +41,17 @@ fn backup_file(path: &Path) -> Result<PathBuf, HandlerError> {
             .unwrap_or("file"),
         Utc::now().format("%Y%m%d-%H%M%S%.6f")
     ));
-    fs::copy(path, &backup)
-        .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))?;
+    let result = (|| -> std::io::Result<()> {
+        fs::copy(path, &backup)?;
+        fs::File::open(&backup)?.sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&backup);
+        return Err(HandlerError::new(
+            "backup_failed",
+            format!("backup failed: {error}"),
+        ));
+    }
     Ok(backup)
 }
 
@@ -54,15 +63,30 @@ fn backup_dir(path: &Path) -> Result<PathBuf, HandlerError> {
             .unwrap_or("dir"),
         Utc::now().format("%Y%m%d-%H%M%S%.6f")
     ));
-    let file = fs::File::create(&archive)
-        .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))?;
-    let encoder = GzEncoder::new(file, Compression::default());
-    let mut tar = tar::Builder::new(encoder);
-    let name = path.file_name().unwrap_or_default();
-    tar.append_dir_all(name, path)
-        .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))?;
-    tar.finish()
-        .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))?;
+
+    let result = (|| -> Result<(), HandlerError> {
+        let file = fs::File::create(&archive)
+            .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        tar.follow_symlinks(false);
+        let name = path.file_name().unwrap_or_default();
+        tar.append_dir_all(name, path)
+            .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))?;
+        let encoder = tar
+            .into_inner()
+            .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))?;
+        let file = encoder
+            .finish()
+            .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))?;
+        file.sync_all()
+            .map_err(|e| HandlerError::new("backup_failed", format!("backup failed: {e}")))
+    })();
+
+    if let Err(error) = result {
+        let _ = fs::remove_file(&archive);
+        return Err(error);
+    }
     Ok(archive)
 }
 
@@ -389,5 +413,32 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "path_not_allowed");
+    }
+
+    #[test]
+    fn directory_backup_preserves_nested_symlinks_without_reading_targets() {
+        use flate2::read::GzDecoder;
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = root.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        let secret = outside.path().join("secret.txt");
+        fs::write(&secret, "outside secret").unwrap();
+        symlink(&secret, victim.join("link")).unwrap();
+
+        let archive_path = backup_dir(&victim).unwrap();
+        let decoder = GzDecoder::new(fs::File::open(archive_path).unwrap());
+        let mut archive = tar::Archive::new(decoder);
+        let mut saw_link = false;
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().unwrap().ends_with("link") {
+                assert!(entry.header().entry_type().is_symlink());
+                saw_link = true;
+            }
+        }
+        assert!(saw_link);
     }
 }

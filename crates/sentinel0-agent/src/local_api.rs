@@ -581,6 +581,8 @@ async fn call_via_run_as(endpoint: &Endpoint, payload: &[u8]) -> Result<Vec<u8>,
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
 
     let mut child = command.spawn().map_err(|error| {
         HandlerError::new(
@@ -588,28 +590,38 @@ async fn call_via_run_as(endpoint: &Endpoint, payload: &[u8]) -> Result<Vec<u8>,
             format!("could not start run_as relay: {error}"),
         )
     })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| HandlerError::new("internal_error", "run_as relay stdin was not piped"))?;
-    stdin
-        .write_all(payload)
-        .await
-        .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-    drop(stdin);
+    let pid = child.id();
 
-    let output = timeout(
-        endpoint.timeout + Duration::from_secs(5),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| {
-        HandlerError::new(
-            "timeout",
-            format!("{} did not answer in time", endpoint.name),
-        )
-    })?
-    .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+    let work = async {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            HandlerError::new("internal_error", "run_as relay stdin was not piped")
+        })?;
+        stdin
+            .write_all(payload)
+            .await
+            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+        drop(stdin);
+
+        child
+            .wait_with_output()
+            .await
+            .map_err(|error| HandlerError::new("bad_response", error.to_string()))
+    };
+
+    let output = match timeout(endpoint.timeout + Duration::from_secs(5), work).await {
+        Ok(result) => result?,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let pgid = nix::unistd::Pid::from_raw(pid as i32);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            }
+            return Err(HandlerError::new(
+                "timeout",
+                format!("{} did not answer in time", endpoint.name),
+            ));
+        }
+    };
 
     if output.status.success() && !output.stdout.is_empty() {
         return Ok(output.stdout);

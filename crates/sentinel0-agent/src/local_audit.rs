@@ -1,9 +1,10 @@
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use std::{
+    collections::VecDeque,
     fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
@@ -94,6 +95,11 @@ fn retention_state() -> &'static Mutex<RetentionState> {
     STATE.get_or_init(|| Mutex::new(RetentionState::default()))
 }
 
+fn audit_io_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[must_use]
 pub fn audit_path() -> PathBuf {
     std::env::var_os("SENTINELX_AUDIT_PATH")
@@ -119,28 +125,53 @@ fn should_check_retention() -> bool {
     }
 }
 
-fn maybe_trim(path: &PathBuf) -> std::io::Result<()> {
-    let bytes = fs::read(path)?;
-    let mut lines = bytes
-        .split_inclusive(|byte| *byte == b'\n')
-        .collect::<Vec<_>>();
-    if lines.len() <= TRIM_TRIGGER {
+fn has_more_than_lines(path: &Path, limit: usize) -> std::io::Result<bool> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut line = Vec::new();
+    for _ in 0..=limit {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn maybe_trim(path: &Path) -> std::io::Result<()> {
+    if !has_more_than_lines(path, TRIM_TRIGGER)? {
         return Ok(());
     }
-    let keep_from = lines.len().saturating_sub(MAX_LINES);
-    let retained = lines.split_off(keep_from).concat();
+
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut retained = VecDeque::with_capacity(MAX_LINES);
+    loop {
+        let mut line = Vec::new();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if retained.len() == MAX_LINES {
+            retained.pop_front();
+        }
+        retained.push_back(line);
+    }
+
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let temp = parent.join(format!(".audit-{:016x}.tmp", rand::random::<u64>()));
-    {
+    let replace = (|| -> std::io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        file.write_all(&retained)?;
+        for line in retained {
+            file.write_all(&line)?;
+        }
         file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if replace.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    fs::rename(temp, path)?;
-    Ok(())
+    replace
 }
 
 pub fn record(
@@ -157,6 +188,14 @@ pub fn record(
     }
     let path = audit_path();
     let attempt = (|| -> Result<(), Box<dyn std::error::Error>> {
+        // Rust dispatches operations concurrently and records them from
+        // spawn_blocking workers. The Python implementation's append-then-
+        // trim sequence was effectively serialized by its event-loop call
+        // site; without a lock a trim rename can race a concurrent append to
+        // the old inode and silently lose a row.
+        let _io_guard = audit_io_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -190,16 +229,18 @@ pub fn record(
     }
 }
 
-fn tail_lines(path: &PathBuf, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
+fn tail_lines(path: &Path, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
     let mut file = fs::File::open(path)?;
     let mut position = file.seek(SeekFrom::End(0))?;
     let mut buffer = Vec::new();
-    while position > 0 && buffer.iter().filter(|byte| **byte == b'\n').count() <= limit {
+    let mut newline_count = 0;
+    while position > 0 && newline_count <= limit {
         let step = position.min(TAIL_BLOCK as u64) as usize;
         position -= step as u64;
         file.seek(SeekFrom::Start(position))?;
         let mut chunk = vec![0_u8; step];
         file.read_exact(&mut chunk)?;
+        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
         chunk.extend(buffer);
         buffer = chunk;
     }
@@ -214,7 +255,7 @@ fn tail_lines(path: &PathBuf, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
     Ok(lines)
 }
 
-fn read_recent_from(path: &PathBuf, limit: usize) -> Vec<Value> {
+fn read_recent_from(path: &Path, limit: usize) -> Vec<Value> {
     let limit = limit.clamp(1, MAX_LINES);
     let Ok(lines) = tail_lines(path, limit) else {
         return Vec::new();
@@ -228,6 +269,9 @@ fn read_recent_from(path: &PathBuf, limit: usize) -> Vec<Value> {
 
 #[must_use]
 pub fn read_recent(limit: usize) -> Vec<Value> {
+    let _io_guard = audit_io_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     read_recent_from(&audit_path(), limit)
 }
 
@@ -285,5 +329,32 @@ mod tests {
         ] {
             assert!(!encoded.contains(secret), "audit summary leaked {secret}");
         }
+    }
+
+    #[test]
+    fn trim_keeps_exactly_the_newest_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut input = Vec::new();
+        for n in 1..=(TRIM_TRIGGER + 1) {
+            writeln!(&mut input, "{{\"n\":{n}}}").unwrap();
+        }
+        fs::write(&path, input).unwrap();
+
+        maybe_trim(&path).unwrap();
+
+        let rows = read_recent_from(&path, MAX_LINES);
+        assert_eq!(rows.len(), MAX_LINES);
+        assert_eq!(rows[0]["n"], TRIM_TRIGGER + 1);
+        assert_eq!(rows[MAX_LINES - 1]["n"], TRIM_TRIGGER + 2 - MAX_LINES);
+    }
+
+    #[test]
+    fn retention_probe_stops_at_the_requested_line_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+        assert!(!has_more_than_lines(&path, 3).unwrap());
+        assert!(has_more_than_lines(&path, 2).unwrap());
     }
 }

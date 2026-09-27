@@ -18,7 +18,8 @@ const MAX_RECENT_COMMITS: usize = 10;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn run_git(root: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>), HandlerError> {
-    let child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .arg("-c")
@@ -31,13 +32,25 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>), 
         .env("LC_ALL", "C")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = command
         .spawn()
         .map_err(|e| HandlerError::new("git_failed", e.to_string()))?;
+    let pid = child.id();
     match timeout(GIT_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(out)) => Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr)),
         Ok(Err(e)) => Err(HandlerError::new("git_failed", e.to_string())),
-        Err(_) => Err(HandlerError::new("git_timeout", "git command timed out")),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let pgid = nix::unistd::Pid::from_raw(pid as i32);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            }
+            Err(HandlerError::new("git_timeout", "git command timed out"))
+        }
     }
 }
 
@@ -55,10 +68,14 @@ fn extension(name: &str) -> &str {
     }
 }
 
-fn top_counts(paths: &[String]) -> (Vec<String>, BTreeMap<String, Value>, bool) {
+fn top_counts<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> (usize, Vec<String>, BTreeMap<String, Value>, bool) {
+    let mut tracked = 0_usize;
     let mut top: HashMap<String, usize> = HashMap::new();
     let mut exts: HashMap<String, usize> = HashMap::new();
     for path in paths {
+        tracked += 1;
         if let Some((head, _)) = path.split_once('/') {
             *top.entry(head.to_owned()).or_default() += 1;
         }
@@ -84,7 +101,7 @@ fn top_counts(paths: &[String]) -> (Vec<String>, BTreeMap<String, Value>, bool) 
         .take(MAX_EXTENSIONS)
         .map(|(name, count)| (name, Value::from(count as u64)))
         .collect::<BTreeMap<_, _>>();
-    (top_dirs, ext_map, top_truncated)
+    (tracked, top_dirs, ext_map, top_truncated)
 }
 
 fn parse_status(raw: &[u8]) -> Map<String, Value> {
@@ -97,10 +114,9 @@ fn parse_status(raw: &[u8]) -> Map<String, Value> {
     let mut unstaged = 0_u64;
     let mut untracked = 0_u64;
 
-    let records = raw.split(|byte| *byte == 0).collect::<Vec<_>>();
-    let mut index = 0;
-    while index < records.len() {
-        let line = String::from_utf8_lossy(records[index]);
+    let mut records = raw.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        let line = String::from_utf8_lossy(record);
         if let Some(value) = line.strip_prefix("# branch.head ") {
             let value = value.trim();
             if value == "(detached)" {
@@ -130,12 +146,11 @@ fn parse_status(raw: &[u8]) -> Map<String, Value> {
                 unstaged += 1;
             }
             if line.starts_with("2 ") {
-                index += 1;
+                let _ = records.next();
             }
         } else if line.starts_with("? ") {
             untracked += 1;
         }
-        index += 1;
     }
 
     Map::from_iter([
@@ -184,16 +199,16 @@ async fn git_snapshot(root: &Path) -> Result<BTreeMap<String, Value>, HandlerErr
     let (_, si, sd) = sum_numstat(&staged_raw);
 
     let (rc, files_raw, _) = run_git(root, &["ls-files", "-z"]).await?;
-    let paths = if rc == 0 {
-        String::from_utf8_lossy(&files_raw)
-            .split('\0')
-            .filter(|path| !path.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
+    let decoded_files = String::from_utf8_lossy(&files_raw);
+    let (tracked_files, top_dirs, extensions, top_truncated) = if rc == 0 {
+        top_counts(
+            decoded_files
+                .split(char::from(0))
+                .filter(|path| !path.is_empty()),
+        )
     } else {
-        Vec::new()
+        (0, Vec::new(), BTreeMap::new(), false)
     };
-    let (top_dirs, extensions, top_truncated) = top_counts(&paths);
 
     let (_, log_raw, _) = run_git(
         root,
@@ -251,7 +266,7 @@ async fn git_snapshot(root: &Path) -> Result<BTreeMap<String, Value>, HandlerErr
         (
             "repository".into(),
             json!({
-                "tracked_files": paths.len(),
+                "tracked_files": tracked_files,
                 "top_directories": top_dirs,
                 "extensions": extensions,
             }),
@@ -394,5 +409,17 @@ mod tests {
         .unwrap();
         assert_eq!(result["kind"], "directory");
         assert_eq!(result["repository"]["file_count"], 1);
+    }
+
+    #[test]
+    fn top_counts_streams_paths_without_materializing_the_inventory() {
+        let paths = ["src/lib.rs", "src/main.rs", "README", ".gitignore"];
+        let (tracked, top, extensions, truncated) = top_counts(paths);
+        assert_eq!(tracked, 4);
+        assert_eq!(top, vec!["src"]);
+        assert_eq!(extensions["rs"], 2);
+        assert_eq!(extensions["<none>"], 1);
+        assert_eq!(extensions["<dotfile>"], 1);
+        assert!(!truncated);
     }
 }
