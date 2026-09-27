@@ -90,6 +90,31 @@ fn backup_dir(path: &Path) -> Result<PathBuf, HandlerError> {
     Ok(archive)
 }
 
+fn is_own_backup(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((_, suffix)) = name.rsplit_once(".bak.") else {
+        return false;
+    };
+    let stamp = suffix.strip_suffix(".tar.gz").unwrap_or(suffix);
+    let bytes = stamp.as_bytes();
+
+    if bytes.len() != 15 && bytes.len() != 22 {
+        return false;
+    }
+    if bytes[8] != b'-' {
+        return false;
+    }
+    if bytes.len() == 22 && bytes[15] != b'.' {
+        return false;
+    }
+
+    bytes.iter().enumerate().all(|(index, byte)| {
+        index == 8 || (bytes.len() == 22 && index == 15) || byte.is_ascii_digit()
+    })
+}
+
 fn remove_existing(path: &Path) -> std::io::Result<()> {
     if path.is_dir() && !path.is_symlink() {
         fs::remove_dir_all(path)
@@ -228,14 +253,19 @@ pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             format!("{raw:?} is a directory; pass recursive=true to delete it"),
         ));
     }
-    let backup = if is_dir {
-        backup_dir(&target)?
+    let own_backup = is_own_backup(&target);
+    let backup = if own_backup {
+        None
+    } else if is_dir {
+        Some(backup_dir(&target)?)
     } else {
-        backup_file(&target)?
+        Some(backup_file(&target)?)
     };
+
     remove_existing(&target)
         .map_err(|e| HandlerError::new("delete_failed", format!("delete failed: {e}")))?;
-    Ok(BTreeMap::from([
+
+    let mut result = BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
         ("op".into(), Value::String("delete".into())),
         ("path".into(), Value::String(target.display().to_string())),
@@ -243,8 +273,27 @@ pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             "kind".into(),
             Value::String(if is_dir { "dir" } else { "file" }.into()),
         ),
-        ("backup".into(), Value::String(backup.display().to_string())),
-    ]))
+        (
+            "backup".into(),
+            backup
+                .as_ref()
+                .map(|path| Value::String(path.display().to_string()))
+                .unwrap_or(Value::Null),
+        ),
+    ]);
+
+    if own_backup {
+        result.insert("terminal".into(), Value::Bool(true));
+        result.insert(
+            "note".into(),
+            Value::String(
+                "This was a SentinelX backup artifact, so it was deleted permanently without making a backup of the backup. Space is reclaimed; there is no recovery copy."
+                    .into(),
+            ),
+        );
+    }
+
+    Ok(result)
 }
 
 pub fn chmod(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -397,6 +446,80 @@ mod tests {
         .unwrap();
         assert!(!victim.exists());
         assert!(Path::new(result["backup"].as_str().unwrap()).exists());
+    }
+
+    #[test]
+    fn recognizes_only_our_timestamped_backup_names() {
+        for name in [
+            "model.gguf.bak.20260924-142530.123456",
+            "project.bak.20260924-142530.123456.tar.gz",
+            "legacy.bak.20260924-142530",
+        ] {
+            assert!(is_own_backup(Path::new(name)), "{name}");
+        }
+
+        for name in [
+            "config.bak",
+            "notes.bak.txt",
+            "backup.tar.gz",
+            "model.gguf",
+            "db.bak.2026",
+            "x.bak.20260924",
+            "x.bak.20260924-142530-not-ours",
+        ] {
+            assert!(!is_own_backup(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn generated_backups_are_recognized_as_ours() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("important.txt");
+        fs::write(&file, "precious").unwrap();
+        let backup = backup_file(&file).unwrap();
+        assert!(is_own_backup(&backup));
+    }
+
+    #[test]
+    fn deleting_our_backup_is_terminal() {
+        let dir = tempdir().unwrap();
+        let backup = dir.path().join("model.gguf.bak.20260924-142530.123456");
+        fs::write(&backup, "backup bytes").unwrap();
+
+        let result = delete(
+            &policy(dir.path()),
+            &Map::from_iter([("path".into(), Value::String(backup.display().to_string()))]),
+        )
+        .unwrap();
+
+        assert!(!backup.exists());
+        assert!(result["backup"].is_null());
+        assert_eq!(result["terminal"], Value::Bool(true));
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn deleting_user_bak_file_still_creates_backup() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("config.bak");
+        fs::write(&file, "user data").unwrap();
+
+        let result = delete(
+            &policy(dir.path()),
+            &Map::from_iter([("path".into(), Value::String(file.display().to_string()))]),
+        )
+        .unwrap();
+
+        assert!(!file.exists());
+        let backup = Path::new(result["backup"].as_str().unwrap());
+        assert!(backup.exists());
+        assert!(!result.contains_key("terminal"));
     }
 
     #[test]
