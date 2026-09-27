@@ -14,7 +14,7 @@ use std::{error::Error, path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-const AGENT_VERSION: &str = "0.21.0-rust.1";
+const AGENT_VERSION: &str = "0.22.0-rust.1";
 
 #[derive(Debug, Parser)]
 #[command(name = "sentinelx-core")]

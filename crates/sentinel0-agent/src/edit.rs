@@ -740,6 +740,84 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_create_leaves_target_tree_absent() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("share").join("nested").join("new.txt");
+
+        let result = edit(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(target.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                ("new_text".into(), Value::String("hello\n".into())),
+                ("create".into(), Value::Bool(true)),
+                ("dry_run".into(), Value::Bool(true)),
+                ("diff".into(), Value::Bool(true)),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(result["dry_run"], true);
+        assert!(result["diff"].as_str().unwrap().contains("+hello"));
+        assert!(!target.exists());
+        assert!(!target.parent().unwrap().exists());
+        assert!(!dir.path().join("share").exists());
+    }
+
+    #[test]
+    fn dry_run_existing_file_leaves_no_sibling_temp_or_content_change() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("config.yaml");
+        fs::write(&target, "a: 1\n").unwrap();
+        let before = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let result = edit(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(target.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                ("new_text".into(), Value::String("a: 2\n".into())),
+                ("dry_run".into(), Value::Bool(true)),
+                ("diff".into(), Value::Bool(true)),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(result["dry_run"], true);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "a: 1\n");
+
+        let after = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != crate::staging::STAGING_DIRNAME)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn missing_target_without_create_leaves_parents_absent() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("missing").join("x.txt");
+        let error = edit(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(target.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                ("new_text".into(), Value::String("x\n".into())),
+            ]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "target_not_found");
+        assert!(!target.parent().unwrap().exists());
+    }
+
+    #[test]
     fn yaml_validation_rejects_bad_candidate_without_touching_target() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("x.yaml");
