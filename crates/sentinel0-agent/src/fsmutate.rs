@@ -811,6 +811,8 @@ mod tests {
             "model.gguf.bak.20260924-142530.123456",
             "project.bak.20260924-142530.123456.tar.gz",
             "legacy.bak.20260924-142530",
+            "hardened.bak.20260924-142530.123456-a1b2c3d4e5f60718",
+            "hardened-dir.bak.20260924-142530.123456-a1b2c3d4e5f60718.tar.gz",
         ] {
             assert!(is_own_backup(Path::new(name)), "{name}");
         }
