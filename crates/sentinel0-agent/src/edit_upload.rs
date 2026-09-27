@@ -102,7 +102,7 @@ pub fn file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 pub fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let upload_id = require_str(payload, "upload_id")?;
     let mode = require_str(payload, "mode")?;
-    let _ = require_str(payload, "path")?;
+    require_str(payload, "path")?;
     let dir = upload_dir(policy, upload_id)?;
     let old_path = dir.join("old.txt");
     let new_path = dir.join("new.txt");
@@ -144,11 +144,16 @@ pub fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult 
         );
     }
 
-    let result = edit::edit(policy, &edit_payload);
-    if result.is_ok() {
-        let _ = fs::remove_dir_all(&dir);
+    let mut result = edit::edit(policy, &edit_payload)?;
+    if let Err(error) = fs::remove_dir_all(&dir) {
+        let message = format!(
+            "edit committed but upload-session cleanup failed for {}: {error}",
+            dir.display()
+        );
+        tracing::warn!(%message);
+        result.insert("cleanup_warning".into(), Value::String(message));
     }
-    result
+    Ok(result)
 }
 
 #[cfg(test)]

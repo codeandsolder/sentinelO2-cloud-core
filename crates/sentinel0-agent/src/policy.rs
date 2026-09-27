@@ -1,3 +1,4 @@
+use crate::tooling::Tooling;
 use sentinel0_proto::ConfigSummary;
 use serde::Deserialize;
 use soft_canonicalize::soft_canonicalize;
@@ -33,6 +34,7 @@ pub struct ServiceSpec {
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub exec_strict: bool,
+    pub exec_enforce_allowlist: bool,
     pub disabled_ops: BTreeSet<String>,
     pub allowed_commands: Vec<String>,
     pub services: BTreeMap<String, ServiceSpec>,
@@ -41,6 +43,7 @@ pub struct Policy {
     pub preferred_profile: Option<String>,
     pub exec_timeout_default: u64,
     pub exec_timeout_max: u64,
+    pub exec_capture_max_bytes: usize,
     pub upload_base: PathBuf,
     pub trusted_fetch_hosts: Vec<String>,
     pub file_url_timeout_seconds: u64,
@@ -50,12 +53,14 @@ pub struct Policy {
     pub file_ops_max_search_results: usize,
     pub local_apis: BTreeMap<String, yaml_serde::Value>,
     pub locations: BTreeMap<String, yaml_serde::Value>,
+    pub tooling: Tooling,
 }
 
 impl Default for Policy {
     fn default() -> Self {
         Self {
             exec_strict: false,
+            exec_enforce_allowlist: false,
             disabled_ops: BTreeSet::new(),
             allowed_commands: Vec::new(),
             services: BTreeMap::new(),
@@ -64,6 +69,7 @@ impl Default for Policy {
             preferred_profile: None,
             exec_timeout_default: 60,
             exec_timeout_max: 600,
+            exec_capture_max_bytes: 4 * 1024 * 1024,
             upload_base: PathBuf::from("/var/lib/sentinelx/uploads"),
             trusted_fetch_hosts: Vec::new(),
             file_url_timeout_seconds: 15,
@@ -73,6 +79,7 @@ impl Default for Policy {
             file_ops_max_search_results: 200,
             local_apis: BTreeMap::new(),
             locations: BTreeMap::new(),
+            tooling: Tooling::default(),
         }
     }
 }
@@ -111,10 +118,34 @@ struct RawPolicy {
     security: RawSecurity,
     file_ops: RawFileOps,
     local_apis: BTreeMap<String, yaml_serde::Value>,
+    tooling: RawTooling,
     disabled_ops: Vec<String>,
     exec_strict: bool,
     #[serde(flatten)]
     unknown: BTreeMap<String, yaml_serde::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RawTooling {
+    path: Option<Vec<PathBuf>>,
+    executables: BTreeMap<String, PathBuf>,
+    uv_python: String,
+    forbid_direct_python: bool,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, yaml_serde::Value>,
+}
+
+impl Default for RawTooling {
+    fn default() -> Self {
+        Self {
+            path: None,
+            executables: BTreeMap::new(),
+            uv_python: "3".into(),
+            forbid_direct_python: true,
+            unknown: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -129,6 +160,8 @@ struct RawAgent {
 struct RawExec {
     timeout_default: u64,
     timeout_max: u64,
+    capture_max_bytes: usize,
+    enforce_allowlist: bool,
 }
 
 impl Default for RawExec {
@@ -136,6 +169,8 @@ impl Default for RawExec {
         Self {
             timeout_default: 60,
             timeout_max: 600,
+            capture_max_bytes: 4 * 1024 * 1024,
+            enforce_allowlist: false,
         }
     }
 }
@@ -216,7 +251,7 @@ impl Default for RawService {
 impl Policy {
     pub fn from_file(path: &Path) -> Result<Self, PolicyError> {
         if !path.exists() {
-            warn!(path = %path.display(), "policy file missing; loading deny-all defaults");
+            warn!(path = %path.display(), "policy file missing; loading built-in defaults");
             return Ok(Self::default());
         }
 
@@ -332,13 +367,35 @@ impl Policy {
             }
         };
 
+        if !raw.tooling.unknown.is_empty() {
+            warn!(
+                unknown_keys = ?raw.tooling.unknown.keys().collect::<Vec<_>>(),
+                "tooling config contains unknown keys"
+            );
+        }
+
         let upload_base = raw
             .upload_base
             .unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/uploads"));
         let upload_base = soft_canonicalize(&upload_base).unwrap_or(upload_base);
 
+        let tooling = Tooling {
+            search_path: raw
+                .tooling
+                .path
+                .unwrap_or_else(|| Tooling::default().search_path),
+            executables: raw.tooling.executables,
+            uv_python: if raw.tooling.uv_python.trim().is_empty() {
+                "3".into()
+            } else {
+                raw.tooling.uv_python
+            },
+            forbid_direct_python: raw.tooling.forbid_direct_python,
+        };
+
         let policy = Self {
             exec_strict: raw.exec_strict,
+            exec_enforce_allowlist: raw.exec.enforce_allowlist || raw.exec_strict,
             disabled_ops: raw
                 .disabled_ops
                 .into_iter()
@@ -352,6 +409,7 @@ impl Policy {
             preferred_profile,
             exec_timeout_default: raw.exec.timeout_default,
             exec_timeout_max: raw.exec.timeout_max,
+            exec_capture_max_bytes: raw.exec.capture_max_bytes.max(64 * 1024),
             upload_base,
             trusted_fetch_hosts: raw.security.trusted_fetch_hosts,
             file_url_timeout_seconds: raw.security.file_url_timeout_seconds,
@@ -361,10 +419,13 @@ impl Policy {
             file_ops_max_search_results: raw.file_ops.max_search_results,
             local_apis: raw.local_apis,
             locations: raw.locations,
+            tooling,
         };
 
-        if policy.allowed_commands.is_empty() {
-            warn!("policy loaded with no allowed_commands; exec is deny-all");
+        if policy.exec_enforce_allowlist && policy.allowed_commands.is_empty() {
+            warn!(
+                "exec allowlist enforcement is enabled with no allowed_commands; exec is deny-all"
+            );
         }
         Ok(policy)
     }
@@ -391,6 +452,36 @@ impl Policy {
             return None;
         }
         let candidate = soft_canonicalize(path).ok()?;
+
+        self.file_ops_paths.iter().find_map(|entry| {
+            if need_write && entry.access != FileAccess::ReadWrite {
+                return None;
+            }
+            let allowed = soft_canonicalize(&entry.path).ok()?;
+            if candidate == allowed || candidate.starts_with(&allowed) {
+                Some(candidate.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Resolve and authorize a path without following the final directory
+    /// entry. This is for operations that manipulate the entry itself
+    /// (move/copy/delete), so a symlink under an allowed directory remains the
+    /// symlink rather than turning into its possibly-outside target.
+    pub fn resolve_path_no_follow_leaf(&self, path: &str, need_write: bool) -> Option<PathBuf> {
+        if path.is_empty() || self.file_ops_paths.is_empty() {
+            return None;
+        }
+        let raw = Path::new(path);
+        let leaf = raw.file_name()?;
+        if leaf == "." || leaf == ".." {
+            return None;
+        }
+        let parent = raw.parent().unwrap_or_else(|| Path::new("."));
+        let parent = soft_canonicalize(parent).ok()?;
+        let candidate = parent.join(leaf);
 
         self.file_ops_paths.iter().find_map(|entry| {
             if need_write && entry.access != FileAccess::ReadWrite {
@@ -461,11 +552,39 @@ upload_base: /var/lib/sentinelx/uploads
         );
         assert_eq!(policy.exec_timeout_default, 30);
         assert_eq!(policy.exec_timeout_max, 3600);
+        assert!(!policy.exec_enforce_allowlist);
         assert!(policy.is_command_allowed("git status"));
         assert!(!policy.is_command_allowed("curl example.com"));
         assert!(policy.service_action_allowed("nginx", "restart"));
         assert_eq!(policy.preferred_profile.as_deref(), Some("compact"));
         assert_eq!(policy.file_ops_paths.len(), 2);
+    }
+
+    #[test]
+    fn allowlist_enforcement_is_opt_in_but_legacy_strict_still_enforces() {
+        let policy = parse(
+            r#"
+allowed_commands: [git]
+"#,
+        );
+        assert!(!policy.exec_enforce_allowlist);
+
+        let policy = parse(
+            r#"
+allowed_commands: [git]
+exec:
+  enforce_allowlist: true
+"#,
+        );
+        assert!(policy.exec_enforce_allowlist);
+
+        let policy = parse(
+            r#"
+allowed_commands: [git]
+exec_strict: true
+"#,
+        );
+        assert!(policy.exec_enforce_allowlist);
     }
 
     #[test]

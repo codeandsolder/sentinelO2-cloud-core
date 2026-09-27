@@ -1,4 +1,5 @@
 use crate::{
+    fsutil::rename_no_replace,
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
     staging,
@@ -151,7 +152,10 @@ fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
     segments[0] == 0x2001 && segments[1] == 0x0db8
 }
 
-async fn validate_fetch_url(policy: &Policy, raw: &str) -> Result<url::Url, HandlerError> {
+async fn validate_fetch_url(
+    policy: &Policy,
+    raw: &str,
+) -> Result<(url::Url, String, Vec<std::net::SocketAddr>), HandlerError> {
     let url = url::Url::parse(raw)
         .map_err(|e| HandlerError::new("invalid_payload", format!("bad file_url: {e}")))?;
     if url.scheme() != "https" {
@@ -184,10 +188,15 @@ async fn validate_fetch_url(policy: &Policy, raw: &str) -> Result<url::Url, Hand
     let port = url.port_or_known_default().unwrap_or(443);
     let addresses = lookup_host((host.as_str(), port))
         .await
-        .map_err(|e| HandlerError::new("fetch_failed", format!("DNS resolution failed: {e}")))?;
-    let mut any = false;
-    for address in addresses {
-        any = true;
+        .map_err(|e| HandlerError::new("fetch_failed", format!("DNS resolution failed: {e}")))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(HandlerError::new(
+            "fetch_failed",
+            "DNS resolution returned no addresses",
+        ));
+    }
+    for address in &addresses {
         if !is_safe_ip(address.ip()) {
             return Err(HandlerError::new(
                 "fetch_blocked",
@@ -198,13 +207,7 @@ async fn validate_fetch_url(policy: &Policy, raw: &str) -> Result<url::Url, Hand
             ));
         }
     }
-    if !any {
-        return Err(HandlerError::new(
-            "fetch_failed",
-            "DNS resolution returned no addresses",
-        ));
-    }
-    Ok(url)
+    Ok((url, host, addresses))
 }
 
 async fn fetch_to(
@@ -212,10 +215,15 @@ async fn fetch_to(
     raw: &str,
     destination: &Path,
 ) -> Result<(u64, String), HandlerError> {
-    let url = validate_fetch_url(policy, raw).await?;
+    let (url, host, addresses) = validate_fetch_url(policy, raw).await?;
     let client = Client::builder()
         .redirect(RedirectPolicy::none())
+        // A proxy would resolve/connect independently and defeat the DNS pin.
+        .no_proxy()
         .timeout(Duration::from_secs(policy.file_url_timeout_seconds))
+        // Use the exact public addresses we just vetted. Otherwise reqwest
+        // performs a second DNS lookup between the policy check and connect.
+        .resolve_to_addrs(&host, &addresses)
         .build()
         .map_err(|e| HandlerError::new("fetch_failed", e.to_string()))?;
     let response = client
@@ -323,16 +331,51 @@ pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> Handl
 
     let (size, sha256) = match result {
         Ok(value) => value,
-        Err(error) => {
-            let _ = async_fs::remove_file(&temp).await;
+        Err(mut error) => {
+            if let Err(cleanup) = async_fs::remove_file(&temp).await
+                && cleanup.kind() != std::io::ErrorKind::NotFound
+            {
+                error.details.insert(
+                    "cleanup_error".into(),
+                    Value::String(format!("failed cleaning staged upload: {cleanup}")),
+                );
+            }
             return Err(error);
         }
     };
-    if let Err(error) = async_fs::rename(&temp, &destination).await {
-        let _ = async_fs::remove_file(&temp).await;
+    let finalize = if overwrite {
+        async_fs::rename(&temp, &destination).await
+    } else {
+        let temp = temp.clone();
+        let destination = destination.clone();
+        tokio::task::spawn_blocking(move || rename_no_replace(&temp, &destination))
+            .await
+            .map_err(|error| {
+                HandlerError::new(
+                    "internal_error",
+                    format!("upload finalization task failed: {error}"),
+                )
+            })?
+    };
+    if let Err(error) = finalize {
+        let cleanup = match async_fs::remove_file(&temp).await {
+            Ok(()) => None,
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => None,
+            Err(cleanup) => Some(cleanup),
+        };
+        let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "conflict"
+        } else {
+            "io_error"
+        };
         return Err(HandlerError::new(
-            "io_error",
-            format!("failed finalizing upload: {error}"),
+            code,
+            match cleanup {
+                Some(cleanup) => format!(
+                    "failed finalizing upload: {error}; staged-file cleanup also failed: {cleanup}"
+                ),
+                None => format!("failed finalizing upload: {error}"),
+            },
         ));
     }
 
@@ -562,11 +605,35 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
             HandlerError::new("io_error", format!("cannot create destination parent: {e}"))
         })?;
     }
-    fs::rename(&assembled, &destination)
-        .map_err(|e| HandlerError::new("io_error", format!("failed finalizing upload: {e}")))?;
-    let _ = fs::remove_dir_all(&dir);
+    let finalize = if meta.overwrite {
+        fs::rename(&assembled, &destination)
+    } else {
+        rename_no_replace(&assembled, &destination)
+    };
+    finalize.map_err(|error| {
+        HandlerError::new(
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "conflict"
+            } else {
+                "io_error"
+            },
+            format!("failed finalizing upload: {error}"),
+        )
+    })?;
+    let cleanup_warning = match fs::remove_dir_all(&dir) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            let message = format!(
+                "upload committed but session cleanup failed for {}: {error}",
+                dir.display()
+            );
+            tracing::warn!(%message);
+            Some(message)
+        }
+    };
 
-    Ok(BTreeMap::from([
+    let mut result = BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
         ("mode".into(), Value::String("chunked".into())),
         ("upload_id".into(), Value::String(id)),
@@ -580,7 +647,11 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
             "filename".into(),
             meta.filename.map(Value::String).unwrap_or(Value::Null),
         ),
-    ]))
+    ]);
+    if let Some(warning) = cleanup_warning {
+        result.insert("cleanup_warning".into(), Value::String(warning));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

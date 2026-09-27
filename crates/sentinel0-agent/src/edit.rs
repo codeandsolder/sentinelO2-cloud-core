@@ -1,6 +1,7 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
+    process_output::read_bounded_sync,
 };
 use rand::RngExt;
 use regex::RegexBuilder;
@@ -12,8 +13,8 @@ use std::{
     io::Write,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Command,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    process::{Command, Stdio},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MODES: &[&str] = &[
@@ -24,6 +25,8 @@ const MODES: &[&str] = &[
     "prepend",
     "write",
 ];
+const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(30);
+const VALIDATOR_CAPTURE_BYTES: usize = 256 * 1024;
 const PRESETS: &[&str] = &["nginx", "json", "python", "sh", "yaml", "systemd", "toml"];
 
 fn now_stamp() -> String {
@@ -274,9 +277,12 @@ fn transform(
 }
 
 fn run_validator(
+    policy: &Policy,
     path: &Path,
     payload: &Map<String, Value>,
 ) -> Result<Option<Vec<String>>, HandlerError> {
+    use wait_timeout::ChildExt as _;
+
     let preset = payload.get("validator_preset").and_then(Value::as_str);
     let custom = payload.get("validator").and_then(Value::as_str);
 
@@ -317,20 +323,34 @@ fn run_validator(
     let argv = if let Some(preset) = preset {
         match preset {
             "python" => vec![
-                "python3".into(),
+                policy.tooling.command("uv").display().to_string(),
+                "run".into(),
+                "--no-project".into(),
+                "--python".into(),
+                policy.tooling.uv_python.clone(),
+                "python".into(),
                 "-m".into(),
                 "py_compile".into(),
                 path.display().to_string(),
             ],
-            "sh" => vec!["bash".into(), "-n".into(), path.display().to_string()],
+            "sh" => vec![
+                policy.tooling.command("bash").display().to_string(),
+                "-n".into(),
+                path.display().to_string(),
+            ],
             "systemd" => vec![
-                "systemd-analyze".into(),
+                policy
+                    .tooling
+                    .command("systemd-analyze")
+                    .display()
+                    .to_string(),
                 "verify".into(),
                 path.display().to_string(),
             ],
             "nginx" => vec![
-                "sudo".into(),
-                "nginx".into(),
+                policy.tooling.command("sudo").display().to_string(),
+                "-n".into(),
+                policy.tooling.command("nginx").display().to_string(),
                 "-t".into(),
                 "-c".into(),
                 "/etc/nginx/nginx.conf".into(),
@@ -338,6 +358,12 @@ fn run_validator(
             _ => return Ok(None),
         }
     } else if let Some(custom) = custom {
+        if let Some(kind) = policy.tooling.direct_python_violation(custom) {
+            return Err(HandlerError::new(
+                "use_uv",
+                format!("direct {kind} validator is disabled; invoke it through uv"),
+            ));
+        }
         shlex::split(custom)
             .ok_or_else(|| {
                 HandlerError::new("invalid_payload", "validator has invalid shell quoting")
@@ -358,13 +384,90 @@ fn run_validator(
     if argv.is_empty() {
         return Ok(None);
     }
-    let output = Command::new(&argv[0])
+
+    let mut command = Command::new(&argv[0]);
+    command
         .args(&argv[1..])
-        .output()
-        .map_err(|e| HandlerError::new("validation_failed", format!("validation failed: {e}")))?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    policy.tooling.configure_std(&mut command)?;
+
+    let mut child = command.spawn().map_err(|e| {
+        HandlerError::new(
+            "validation_failed",
+            format!("failed starting validator {:?}: {e}", argv[0]),
+        )
+    })?;
+    let pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HandlerError::new("validation_failed", "validator stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| HandlerError::new("validation_failed", "validator stderr was not piped"))?;
+
+    let per_stream = VALIDATOR_CAPTURE_BYTES / 2;
+    let stdout_reader = std::thread::spawn(move || read_bounded_sync(stdout, per_stream));
+    let stderr_reader = std::thread::spawn(move || read_bounded_sync(stderr, per_stream));
+
+    let status = match child.wait_timeout(VALIDATOR_TIMEOUT).map_err(|e| {
+        HandlerError::new("validation_failed", format!("validator wait failed: {e}"))
+    })? {
+        Some(status) => status,
+        None => {
+            let mut cleanup_error = None;
+            #[cfg(unix)]
+            {
+                let pgid = nix::unistd::Pid::from_raw(pid as i32);
+                if let Err(error) =
+                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                    && error != nix::errno::Errno::ESRCH
+                {
+                    let message = format!("failed killing validator process group: {error}");
+                    tracing::warn!(%message);
+                    cleanup_error = Some(message);
+                }
+            }
+            if let Err(error) = child.wait() {
+                let message = format!("failed reaping timed-out validator: {error}");
+                tracing::warn!(%message);
+                cleanup_error.get_or_insert(message);
+            }
+            let mut details = Map::new();
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
+            }
+            return Err(HandlerError::with_details(
+                "validation_timeout",
+                format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
+                details,
+            ));
+        }
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| HandlerError::new("validation_failed", "validator stdout reader panicked"))?
+        .map_err(|e| {
+            HandlerError::new("validation_failed", format!("validator stdout failed: {e}"))
+        })?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| HandlerError::new("validation_failed", "validator stderr reader panicked"))?
+        .map_err(|e| {
+            HandlerError::new("validation_failed", format!("validator stderr failed: {e}"))
+        })?;
+
+    if !status.success() {
+        let stdout = stdout.rendered_trimmed_lossy();
+        let stderr = stderr.rendered_trimmed_lossy();
         let tail = [stdout, stderr]
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -404,7 +507,15 @@ struct RemoveFileOnDrop(PathBuf);
 
 impl Drop for RemoveFileOnDrop {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if let Err(error) = fs::remove_file(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.0.display(),
+                %error,
+                "failed cleaning temporary edit file"
+            );
+        }
     }
 }
 
@@ -497,6 +608,7 @@ fn atomic_replace(
 }
 
 fn sudo_replace(
+    policy: &Policy,
     target: &Path,
     staged: &Path,
     original_meta: Option<&fs::Metadata>,
@@ -513,8 +625,8 @@ fn sudo_replace(
         rand::rng().random::<u64>()
     ));
 
-    let mut install = Command::new("sudo");
-    install.arg("install");
+    let mut install = Command::new(policy.tooling.command("sudo"));
+    install.arg("-n").arg("install");
     if let Some(meta) = original_meta {
         install
             .arg("-m")
@@ -524,28 +636,43 @@ fn sudo_replace(
             .arg("-g")
             .arg(meta.gid().to_string());
     }
+    policy.tooling.configure_std(&mut install)?;
     let status = install
         .arg(staged)
         .arg(&temp)
         .status()
         .map_err(|e| HandlerError::new("write_failed", format!("sudo install failed: {e}")))?;
+    let cleanup_temp = |context: &str| -> Option<String> {
+        let mut cleanup = Command::new(policy.tooling.command("sudo"));
+        cleanup.args(["-n", "rm", "-f"]).arg(&temp);
+        if let Err(error) = policy.tooling.configure_std(&mut cleanup) {
+            return Some(format!("{context}; temp cleanup setup failed: {error}"));
+        }
+        match cleanup.status() {
+            Ok(status) if status.success() => None,
+            Ok(status) => Some(format!(
+                "{context}; temp cleanup command exited with {status}"
+            )),
+            Err(error) => Some(format!("{context}; temp cleanup failed: {error}")),
+        }
+    };
+
     if !status.success() {
-        let _ = Command::new("sudo").arg("rm").arg("-f").arg(&temp).status();
-        return Err(HandlerError::new("write_failed", "sudo install failed"));
+        let message =
+            cleanup_temp("sudo install failed").unwrap_or_else(|| "sudo install failed".into());
+        return Err(HandlerError::new("write_failed", message));
     }
-    let status = Command::new("sudo")
-        .arg("mv")
-        .arg("-f")
-        .arg(&temp)
-        .arg(target)
+
+    let mut mv = Command::new(policy.tooling.command("sudo"));
+    mv.args(["-n", "mv", "-f"]).arg(&temp).arg(target);
+    policy.tooling.configure_std(&mut mv)?;
+    let status = mv
         .status()
         .map_err(|e| HandlerError::new("write_failed", format!("sudo mv failed: {e}")))?;
     if !status.success() {
-        let _ = Command::new("sudo").arg("rm").arg("-f").arg(&temp).status();
-        return Err(HandlerError::new(
-            "write_failed",
-            "sudo atomic rename failed",
-        ));
+        let message = cleanup_temp("sudo atomic rename failed")
+            .unwrap_or_else(|| "sudo atomic rename failed".into());
+        return Err(HandlerError::new("write_failed", message));
     }
     Ok(())
 }
@@ -619,13 +746,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     fs::write(&staged, &updated)
         .map_err(|e| HandlerError::new("write_failed", format!("failed staging edit: {e}")))?;
 
-    let validator = match run_validator(&staged, payload) {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = fs::remove_file(&staged);
-            return Err(error);
-        }
-    };
+    let validator = run_validator(policy, &staged, payload)?;
     let want_diff = payload
         .get("diff")
         .and_then(Value::as_bool)
@@ -656,7 +777,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if sudo {
-            sudo_replace(&target, &staged, original_meta.as_ref())?;
+            sudo_replace(policy, &target, &staged, original_meta.as_ref())?;
         } else {
             atomic_replace(&target, &updated, original_meta.as_ref())?;
         }

@@ -153,13 +153,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 Err(error) => {
                     error!(%error, "failed to install SIGTERM handler; CTRL-C remains active");
-                    let _ = tokio::signal::ctrl_c().await;
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        error!(%error, "failed waiting for CTRL-C");
+                    }
                 }
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = tokio::signal::ctrl_c().await;
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                error!(%error, "failed waiting for CTRL-C");
+            }
         }
         signal_cancel.cancel();
     });

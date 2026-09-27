@@ -1645,6 +1645,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wait-timeout",
  "walkdir",
  "yaml_serde",
 ]

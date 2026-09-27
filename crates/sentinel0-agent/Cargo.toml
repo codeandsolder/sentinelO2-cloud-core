@@ -38,6 +38,7 @@ tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 walkdir.workspace = true
+wait-timeout.workspace = true
 yaml_serde.workspace = true
 
 [dev-dependencies]

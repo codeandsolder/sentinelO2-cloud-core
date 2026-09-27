@@ -13,75 +13,22 @@ const TRIM_TRIGGER: usize = 5500;
 const RETENTION_CHECK_EVERY: usize = 100;
 const TAIL_BLOCK: usize = 64 * 1024;
 
-const SAFE_PAYLOAD_KEYS: &[&str] = &[
-    "action",
-    "allow_no_change",
-    "backup_dir",
-    "background",
-    "branch",
-    "case_sensitive",
-    "cleanup",
-    "count",
-    "create",
-    "cwd",
-    "depth",
-    "dest",
-    "detail",
-    "diff",
-    "dotall",
-    "dry_run",
-    "expected_remote_sha",
-    "file_glob",
-    "filename",
-    "force",
-    "glob",
-    "interpreter",
-    "interpret_escapes",
-    "max_bytes",
-    "max_results",
-    "mode",
-    "multiline",
-    "operation",
-    "path",
-    "ref",
-    "ref_pattern",
-    "regex",
-    "remote",
-    "role",
-    "service",
-    "sha256",
-    "source_path",
-    "src",
-    "target_path",
-    "timeout",
-    "transfer_id",
-    "upload_id",
-    "validator_preset",
-    "view_range",
-];
-
-fn redacted_summary(value: &Value) -> Value {
-    match value {
-        Value::String(text) => json!({"redacted": true, "bytes": text.len()}),
-        Value::Array(items) => json!({"redacted": true, "items": items.len()}),
-        Value::Object(fields) => json!({"redacted": true, "fields": fields.len()}),
-        _ => json!({"redacted": true}),
-    }
-}
-
+/// Keep audit records useful for correlation without maintaining a giant
+/// "safe values" whitelist. Request values are deliberately not persisted:
+/// the operation/result fields already record what happened, while these two
+/// fields are enough to see the request shape and rough size.
 #[must_use]
 pub fn summarize_payload(payload: &Map<String, Value>) -> Map<String, Value> {
-    payload
-        .iter()
-        .map(|(key, value)| {
-            let summary = if SAFE_PAYLOAD_KEYS.contains(&key.as_str()) {
-                value.clone()
-            } else {
-                redacted_summary(value)
-            };
-            (key.clone(), summary)
-        })
-        .collect()
+    let approx_bytes = serde_json::to_vec(payload)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    Map::from_iter([
+        (
+            "keys".into(),
+            Value::Array(payload.keys().cloned().map(Value::String).collect()),
+        ),
+        ("approx_bytes".into(), Value::from(approx_bytes)),
+    ])
 }
 
 #[derive(Debug, Default)]
@@ -108,9 +55,9 @@ pub fn audit_path() -> PathBuf {
 }
 
 fn should_check_retention() -> bool {
-    let Ok(mut state) = retention_state().lock() else {
-        return false;
-    };
+    let mut state = retention_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !state.checked_once {
         state.checked_once = true;
         state.writes_since_check = 0;
@@ -168,8 +115,15 @@ fn maybe_trim(path: &Path) -> std::io::Result<()> {
         file.sync_all()?;
         fs::rename(&temp, path)
     })();
-    if replace.is_err() {
-        let _ = fs::remove_file(&temp);
+    if replace.is_err()
+        && let Err(cleanup) = fs::remove_file(&temp)
+        && cleanup.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %temp.display(),
+            %cleanup,
+            "failed cleaning audit trim temp file"
+        );
     }
     replace
 }
@@ -257,14 +211,34 @@ fn tail_lines(path: &Path, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
 
 fn read_recent_from(path: &Path, limit: usize) -> Vec<Value> {
     let limit = limit.clamp(1, MAX_LINES);
-    let Ok(lines) = tail_lines(path, limit) else {
-        return Vec::new();
+    let lines = match tail_lines(path, limit) {
+        Ok(lines) => lines,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed reading local audit log"
+            );
+            return Vec::new();
+        }
     };
-    lines
-        .into_iter()
-        .rev()
-        .filter_map(|line| serde_json::from_slice::<Value>(&line).ok())
-        .collect()
+
+    let mut malformed = 0_u64;
+    let mut rows = Vec::new();
+    for line in lines.into_iter().rev() {
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(row) => rows.push(row),
+            Err(_) => malformed = malformed.saturating_add(1),
+        }
+    }
+    if malformed != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            malformed,
+            "skipped malformed local audit rows"
+        );
+    }
+    rows
 }
 
 #[must_use]
@@ -292,41 +266,19 @@ mod tests {
     }
 
     #[test]
-    fn payload_summary_keeps_routing_metadata_but_not_sensitive_values() {
+    fn payload_summary_records_shape_not_values() {
         let payload = Map::from_iter([
-            ("path".into(), Value::String("/tmp/example".into())),
-            ("mode".into(), Value::String("replace".into())),
-            ("content".into(), Value::String("CONTENT_SECRET".into())),
-            ("new_text".into(), Value::String("TEXT_SECRET".into())),
-            ("command".into(), Value::String("COMMAND_SECRET".into())),
-            (
-                "env".into(),
-                json!({"TOKEN": "ENV_SECRET", "OTHER": "value"}),
-            ),
-            ("patch".into(), Value::String("PATCH_SECRET".into())),
-            (
-                "url".into(),
-                Value::String("https://URL_SECRET@example.test".into()),
-            ),
-            ("params".into(), json!({"password": "PARAM_SECRET"})),
+            ("path".into(), Value::String("/tmp/SECRET_PATH".into())),
+            ("command".into(), Value::String("SECRET_COMMAND".into())),
+            ("env".into(), json!({"TOKEN": "SECRET_TOKEN"})),
         ]);
 
         let summary = summarize_payload(&payload);
-        assert_eq!(summary["path"], "/tmp/example");
-        assert_eq!(summary["mode"], "replace");
-        assert_eq!(summary["content"], json!({"redacted": true, "bytes": 14}));
-        assert_eq!(summary["env"], json!({"redacted": true, "fields": 2}));
+        assert_eq!(summary["keys"], json!(["command", "env", "path"]));
+        assert!(summary["approx_bytes"].as_u64().unwrap() > 0);
 
         let encoded = serde_json::to_string(&summary).unwrap();
-        for secret in [
-            "CONTENT_SECRET",
-            "TEXT_SECRET",
-            "COMMAND_SECRET",
-            "ENV_SECRET",
-            "PATCH_SECRET",
-            "URL_SECRET",
-            "PARAM_SECRET",
-        ] {
+        for secret in ["SECRET_PATH", "SECRET_COMMAND", "SECRET_TOKEN"] {
             assert!(!encoded.contains(secret), "audit summary leaked {secret}");
         }
     }

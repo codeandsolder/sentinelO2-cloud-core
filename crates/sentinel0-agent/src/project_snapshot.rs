@@ -17,8 +17,12 @@ const MAX_EXTENSIONS: usize = 40;
 const MAX_RECENT_COMMITS: usize = 10;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn run_git(root: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>), HandlerError> {
-    let mut command = Command::new("git");
+async fn run_git(
+    policy: &Policy,
+    root: &Path,
+    args: &[&str],
+) -> Result<(i32, Vec<u8>, Vec<u8>), HandlerError> {
+    let mut command = Command::new(policy.tooling.command("git"));
     command
         .arg("-C")
         .arg(root)
@@ -35,6 +39,7 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>), 
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    policy.tooling.configure_tokio(&mut command)?;
 
     let child = command
         .spawn()
@@ -47,7 +52,16 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>), 
             #[cfg(unix)]
             if let Some(pid) = pid {
                 let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+                if let Err(error) =
+                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                    && error != nix::errno::Errno::ESRCH
+                {
+                    tracing::warn!(
+                        pid,
+                        %error,
+                        "failed killing timed-out project-snapshot git process group"
+                    );
+                }
             }
             Err(HandlerError::new("git_timeout", "git command timed out"))
         }
@@ -185,12 +199,22 @@ fn sum_numstat(raw: &[u8]) -> (u64, u64, u64) {
     (files, ins, dels)
 }
 
-async fn git_snapshot(root: &Path) -> Result<BTreeMap<String, Value>, HandlerError> {
-    let (_, status_raw, _) = run_git(root, &["status", "--porcelain=v2", "--branch", "-z"]).await?;
+async fn git_snapshot(
+    policy: &Policy,
+    root: &Path,
+) -> Result<BTreeMap<String, Value>, HandlerError> {
+    let (_, status_raw, _) = run_git(
+        policy,
+        root,
+        &["status", "--porcelain=v2", "--branch", "-z"],
+    )
+    .await?;
     let status = parse_status(&status_raw);
 
-    let (_, unstaged_raw, _) = run_git(root, &["diff", "--no-ext-diff", "--numstat", "-z"]).await?;
+    let (_, unstaged_raw, _) =
+        run_git(policy, root, &["diff", "--no-ext-diff", "--numstat", "-z"]).await?;
     let (_, staged_raw, _) = run_git(
+        policy,
         root,
         &["diff", "--cached", "--no-ext-diff", "--numstat", "-z"],
     )
@@ -198,7 +222,7 @@ async fn git_snapshot(root: &Path) -> Result<BTreeMap<String, Value>, HandlerErr
     let (_, ui, ud) = sum_numstat(&unstaged_raw);
     let (_, si, sd) = sum_numstat(&staged_raw);
 
-    let (rc, files_raw, _) = run_git(root, &["ls-files", "-z"]).await?;
+    let (rc, files_raw, _) = run_git(policy, root, &["ls-files", "-z"]).await?;
     let decoded_files = String::from_utf8_lossy(&files_raw);
     let (tracked_files, top_dirs, extensions, top_truncated) = if rc == 0 {
         top_counts(
@@ -211,6 +235,7 @@ async fn git_snapshot(root: &Path) -> Result<BTreeMap<String, Value>, HandlerErr
     };
 
     let (_, log_raw, _) = run_git(
+        policy,
         root,
         &[
             "log",
@@ -361,11 +386,11 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         ));
     }
 
-    let (rc, out, err) = run_git(&root, &["rev-parse", "--show-toplevel"]).await?;
+    let (rc, out, err) = run_git(policy, &root, &["rev-parse", "--show-toplevel"]).await?;
     if rc == 0 && !out.is_empty() {
         let git_root_text = String::from_utf8_lossy(&out).trim().to_owned();
         if let Some(git_root) = policy.resolve_path(&git_root_text, false) {
-            return git_snapshot(&git_root).await;
+            return git_snapshot(policy, &git_root).await;
         }
     }
     let mut result = directory_snapshot_async(root.clone()).await?;

@@ -37,12 +37,16 @@ fn forget_compatibility(endpoint_name: &str) {
     cache.remove(endpoint_name);
 }
 
-fn relay_command(endpoint: &Endpoint, executable: &Path) -> Result<Vec<String>, HandlerError> {
+fn relay_command(
+    policy: &Policy,
+    endpoint: &Endpoint,
+    executable: &Path,
+) -> Result<Vec<String>, HandlerError> {
     let user = endpoint.run_as.as_deref().ok_or_else(|| {
         HandlerError::new("internal_error", "relay requested without run_as user")
     })?;
     Ok(vec![
-        "sudo".into(),
+        policy.tooling.command("sudo").display().to_string(),
         "-n".into(),
         "-u".into(),
         user.into(),
@@ -84,8 +88,14 @@ pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
                 return 3;
             }
         };
-        let _ = stream.set_read_timeout(Some(timeout));
-        let _ = stream.set_write_timeout(Some(timeout));
+        if let Err(error) = stream.set_read_timeout(Some(timeout)) {
+            eprintln!("could not set relay read timeout: {error}");
+            return 3;
+        }
+        if let Err(error) = stream.set_write_timeout(Some(timeout)) {
+            eprintln!("could not set relay write timeout: {error}");
+            return 3;
+        }
 
         if let Err(error) = stream.write_all(&payload) {
             eprintln!("relay failed: {error}");
@@ -123,7 +133,7 @@ pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
 
     #[cfg(not(unix))]
     {
-        let _ = (path, timeout_seconds);
+        drop((path, timeout_seconds));
         eprintln!("local_api relay requires a Unix-domain socket");
         3
     }
@@ -482,7 +492,12 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
                 .map_err(|_| HandlerError::new("bad_response", "invalid chunk size"))?;
             if size == 0 {
                 let mut trailer = String::new();
-                let _ = reader.read_line(&mut trailer).await;
+                reader.read_line(&mut trailer).await.map_err(|e| {
+                    HandlerError::new(
+                        "bad_response",
+                        format!("failed reading chunked trailer: {e}"),
+                    )
+                })?;
                 break;
             }
             if body.len().saturating_add(size) > MAX_RESPONSE_BYTES {
@@ -570,10 +585,14 @@ async fn call_http(
         .map_err(|_| HandlerError::new("timeout", "endpoint did not answer in time"))?
 }
 
-async fn call_via_run_as(endpoint: &Endpoint, payload: &[u8]) -> Result<Vec<u8>, HandlerError> {
+async fn call_via_run_as(
+    policy: &Policy,
+    endpoint: &Endpoint,
+    payload: &[u8],
+) -> Result<Vec<u8>, HandlerError> {
     let executable = std::env::current_exe()
         .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
-    let argv = relay_command(endpoint, &executable)?;
+    let argv = relay_command(policy, endpoint, &executable)?;
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -583,6 +602,7 @@ async fn call_via_run_as(endpoint: &Endpoint, payload: &[u8]) -> Result<Vec<u8>,
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    policy.tooling.configure_tokio(&mut command)?;
 
     let mut child = command.spawn().map_err(|error| {
         HandlerError::new(
@@ -614,7 +634,16 @@ async fn call_via_run_as(endpoint: &Endpoint, payload: &[u8]) -> Result<Vec<u8>,
             #[cfg(unix)]
             if let Some(pid) = pid {
                 let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+                if let Err(error) =
+                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                    && error != nix::errno::Errno::ESRCH
+                {
+                    tracing::warn!(
+                        pid,
+                        %error,
+                        "failed killing timed-out local-api relay process group"
+                    );
+                }
             }
             return Err(HandlerError::new(
                 "timeout",
@@ -666,6 +695,7 @@ async fn call_via_run_as(endpoint: &Endpoint, payload: &[u8]) -> Result<Vec<u8>,
 }
 
 async fn call_jsonrpc(
+    policy: &Policy,
     endpoint: &Endpoint,
     action: &Action,
     params: &Map<String, Value>,
@@ -681,7 +711,7 @@ async fn call_jsonrpc(
     encoded.push(b'\n');
 
     let line = if endpoint.run_as.is_some() {
-        call_via_run_as(endpoint, &encoded).await?
+        call_via_run_as(policy, endpoint, &encoded).await?
     } else {
         let mut stream = connect(endpoint).await?;
         timeout(endpoint.timeout, stream.write_all(&encoded))
@@ -726,7 +756,7 @@ fn extract<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-async fn ensure_compatible(endpoint: &Endpoint) -> Result<(), HandlerError> {
+async fn ensure_compatible(policy: &Policy, endpoint: &Endpoint) -> Result<(), HandlerError> {
     let Some(constraint) = endpoint.compatibility.as_ref().and_then(Value::as_object) else {
         return Ok(());
     };
@@ -781,7 +811,7 @@ async fn ensure_compatible(endpoint: &Endpoint) -> Result<(), HandlerError> {
     let response = match if endpoint.protocol == "http" {
         call_http(endpoint, &probe_action, &Map::new()).await
     } else {
-        call_jsonrpc(endpoint, &probe_action, &Map::new()).await
+        call_jsonrpc(policy, endpoint, &probe_action, &Map::new()).await
     } {
         Ok(response) => response,
         Err(error)
@@ -860,6 +890,7 @@ async fn ensure_compatible(endpoint: &Endpoint) -> Result<(), HandlerError> {
 }
 
 async fn call_action(
+    policy: &Policy,
     endpoint: &Endpoint,
     action_name: &str,
     params: &Map<String, Value>,
@@ -873,11 +904,11 @@ async fn call_action(
             ),
         )
     })?;
-    ensure_compatible(endpoint).await?;
+    ensure_compatible(policy, endpoint).await?;
     let raw = match if endpoint.protocol == "http" {
         call_http(endpoint, action, params).await
     } else {
-        call_jsonrpc(endpoint, action, params).await
+        call_jsonrpc(policy, endpoint, action, params).await
     } {
         Ok(raw) => raw,
         Err(error) => {
@@ -1007,7 +1038,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                 ));
             }
         };
-        let result = call_action(endpoint, action, &params).await?;
+        let result = call_action(policy, endpoint, action, &params).await?;
         return Ok(BTreeMap::from([
             ("ok".into(), Value::Bool(true)),
             ("operation".into(), Value::String("call".into())),
@@ -1044,11 +1075,18 @@ mod tests {
         )
         .unwrap();
         let endpoint = endpoint_from_raw("ep", &raw).unwrap();
-        let argv = relay_command(&endpoint, Path::new("/usr/local/bin/sentinelx-core")).unwrap();
+        let policy = Policy::default();
+        let sudo = policy.tooling.command("sudo").display().to_string();
+        let argv = relay_command(
+            &policy,
+            &endpoint,
+            Path::new("/usr/local/bin/sentinelx-core"),
+        )
+        .unwrap();
         assert_eq!(
             &argv[..5],
             &[
-                "sudo".to_owned(),
+                sudo,
                 "-n".to_owned(),
                 "-u".to_owned(),
                 "userx".to_owned(),

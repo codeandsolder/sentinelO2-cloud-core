@@ -102,11 +102,31 @@ Reference surfaces:
   created only by the real write path. Regression tests now pin that dry-run
   creates, existing-file dry runs and missing targets leave the target directory
   untouched.
-- Upstream 0.21.0 terminal backup deletion is matched: files whose names exactly
-  match the timestamped backup artifacts produced by this Rust agent may be
-  deleted without creating a backup-of-a-backup. The response reports
-  `backup=null` and `terminal=true`; ordinary user files such as `config.bak`
-  retain the mandatory-backup guarantee.
+- Upstream 0.21.0 terminal backup deletion is matched: files whose names match
+  legacy timestamp-only backups or the hardened timestamp+nonce backups produced
+  by this Rust agent may be deleted without creating a backup-of-a-backup. The
+  response reports `backup=null` and `terminal=true`; ordinary user files such
+  as `config.bak` retain the mandatory-backup guarantee.
+- External tools are resolved through configurable `tooling` policy and the
+  resolved paths are exposed in state/capabilities for diagnosis.
+- Legacy `script_run.interpreter=python3` remains accepted for the hosted Hub,
+  but executes through `uv run`; direct Python/pip `exec` requests can be
+  rejected with `use_uv` while preserving the old request schema.
+- `exec` and `script_run` capture child output with bounded head/tail buffers,
+  report exact stdout/stderr byte counts when truncated, and kill process
+  groups on timeout.
+- Service actions invoke `systemctl`/`sudo` as argv rather than routing fixed
+  operations through a shell.
+- External edit validators have bounded diagnostics, a deadline and process
+  group cleanup; JSON/YAML/TOML validators remain in-process.
+- Move/copy/delete operate on the named directory entry rather than following
+  a final symlink. Recursive copies preserve symlinks, and cross-filesystem
+  copy/move stages and fsyncs the replacement before committing it.
+- Search reports Unicode character columns and also exposes `byte_column`.
+- Trusted `file_url` connections are pinned to the exact public DNS answers
+  vetted by the SSRF check, closing the check/connect second-lookup race.
+- Local audit stores request key names and approximate size, not request values;
+  this replaces the earlier large safe-key redaction whitelist.
 
 ### Verification
 
@@ -143,6 +163,17 @@ wire contract:
 - connection/welcome operations without explicit deadlines;
 - background completion disappearing when the request WebSocket dies;
 - duplicate native WebSocket keepalive in addition to the application heartbeat;
-- capability lists drifting away from the handlers the process can execute.
+- capability lists drifting away from the handlers the process can execute;
+- unbounded subprocess output buffering before the response-size limiter runs;
+- copying a symlink by dereferencing its target, including targets outside the
+  allowed tree;
+- destroying an existing copy/move destination before its replacement is
+  completely staged;
+- byte offsets presented as human text columns;
+- fixed service actions unnecessarily interpreted by Bash;
+- direct Python/pip invocation from agent-controlled execution paths when uv is
+  available;
+- opaque dependence on whatever executable PATH the service happened to inherit;
+  resolved external tools are now configurable and reported explicitly.
 
 Every intentional deviation should have a regression test and be recorded here.
