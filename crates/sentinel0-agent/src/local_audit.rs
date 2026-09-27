@@ -13,22 +13,38 @@ const TRIM_TRIGGER: usize = 5500;
 const RETENTION_CHECK_EVERY: usize = 100;
 const TAIL_BLOCK: usize = 64 * 1024;
 
-/// Keep audit records useful for correlation without maintaining a giant
-/// "safe values" whitelist. Request values are deliberately not persisted:
-/// the operation/result fields already record what happened, while these two
-/// fields are enough to see the request shape and rough size.
+fn looks_tokenish(text: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| {
+            part.len() >= 24
+                && part.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && part.bytes().any(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn audit_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) if looks_tokenish(text) => Value::String("[redacted-tokenish]".into()),
+        Value::Array(items) => Value::Array(items.iter().map(audit_value).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), audit_value(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// Preserve the request that was actually made. The only generic failsafe is
+/// deliberately cheap: long mixed alphanumeric chunks look more like opaque
+/// keys/tokens than prose, so strings containing one are replaced.
 #[must_use]
 pub fn summarize_payload(payload: &Map<String, Value>) -> Map<String, Value> {
-    let approx_bytes = serde_json::to_vec(payload)
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0);
-    Map::from_iter([
-        (
-            "keys".into(),
-            Value::Array(payload.keys().cloned().map(Value::String).collect()),
-        ),
-        ("approx_bytes".into(), Value::from(approx_bytes)),
-    ])
+    payload
+        .iter()
+        .map(|(key, value)| (key.clone(), audit_value(value)))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -266,21 +282,49 @@ mod tests {
     }
 
     #[test]
-    fn payload_summary_records_shape_not_values() {
+    fn payload_summary_keeps_useful_values_and_redacts_tokenish_strings() {
         let payload = Map::from_iter([
-            ("path".into(), Value::String("/tmp/SECRET_PATH".into())),
-            ("command".into(), Value::String("SECRET_COMMAND".into())),
-            ("env".into(), json!({"TOKEN": "SECRET_TOKEN"})),
+            (
+                "path".into(),
+                Value::String("/tmp/example-2026/foo.rs".into()),
+            ),
+            (
+                "command".into(),
+                Value::String("cargo test -p sentinel0-agent local_audit".into()),
+            ),
+            (
+                "message".into(),
+                Value::String("this is ordinary written text and should stay".into()),
+            ),
+            (
+                "env".into(),
+                json!({"TOKEN": "A1b2C3d4E5f6G7h8I9j0K1l2", "MODE": "debug"}),
+            ),
         ]);
 
         let summary = summarize_payload(&payload);
-        assert_eq!(summary["keys"], json!(["command", "env", "path"]));
-        assert!(summary["approx_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(summary["path"], "/tmp/example-2026/foo.rs");
+        assert_eq!(
+            summary["command"],
+            "cargo test -p sentinel0-agent local_audit"
+        );
+        assert_eq!(
+            summary["message"],
+            "this is ordinary written text and should stay"
+        );
+        assert_eq!(summary["env"]["MODE"], "debug");
+        assert_eq!(summary["env"]["TOKEN"], "[redacted-tokenish]");
+    }
 
-        let encoded = serde_json::to_string(&summary).unwrap();
-        for secret in ["SECRET_PATH", "SECRET_COMMAND", "SECRET_TOKEN"] {
-            assert!(!encoded.contains(secret), "audit summary leaked {secret}");
-        }
+    #[test]
+    fn tokenish_classifier_is_intentionally_simple() {
+        assert!(looks_tokenish("prefix=A1b2C3d4E5f6G7h8I9j0K1l2;suffix"));
+        assert!(looks_tokenish(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!looks_tokenish("ordinary-written-text-without-digits"));
+        assert!(!looks_tokenish("123456789012345678901234567890"));
+        assert!(!looks_tokenish("550e8400-e29b-41d4-a716-446655440000"));
     }
 
     #[test]
