@@ -29,7 +29,7 @@ pub mod staging;
 pub mod tooling;
 pub mod upload;
 
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
 use rand::RngExt;
@@ -692,12 +692,28 @@ impl<D: Dispatcher> Agent<D> {
                                                 ..
                                             } = &mut dispatched.message
                                             {
+                                                let finished_at = Utc::now();
+                                                let finished_at_unix =
+                                                    finished_at.timestamp_micros() as f64 / 1_000_000.0;
                                                 result.insert(
                                                     "_sx_timing".into(),
                                                     serde_json::json!({
                                                         "received_at": received_at,
-                                                        "finished_at": unix_time_seconds(),
+                                                        "finished_at": finished_at_unix,
                                                     }),
+                                                );
+                                                // The hosted hub intentionally consumes and strips
+                                                // _sx_timing. Keep this separate, inside result, so the
+                                                // caller can see a clock sample without changing the
+                                                // strict v1 response envelope.
+                                                result.insert(
+                                                    "sentinel0_response_at".into(),
+                                                    serde_json::Value::String(
+                                                        finished_at.to_rfc3339_opts(
+                                                            SecondsFormat::Millis,
+                                                            true,
+                                                        ),
+                                                    ),
                                                 );
                                             }
                                             if let Err(error) = response_tx

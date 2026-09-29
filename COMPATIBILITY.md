@@ -56,7 +56,8 @@ Reference surfaces:
   than taking down the connection loop.
 - Official response bounding is checked against Python-generated fixtures and
   applied to foreground and background responses.
-- 0.18 `_sx_timing` metadata is attached to ordinary foreground results.
+- 0.18 `_sx_timing` metadata is attached to ordinary foreground results for Hub-side timing; the hosted Hub consumes and strips it before caller-visible tool output.
+- Sentinel0² additionally attaches caller-visible `sentinel0_response_at` (RFC 3339 UTC) inside successful foreground `result` maps. Keeping this additive extension inside `result` preserves the strict v1 response envelope while giving chat/model clients a clock sample on every normal tool return.
 
 ### Host configuration and operations
 

@@ -346,6 +346,11 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         let finished_at = timing["finished_at"].as_f64().unwrap();
         assert!(received_at <= finished_at);
 
+        let response_at = result["sentinel0_response_at"].as_str().unwrap();
+        let response_at = chrono::DateTime::parse_from_rfc3339(response_at).unwrap();
+        let response_at_unix = response_at.timestamp_micros() as f64 / 1_000_000.0;
+        assert!((response_at_unix - finished_at).abs() < 0.001);
+
         server_cancel.cancel();
         let _ = ws.close(None).await;
     });
