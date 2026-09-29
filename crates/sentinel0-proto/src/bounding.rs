@@ -76,7 +76,10 @@ fn mul_div_floor(value: usize, numerator: usize, denominator: usize) -> usize {
         return 0;
     }
 
-    let scaled = u128::from(value) * u128::from(numerator) / u128::from(denominator);
+    let value = u128::try_from(value).unwrap_or(u128::MAX);
+    let numerator = u128::try_from(numerator).unwrap_or(u128::MAX);
+    let denominator = u128::try_from(denominator).unwrap_or(u128::MAX);
+    let scaled = value * numerator / denominator;
     usize::try_from(scaled).unwrap_or(usize::MAX)
 }
 
