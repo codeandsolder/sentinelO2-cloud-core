@@ -54,10 +54,10 @@ fn decode_utf8_ignoring_invalid(mut bytes: &[u8]) -> String {
             }
             Err(error) => {
                 let valid = error.valid_up_to();
-                if valid > 0 {
-                    if let Ok(prefix) = std::str::from_utf8(&bytes[..valid]) {
-                        out.push_str(prefix);
-                    }
+                if valid > 0
+                    && let Ok(prefix) = std::str::from_utf8(&bytes[..valid])
+                {
+                    out.push_str(prefix);
                 }
                 let skip = error.error_len().unwrap_or(bytes.len() - valid);
                 bytes = &bytes[(valid + skip).min(bytes.len())..];
