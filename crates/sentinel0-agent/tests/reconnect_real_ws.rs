@@ -1,8 +1,3 @@
-#![expect(
-    clippy::result_large_err,
-    reason = "tungstenite fixes the handshake callback Result error type"
-)]
-
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{Agent, AgentConfig, AuthToken, ReconnectPolicy, UnsupportedDispatcher};
 use sentinel0_proto::{HostInfo, Message};
@@ -18,11 +13,27 @@ use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::{
         Message as WsMessage,
-        handshake::server::{Request, Response},
+        handshake::server::{Callback, ErrorResponse, Request, Response},
         protocol::{CloseFrame, frame::coding::CloseCode},
     },
 };
 use tokio_util::sync::CancellationToken;
+
+struct AssertHeaders<F>(F);
+
+impl<F> Callback for AssertHeaders<F>
+where
+    F: FnOnce(&Request),
+{
+    fn on_request(
+        self,
+        request: &Request,
+        response: Response,
+    ) -> Result<Response, ErrorResponse> {
+        (self.0)(request);
+        Ok(response)
+    }
+}
 
 fn host() -> HostInfo {
     HostInfo {
@@ -53,7 +64,7 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
     let server = tokio::spawn(async move {
         for n in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_hdr_async(stream, |req: &Request, response: Response| {
+            let mut ws = accept_hdr_async(stream, AssertHeaders(|req: &Request| {
                 assert_eq!(req.uri().path(), "/agent/connect");
                 assert_eq!(
                     req.headers().get("authorization").unwrap(),
@@ -146,7 +157,7 @@ async fn established_session_loss_discards_old_handshake_backoff() {
     let server = tokio::spawn(async move {
         for n in 0..5 {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_hdr_async(stream, |req: &Request, response: Response| {
+            let mut ws = accept_hdr_async(stream, AssertHeaders(|req: &Request| {
                 assert_eq!(
                     req.headers().get("authorization").unwrap(),
                     "Bearer test-token"
@@ -228,7 +239,7 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() {
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut first = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let mut first = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
             .unwrap();
         let _hello = first.next().await.unwrap().unwrap();
@@ -236,7 +247,7 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() {
         drop(first);
 
         let (stream, _) = listener.accept().await.unwrap();
-        let mut second = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let mut second = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
             .unwrap();
         let _hello = second.next().await.unwrap().unwrap();
@@ -294,7 +305,7 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() {
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut first = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let mut first = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
             .unwrap();
         let _hello = first.next().await.unwrap().unwrap();
@@ -314,7 +325,7 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() {
         drop(first);
 
         let (stream, _) = listener.accept().await.unwrap();
-        let mut second = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let mut second = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
             .unwrap();
         let _hello = second.next().await.unwrap().unwrap();
@@ -410,7 +421,7 @@ async fn cancellation_interrupts_wait_for_welcome_immediately() {
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let mut ws = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
             .unwrap();
         let _hello = ws.next().await.unwrap().unwrap();
