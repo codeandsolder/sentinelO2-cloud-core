@@ -82,8 +82,7 @@ fn safe_filename(filename: Option<&str>, extension: &str) -> String {
         .and_then(|name| Path::new(name).file_name())
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty() && !name.starts_with('.'))
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("script.{extension}"))
+        .map_or_else(|| format!("script.{extension}"), str::to_owned)
 }
 
 fn merged_output(captured: &CapturedOutput) -> String {
@@ -122,8 +121,7 @@ fn result(
         (
             "cwd".into(),
             meta.cwd
-                .map(|value| Value::String(value.into()))
-                .unwrap_or(Value::Null),
+                .map_or(Value::Null, |value| Value::String(value.into())),
         ),
         ("cleanup".into(), Value::Bool(meta.cleanup)),
         (

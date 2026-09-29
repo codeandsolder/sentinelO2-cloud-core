@@ -40,6 +40,7 @@ fn relay_command(
     ])
 }
 
+#[must_use]
 pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
     #[cfg(unix)]
     {
@@ -491,8 +492,7 @@ fn render(template: &str, params: &Map<String, Value>) -> Result<String, Handler
     for (key, value) in params {
         let value = value
             .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| value.to_string());
+            .map_or_else(|| value.to_string(), str::to_owned);
         output = output.replace(&format!("{{{key}}}"), &percent_encode(&value));
     }
     if let Some(start) = output.find('{')
@@ -802,9 +802,8 @@ async fn call_http(
     let target = render(target.trim(), params)?;
     let mut stream = connect(endpoint).await?;
     let wire = format!(
-        "{} {} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        method.to_ascii_uppercase(),
-        target
+        "{} {target} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        method.to_ascii_uppercase()
     );
     timeout(endpoint.timeout, stream.write_all(wire.as_bytes()))
         .await
@@ -910,7 +909,7 @@ async fn call_via_run_as(
     };
     let work = async {
         let capture = capture_bounded(&mut child, MAX_RESPONSE_BYTES, RELAY_STDERR_BYTES);
-        let (_, captured) = tokio::try_join!(write, capture)?;
+        let ((), captured) = tokio::try_join!(write, capture)?;
         Ok::<_, std::io::Error>(captured)
     };
     let captured = match timeout(endpoint.timeout + Duration::from_secs(5), work).await {
@@ -1218,19 +1217,11 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                 let mut value = Map::from_iter([
                     (
                         "request".into(),
-                        action
-                            .request
-                            .clone()
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
+                        action.request.clone().map_or(Value::Null, Value::String),
                     ),
                     (
                         "method".into(),
-                        action
-                            .method
-                            .clone()
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
+                        action.method.clone().map_or(Value::Null, Value::String),
                     ),
                     (
                         "returns".into(),
@@ -1245,8 +1236,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                         action
                             .description
                             .clone()
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
+                            .map_or(Value::Null, Value::String),
                     ),
                     (
                         "params".into(),

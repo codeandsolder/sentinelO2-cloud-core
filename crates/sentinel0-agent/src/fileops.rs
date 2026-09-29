@@ -179,14 +179,14 @@ fn scan_utf8(
         for &byte in &buf[..n] {
             saw_any = true;
             last_was_newline = byte == b'\n';
-            let selected = line >= start && end.map(|last| line <= last).unwrap_or(true);
+            let selected = line >= start && end.map_or(true, |last| line <= last);
 
             if byte == b'\n' {
                 if selected {
                     last_selected = line;
                     let next_line = line.saturating_add(1);
                     let next_selected =
-                        next_line >= start && end.map(|last| next_line <= last).unwrap_or(true);
+                        next_line >= start && end.map_or(true, |last| next_line <= last);
                     if next_selected {
                         if out.len() >= cap {
                             truncated = true;
@@ -285,13 +285,12 @@ fn scan_utf16(
                 first_unit = false;
                 saw_any = true;
                 last_was_newline = unit == 0x000a;
-                let selected = line >= start && end.map(|last| line <= last).unwrap_or(true);
+                let selected = line >= start && end.map_or(true, |last| line <= last);
                 if unit == 0x000a {
                     if selected {
                         last_selected = line;
                         let next = line.saturating_add(1);
-                        let next_selected =
-                            next >= start && end.map(|last| next <= last).unwrap_or(true);
+                        let next_selected = next >= start && end.map_or(true, |last| next <= last);
                         if next_selected {
                             if units.len() >= cap {
                                 truncated = true;
@@ -333,14 +332,13 @@ fn scan_utf16(
             first_unit = false;
             saw_any = true;
             last_was_newline = unit == 0x000a;
-            let selected = line >= start && end.map(|last| line <= last).unwrap_or(true);
+            let selected = line >= start && end.map_or(true, |last| line <= last);
 
             if unit == 0x000a {
                 if selected {
                     last_selected = line;
                     let next = line.saturating_add(1);
-                    let next_selected =
-                        next >= start && end.map(|last| next <= last).unwrap_or(true);
+                    let next_selected = next >= start && end.map_or(true, |last| next <= last);
                     if next_selected {
                         if units.len() >= cap {
                             truncated = true;
@@ -446,7 +444,7 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             ("preview_hex".into(), Value::String(preview)),
             (
                 "modified_at".into(),
-                mtime(&meta).map(Value::String).unwrap_or(Value::Null),
+                mtime(&meta).map_or(Value::Null, Value::String),
             ),
             ("truncated".into(), Value::Bool(true)),
         ]));
@@ -484,7 +482,7 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("truncated".into(), Value::Bool(truncated)),
         (
             "modified_at".into(),
-            mtime(&meta).map(Value::String).unwrap_or(Value::Null),
+            mtime(&meta).map_or(Value::Null, Value::String),
         ),
     ]);
     if range.is_some() {
@@ -576,9 +574,8 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 fn skip_search_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .map(|ext| SKIP_EXTS.contains(&ext.as_str()))
-        .unwrap_or(false)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|ext| SKIP_EXTS.contains(&ext.as_str()))
 }
 
 pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -710,7 +707,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
                 format!("rewind failed: {error}"),
             );
             continue;
-        };
+        }
         files_searched += 1;
 
         let rel = if root.is_file() {

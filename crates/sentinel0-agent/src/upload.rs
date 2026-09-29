@@ -147,7 +147,7 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
-fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
+const fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
     let segments = ip.segments();
     segments[0] == 0x2001 && segments[1] == 0x0db8
 }
@@ -651,7 +651,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
         ("sha256".into(), Value::String(sha256)),
         (
             "filename".into(),
-            meta.filename.map(Value::String).unwrap_or(Value::Null),
+            meta.filename.map_or(Value::Null, Value::String),
         ),
     ]);
     if let Some(warning) = cleanup_warning {

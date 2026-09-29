@@ -56,8 +56,7 @@ fn sweep(map: &mut SessionMap) {
     map.retain(|_, session| {
         session
             .lock()
-            .map(|session| session.created_at.elapsed() <= SESSION_TTL)
-            .unwrap_or(false)
+            .is_ok_and(|session| session.created_at.elapsed() <= SESSION_TTL)
     });
 }
 
@@ -273,10 +272,7 @@ pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
         ("size".into(), Value::from(session.size)),
         ("chunks_read".into(), Value::from(session.next_index)),
         ("num_chunks".into(), Value::from(session.num_chunks)),
-        (
-            "sha256".into(),
-            digest.map(Value::String).unwrap_or(Value::Null),
-        ),
+        ("sha256".into(), digest.map_or(Value::Null, Value::String)),
         ("sha256_complete".into(), Value::Bool(complete)),
         ("filename".into(), Value::String(session.filename.clone())),
     ]))

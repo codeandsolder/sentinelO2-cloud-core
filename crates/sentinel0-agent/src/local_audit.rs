@@ -65,9 +65,10 @@ fn audit_io_lock() -> &'static Mutex<()> {
 
 #[must_use]
 pub fn audit_path() -> PathBuf {
-    std::env::var_os("SENTINELX_AUDIT_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/audit.jsonl"))
+    std::env::var_os("SENTINELX_AUDIT_PATH").map_or_else(
+        || PathBuf::from("/var/lib/sentinelx/audit.jsonl"),
+        PathBuf::from,
+    )
 }
 
 fn should_check_retention() -> bool {
@@ -165,7 +166,7 @@ pub fn record(
         // the old inode and silently lose a row.
         let _io_guard = audit_io_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -217,7 +218,7 @@ fn tail_lines(path: &Path, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
     let mut lines = buffer
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-        .map(|line| line.to_vec())
+        .map(<[u8]>::to_vec)
         .collect::<Vec<_>>();
     if lines.len() > limit {
         lines.drain(..lines.len() - limit);
@@ -261,7 +262,7 @@ fn read_recent_from(path: &Path, limit: usize) -> Vec<Value> {
 pub fn read_recent(limit: usize) -> Vec<Value> {
     let _io_guard = audit_io_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     read_recent_from(&audit_path(), limit)
 }
 

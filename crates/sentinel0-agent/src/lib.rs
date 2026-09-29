@@ -152,6 +152,7 @@ impl Default for ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
+    #[must_use]
     pub fn delay(&self, attempt: usize) -> Duration {
         let Some(&raw) = self
             .steps
@@ -174,7 +175,7 @@ pub struct DispatchResponse {
 
 impl DispatchResponse {
     #[must_use]
-    pub fn message(message: Message) -> Self {
+    pub const fn message(message: Message) -> Self {
         Self {
             message,
             binary_frame: None,
@@ -182,7 +183,7 @@ impl DispatchResponse {
     }
 
     #[must_use]
-    pub fn with_binary(message: Message, binary_frame: Vec<u8>) -> Self {
+    pub const fn with_binary(message: Message, binary_frame: Vec<u8>) -> Self {
         Self {
             message,
             binary_frame: Some(binary_frame),
@@ -315,6 +316,7 @@ impl<D: Dispatcher> Agent<D> {
         })
     }
 
+    #[must_use]
     pub fn with_credential_rotation(mut self, config: rotation::RotationConfig) -> Self {
         self.rotation = Some(config);
         self
@@ -331,8 +333,8 @@ impl<D: Dispatcher> Agent<D> {
                 .unwrap_or_else(|| self.config.reconnect.delay(attempt));
             if !delay.is_zero() {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = sleep(delay) => {}
+                    () = cancel.cancelled() => break,
+                    () = sleep(delay) => {}
                 }
             }
 
@@ -405,7 +407,7 @@ impl<D: Dispatcher> Agent<D> {
             .await?;
 
         let first = tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 if let Err(error) = ws.close(None).await {
                     debug!(?error, "websocket close failed during cancellation");
                 }
@@ -465,7 +467,7 @@ impl<D: Dispatcher> Agent<D> {
 
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     if let Err(error) = ws.close(None).await {
                         debug!(?error, "websocket close failed during cancellation");
                     }
@@ -599,14 +601,12 @@ impl<D: Dispatcher> Agent<D> {
                                     if background {
                                         let job_id = payload
                                             .get("job_id")
-                                            .and_then(serde_json::Value::as_str)
-                                            .map(ToOwned::to_owned)
-                                            .unwrap_or_else(|| {
+                                            .and_then(serde_json::Value::as_str).map_or_else(|| {
                                                 format!(
                                                     "job_{:012x}",
                                                     rand::rng().random::<u64>() & 0xffffffffffff
                                                 )
-                                            });
+                                            }, ToOwned::to_owned);
                                         let mut ack = Message::Response {
                                             id: id.clone(),
                                             ok: true,
@@ -762,9 +762,8 @@ impl<D: Dispatcher> Agent<D> {
                                     (
                                         "error".into(),
                                         serde_json::Value::String(format!(
-                                            "busy: agent has {} in-flight operations (limit {})",
-                                            tasks.len(),
-                                            MAX_IN_FLIGHT_TASKS
+                                            "busy: agent has {} in-flight operations (limit {MAX_IN_FLIGHT_TASKS})",
+                                            tasks.len()
                                         )),
                                     ),
                                 ]);
@@ -874,24 +873,23 @@ async fn dispatch_safely<D: Dispatcher>(
     op: Op,
     payload: serde_json::Map<String, serde_json::Value>,
 ) -> DispatchResponse {
-    match AssertUnwindSafe(dispatcher.dispatch(&id, op, payload))
+    if let Ok(response) = AssertUnwindSafe(dispatcher.dispatch(&id, op, payload))
         .catch_unwind()
         .await
     {
-        Ok(response) => response,
-        Err(_) => {
-            warn!(%id, %op, "dispatcher panicked; converting panic into internal_error");
-            DispatchResponse::message(Message::Response {
-                id,
-                ok: false,
-                result: None,
-                error: Some(sentinel0_proto::ResponseError {
-                    code: "internal_error".into(),
-                    message: "operation handler panicked".into(),
-                    details: None,
-                }),
-            })
-        }
+        response
+    } else {
+        warn!(%id, %op, "dispatcher panicked; converting panic into internal_error");
+        DispatchResponse::message(Message::Response {
+            id,
+            ok: false,
+            result: None,
+            error: Some(sentinel0_proto::ResponseError {
+                code: "internal_error".into(),
+                message: "operation handler panicked".into(),
+                details: None,
+            }),
+        })
     }
 }
 
@@ -953,6 +951,7 @@ fn unix_time_seconds() -> f64 {
 
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 
+#[must_use]
 pub fn parse_retry_after(reason: &str) -> Option<Duration> {
     for part in reason.replace(',', ";").split(';') {
         let Some((key, value)) = part.trim().split_once('=') else {

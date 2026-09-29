@@ -345,7 +345,7 @@ async fn git_snapshot(
         ],
     )
     .await?;
-    if log_rc != 0 && !status.get("head").is_some_and(|head| head.is_null()) {
+    if log_rc != 0 && !status.get("head").is_some_and(serde_json::Value::is_null) {
         require_git_success("log", log_rc, &log_err)?;
     }
     let commits = String::from_utf8_lossy(&log_raw)

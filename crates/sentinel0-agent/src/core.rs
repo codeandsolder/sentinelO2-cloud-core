@@ -86,7 +86,7 @@ impl CoreDispatcher {
             ("hostname".into(), Value::String(host::hostname())),
             (
                 "kernel".into(),
-                host::kernel().map(Value::String).unwrap_or(Value::Null),
+                host::kernel().map_or(Value::Null, Value::String),
             ),
             ("arch".into(), Value::String(std::env::consts::ARCH.into())),
             (
@@ -101,15 +101,13 @@ impl CoreDispatcher {
             ("now_utc".into(), Value::String(Utc::now().to_rfc3339())),
             (
                 "uptime_seconds".into(),
-                host::uptime_seconds()
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
+                host::uptime_seconds().map_or(Value::Null, Value::from),
             ),
             (
                 "loadavg".into(),
-                host::loadavg()
-                    .map(|values| Value::Array(values.into_iter().map(Value::from).collect()))
-                    .unwrap_or(Value::Null),
+                host::loadavg().map_or(Value::Null, |values| {
+                    Value::Array(values.into_iter().map(Value::from).collect())
+                }),
             ),
             ("tooling".into(), self.policy.tooling.report()),
         ]))
@@ -595,8 +593,7 @@ impl CoreDispatcher {
                 self.policy
                     .hostname_label
                     .clone()
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                    .map_or(Value::Null, Value::String),
             ),
             (
                 "summary".into(),

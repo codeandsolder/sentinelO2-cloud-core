@@ -96,9 +96,9 @@ impl Tooling {
             .map(|name| {
                 (
                     name.to_owned(),
-                    self.resolve(name)
-                        .map(|path| Value::String(path.display().to_string()))
-                        .unwrap_or(Value::Null),
+                    self.resolve(name).map_or(Value::Null, |path| {
+                        Value::String(path.display().to_string())
+                    }),
                 )
             })
             .collect::<Map<_, _>>();

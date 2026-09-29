@@ -72,6 +72,7 @@ fn now_seconds() -> f64 {
     chrono::Utc::now().timestamp_millis() as f64 / 1000.0
 }
 
+#[must_use]
 pub fn should_rotate(token: &AuthToken) -> bool {
     let Some(claims) = claims(token.expose()) else {
         return false;
@@ -126,6 +127,7 @@ fn load_effective_identity_from(rotated: &Path, base: Identity) -> Identity {
     }
 }
 
+#[must_use]
 pub fn load_effective_identity(identity_path: &Path, base: Identity) -> Identity {
     let Some(rotated) = rotated_path(identity_path) else {
         return base;

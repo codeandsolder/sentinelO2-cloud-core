@@ -94,8 +94,8 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
             if payload
                 .get("pattern")
                 .and_then(Value::as_str)
-                .filter(|v| !v.is_empty())
-                .is_none()
+                .as_ref()
+                .is_none_or(|v| !!v.is_empty())
             {
                 return Err(HandlerError::new(
                     "invalid_payload",
@@ -109,8 +109,8 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
                 if payload
                     .get(key)
                     .and_then(Value::as_str)
-                    .filter(|v| !v.is_empty())
-                    .is_none()
+                    .as_ref()
+                    .is_none_or(|v| !!v.is_empty())
                 {
                     return Err(HandlerError::new(
                         "invalid_payload",
@@ -417,39 +417,37 @@ fn run_validator(
     let stdout_reader = std::thread::spawn(move || read_bounded_sync(stdout, per_stream));
     let stderr_reader = std::thread::spawn(move || read_bounded_sync(stderr, per_stream));
 
-    let status = match child.wait_timeout(VALIDATOR_TIMEOUT).map_err(|e| {
+    let status = if let Some(status) = child.wait_timeout(VALIDATOR_TIMEOUT).map_err(|e| {
         HandlerError::new("validation_failed", format!("validator wait failed: {e}"))
     })? {
-        Some(status) => status,
-        None => {
-            let mut cleanup_error = None;
-            #[cfg(unix)]
+        status
+    } else {
+        let mut cleanup_error = None;
+        #[cfg(unix)]
+        {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                && error != nix::errno::Errno::ESRCH
             {
-                let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                if let Err(error) =
-                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                    && error != nix::errno::Errno::ESRCH
-                {
-                    let message = format!("failed killing validator process group: {error}");
-                    tracing::warn!(%message);
-                    cleanup_error = Some(message);
-                }
-            }
-            if let Err(error) = child.wait() {
-                let message = format!("failed reaping timed-out validator: {error}");
+                let message = format!("failed killing validator process group: {error}");
                 tracing::warn!(%message);
-                cleanup_error.get_or_insert(message);
+                cleanup_error = Some(message);
             }
-            let mut details = Map::new();
-            if let Some(error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(error));
-            }
-            return Err(HandlerError::with_details(
-                "validation_timeout",
-                format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
-                details,
-            ));
         }
+        if let Err(error) = child.wait() {
+            let message = format!("failed reaping timed-out validator: {error}");
+            tracing::warn!(%message);
+            cleanup_error.get_or_insert(message);
+        }
+        let mut details = Map::new();
+        if let Some(error) = cleanup_error {
+            details.insert("cleanup_error".into(), Value::String(error));
+        }
+        return Err(HandlerError::with_details(
+            "validation_timeout",
+            format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
+            details,
+        ));
     };
 
     let stdout = stdout_reader
@@ -520,9 +518,10 @@ impl Drop for RemoveFileOnDrop {
 }
 
 fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
-    let base = backup_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| target.parent().unwrap_or(Path::new(".")).to_owned());
+    let base = backup_dir.map_or_else(
+        || target.parent().unwrap_or(Path::new(".")).to_owned(),
+        PathBuf::from,
+    );
     base.join(format!(
         "{}.bak.{}",
         target

@@ -31,6 +31,7 @@ impl HandlerError {
         }
     }
 
+    #[must_use]
     pub fn response_error(self) -> ResponseError {
         ResponseError {
             code: self.code,

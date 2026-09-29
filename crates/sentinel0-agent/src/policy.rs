@@ -452,7 +452,7 @@ impl Policy {
                     RawFilePath::Path(path) => (path, FileAccess::Read),
                     RawFilePath::Detailed(RawFilePathDetailed { path, access }) => {
                         let access = match access.as_deref().map(str::trim) {
-                            None | Some("") | Some("r") => FileAccess::Read,
+                            None | Some("" | "r") => FileAccess::Read,
                             Some("rw") => FileAccess::ReadWrite,
                             Some(other) => {
                                 return Err(PolicyError::InvalidValue {
@@ -577,6 +577,7 @@ impl Policy {
             .is_some_and(|spec| spec.actions.iter().any(|allowed| allowed == action))
     }
 
+    #[must_use]
     pub fn resolve_path(&self, path: &str, need_write: bool) -> Option<PathBuf> {
         if path.is_empty() || self.file_ops_paths.is_empty() {
             return None;
@@ -600,6 +601,7 @@ impl Policy {
     /// entry. This is for operations that manipulate the entry itself
     /// (move/copy/delete), so a symlink under an allowed directory remains the
     /// symlink rather than turning into its possibly-outside target.
+    #[must_use]
     pub fn resolve_path_no_follow_leaf(&self, path: &str, need_write: bool) -> Option<PathBuf> {
         if path.is_empty() || self.file_ops_paths.is_empty() {
             return None;

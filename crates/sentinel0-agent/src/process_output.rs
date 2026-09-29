@@ -69,12 +69,12 @@ impl CapturedStream {
     }
 
     #[must_use]
-    pub fn total_bytes(&self) -> u64 {
+    pub const fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
 
     #[must_use]
-    pub fn truncated(&self) -> bool {
+    pub const fn truncated(&self) -> bool {
         self.total_bytes > self.limit as u64
     }
 

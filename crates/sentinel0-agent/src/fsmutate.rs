@@ -618,10 +618,9 @@ pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ),
         (
             "backup".into(),
-            backup
-                .as_ref()
-                .map(|path| Value::String(path.display().to_string()))
-                .unwrap_or(Value::Null),
+            backup.as_ref().map_or(Value::Null, |path| {
+                Value::String(path.display().to_string())
+            }),
         ),
     ]);
 
@@ -735,14 +734,8 @@ pub fn chown(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("ok".into(), Value::Bool(true)),
         ("op".into(), Value::String("chown".into())),
         ("path".into(), Value::String(target.display().to_string())),
-        (
-            "owner".into(),
-            owner.map(Value::from).unwrap_or(Value::Null),
-        ),
-        (
-            "group".into(),
-            group.map(Value::from).unwrap_or(Value::Null),
-        ),
+        ("owner".into(), owner.map_or(Value::Null, Value::from)),
+        ("group".into(), group.map_or(Value::Null, Value::from)),
     ]))
 }
 

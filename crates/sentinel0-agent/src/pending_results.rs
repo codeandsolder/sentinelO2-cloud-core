@@ -29,6 +29,7 @@ fn store_lock(dir: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
+#[must_use]
 pub fn pending_dir(upload_base: &Path) -> PathBuf {
     upload_base
         .parent()

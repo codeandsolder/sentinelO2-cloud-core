@@ -119,7 +119,7 @@ async fn run_git(
                 drop(pipe);
                 Ok::<(), std::io::Error>(())
             };
-            let (_, captured) = tokio::try_join!(write, capture)?;
+            let ((), captured) = tokio::try_join!(write, capture)?;
             Ok::<_, std::io::Error>(captured)
         } else {
             capture.await
@@ -148,10 +148,7 @@ async fn run_git(
             }
             return Err(HandlerError::with_details(
                 "git_timeout",
-                format!(
-                    "git {} timed out",
-                    args.first().map(String::as_str).unwrap_or("?")
-                ),
+                format!("git {} timed out", args.first().map_or("?", String::as_str)),
                 details,
             ));
         }
@@ -161,9 +158,8 @@ async fn run_git(
         return Err(HandlerError::with_details(
             "git_output_too_large",
             format!(
-                "git {} stdout exceeded the {} byte capture ceiling",
-                args.first().map(String::as_str).unwrap_or("?"),
-                MAX_GIT_STDOUT
+                "git {} stdout exceeded the {MAX_GIT_STDOUT} byte capture ceiling",
+                args.first().map_or("?", String::as_str)
             ),
             Map::from_iter([(
                 "stdout_bytes".into(),
@@ -237,10 +233,7 @@ async fn run_git_capped_stdout(
             }
             return Err(HandlerError::with_details(
                 "git_timeout",
-                format!(
-                    "git {} timed out",
-                    args.first().map(String::as_str).unwrap_or("?")
-                ),
+                format!("git {} timed out", args.first().map_or("?", String::as_str)),
                 details,
             ));
         }
@@ -336,7 +329,7 @@ fn parse_numstat(raw: &[u8]) -> (u64, u64, u64) {
     (files, ins, dels)
 }
 
-fn status_name(letter: char) -> &'static str {
+const fn status_name(letter: char) -> &'static str {
     match letter {
         'A' => "added",
         'M' => "modified",
@@ -784,8 +777,7 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     if target.exists()
         && target
             .read_dir()
-            .map(|mut iter| iter.next().is_some())
-            .unwrap_or(true)
+            .map_or(true, |mut iter| iter.next().is_some())
     {
         return Err(HandlerError::new(
             "dest_not_empty",

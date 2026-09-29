@@ -34,19 +34,7 @@ pub fn build_completed_event_data(
 
     let duration_s = ((finished_at - started_at).num_milliseconds() as f64 / 10.0).round() / 100.0;
 
-    let (status, exit_code, output, error_message) = if !ok {
-        (
-            "failed",
-            None,
-            String::new(),
-            Some(
-                error
-                    .map(|error| error.message.clone())
-                    .filter(|message| !message.is_empty())
-                    .unwrap_or_else(|| "operation failed".into()),
-            ),
-        )
-    } else {
+    let (status, exit_code, output, error_message) = if ok {
         let timed_out = result
             .and_then(|result| result.get("timed_out"))
             .and_then(Value::as_bool)
@@ -67,6 +55,18 @@ pub fn build_completed_event_data(
             .unwrap_or("")
             .to_owned();
         (status, returncode, output, None)
+    } else {
+        (
+            "failed",
+            None,
+            String::new(),
+            Some(
+                error
+                    .map(|error| error.message.clone())
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| "operation failed".into()),
+            ),
+        )
     };
 
     let (output, output_truncated) = truncate_output(&output);
@@ -78,7 +78,7 @@ pub fn build_completed_event_data(
         ("status".into(), Value::String(status.into())),
         (
             "exit_code".into(),
-            exit_code.map(Value::from).unwrap_or(Value::Null),
+            exit_code.map_or(Value::Null, Value::from),
         ),
         (
             "started_at".into(),
@@ -93,7 +93,7 @@ pub fn build_completed_event_data(
         ("output_truncated".into(), Value::Bool(output_truncated)),
         (
             "error".into(),
-            error_message.map(Value::String).unwrap_or(Value::Null),
+            error_message.map_or(Value::Null, Value::String),
         ),
     ])
 }
