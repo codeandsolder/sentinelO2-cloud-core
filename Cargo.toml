@@ -23,6 +23,7 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "=0.4.33"
 nix = { version = "0.31.3", features = ["signal", "process", "user", "fs"] }
+num-traits = "0.2.19"
 proptest = "1.11.0"
 rand = "0.10.3"
 regex = "1.13.1"

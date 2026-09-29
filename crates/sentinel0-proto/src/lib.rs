@@ -179,7 +179,7 @@ impl std::fmt::Display for Op {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Message {
     Hello {

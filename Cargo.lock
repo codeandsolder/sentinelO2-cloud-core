@@ -1655,6 +1655,7 @@ name = "sentinel0-proto"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "num-traits",
  "proptest",
  "serde",
  "serde_json",

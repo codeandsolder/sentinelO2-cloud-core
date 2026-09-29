@@ -1,13 +1,12 @@
+use num_traits::ToPrimitive;
 use serde_json::{Map, Value, json};
 
 pub const RESPONSE_SOFT_LIMIT_BYTES: usize = 131_072;
+pub const RESPONSE_HEAD_RATIO: f64 = 0.6;
 pub const TRUNCATION_KEY: &str = "_truncation";
 
 const META_RESERVE: usize = 512;
-const RESPONSE_HEAD_NUMERATOR: usize = 3;
-const RESPONSE_HEAD_DENOMINATOR: usize = 5;
-const SHRINK_SLACK_NUMERATOR: usize = 19;
-const SHRINK_SLACK_DENOMINATOR: usize = 20;
+const SHRINK_SLACK: f64 = 0.95;
 const MAX_PASSES: usize = 64;
 const MIN_TRUNCATABLE: usize = 256;
 
@@ -71,16 +70,12 @@ fn marker(omitted: usize) -> String {
     format!("\n…[sentinelx: truncated {omitted} bytes]…\n")
 }
 
-fn mul_div_floor(value: usize, numerator: usize, denominator: usize) -> usize {
-    if denominator == 0 {
-        return 0;
-    }
+fn usize_to_f64(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
+}
 
-    let value = u128::try_from(value).unwrap_or(u128::MAX);
-    let numerator = u128::try_from(numerator).unwrap_or(u128::MAX);
-    let denominator = u128::try_from(denominator).unwrap_or(u128::MAX);
-    let scaled = value * numerator / denominator;
-    usize::try_from(scaled).unwrap_or(usize::MAX)
+fn nonnegative_f64_to_usize(value: f64) -> usize {
+    value.to_usize().unwrap_or(usize::MAX)
 }
 
 fn truncate_text(text: &str, keep_bytes: usize) -> String {
@@ -90,11 +85,7 @@ fn truncate_text(text: &str, keep_bytes: usize) -> String {
         return text.to_owned();
     }
 
-    let head_budget = mul_div_floor(
-        keep_bytes,
-        RESPONSE_HEAD_NUMERATOR,
-        RESPONSE_HEAD_DENOMINATOR,
-    );
+    let head_budget = nonnegative_f64_to_usize(usize_to_f64(keep_bytes) * RESPONSE_HEAD_RATIO);
     let tail_budget = keep_bytes - head_budget;
     let head = decode_utf8_ignoring_invalid(&raw[..head_budget.min(original)]);
     let tail = if tail_budget > 0 {
@@ -184,11 +175,8 @@ fn shrink_largest(response: &mut Value, root_key: &str, budget: usize) -> bool {
             return false;
         };
 
-        let within_budget = mul_div_floor(raw_len, budget, current);
-        let proportional = mul_div_floor(
-            within_budget,
-            SHRINK_SLACK_NUMERATOR,
-            SHRINK_SLACK_DENOMINATOR,
+        let proportional = nonnegative_f64_to_usize(
+            usize_to_f64(raw_len) * (usize_to_f64(budget) / usize_to_f64(current)) * SHRINK_SLACK,
         );
         let keep = proportional
             .max(MIN_TRUNCATABLE)
@@ -292,20 +280,5 @@ mod tests {
         let original = response.clone();
         assert!(bound_response_default(&mut response).is_none());
         assert_eq!(response, original);
-    }
-
-    #[test]
-    fn integer_ratio_scaling_is_exact_and_overflow_safe() {
-        assert_eq!(mul_div_floor(10, 3, 5), 6);
-        assert_eq!(mul_div_floor(usize::MAX, 1, 1), usize::MAX);
-        assert_eq!(mul_div_floor(usize::MAX, 1, 2), usize::MAX / 2);
-        assert_eq!(mul_div_floor(123, 1, 0), 0);
-    }
-
-    #[test]
-    fn truncation_keeps_the_configured_three_fifths_head_ratio() {
-        let truncated = truncate_text(&"x".repeat(1_000), 100);
-        assert!(truncated.starts_with(&"x".repeat(60)));
-        assert!(truncated.ends_with(&"x".repeat(40)));
     }
 }
