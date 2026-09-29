@@ -55,6 +55,19 @@ use tracing::{debug, info, warn};
 
 const MAX_IN_FLIGHT_TASKS: usize = 64;
 
+fn add_response_time(message: &mut Message) {
+    if let Message::Response {
+        result: Some(result),
+        ..
+    } = message
+    {
+        result.insert(
+            "response_time".into(),
+            serde_json::Value::String(Utc::now().format("%H:%M:%S").to_string()),
+        );
+    }
+}
+
 fn overloaded_response(id: String, in_flight: usize) -> Message {
     Message::Response {
         id,
@@ -290,7 +303,6 @@ pub struct Agent<D> {
     config: AgentConfig,
     dispatcher: Arc<D>,
     rotation: Option<rotation::RotationConfig>,
-    response_timestamp_interval: Duration,
 }
 
 impl<D: Dispatcher> Agent<D> {
@@ -300,18 +312,11 @@ impl<D: Dispatcher> Agent<D> {
             config,
             dispatcher: Arc::new(dispatcher),
             rotation: None,
-            response_timestamp_interval: Duration::from_secs(60),
         })
     }
 
     pub fn with_credential_rotation(mut self, config: rotation::RotationConfig) -> Self {
         self.rotation = Some(config);
-        self
-    }
-
-    #[must_use]
-    pub fn with_response_timestamp_interval(mut self, interval: Duration) -> Self {
-        self.response_timestamp_interval = interval;
         self
     }
 
@@ -457,7 +462,6 @@ impl<D: Dispatcher> Agent<D> {
         heartbeat.tick().await;
         let mut last_pong = Instant::now();
         let (response_tx, mut response_rx) = mpsc::channel::<Outbound>(64);
-        let mut last_response_timestamp = None;
 
         loop {
             tokio::select! {
@@ -486,24 +490,7 @@ impl<D: Dispatcher> Agent<D> {
                 outbound = response_rx.recv() => {
                     if let Some(outbound) = outbound {
                         let mut message = outbound.message;
-                        if let Message::Response {
-                            result: Some(result),
-                            ..
-                        } = &mut message
-                        {
-                            let now = Instant::now();
-                            if last_response_timestamp.is_none_or(|last: Instant| {
-                                now.duration_since(last) >= self.response_timestamp_interval
-                            }) {
-                                result.insert(
-                                    "sentinel0_response_at".into(),
-                                    serde_json::Value::String(
-                                        Utc::now().format("%H:%M:%S").to_string(),
-                                    ),
-                                );
-                                last_response_timestamp = Some(now);
-                            }
-                        }
+                        add_response_time(&mut message);
 
                         if let Some(frame) = outbound.binary_frame
                             && ws.send(WsMessage::Binary(frame.into())).await.is_err()
@@ -620,7 +607,7 @@ impl<D: Dispatcher> Agent<D> {
                                                     rand::rng().random::<u64>() & 0xffffffffffff
                                                 )
                                             });
-                                        let ack = Message::Response {
+                                        let mut ack = Message::Response {
                                             id: id.clone(),
                                             ok: true,
                                             result: Some(BTreeMap::from([
@@ -631,6 +618,7 @@ impl<D: Dispatcher> Agent<D> {
                                             ])),
                                             error: None,
                                         };
+                                        add_response_time(&mut ack);
                                         if ws
                                             .send(WsMessage::Text(serde_json::to_string(&ack)?.into()))
                                             .await

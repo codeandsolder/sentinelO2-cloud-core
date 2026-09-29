@@ -87,7 +87,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "capabilities": dispatcher.capabilities(),
                 "preferred_profile": policy.preferred_profile,
                 "hostname_label": policy.hostname_label,
-                "response_timestamp_interval_seconds": policy.response_timestamp_interval_seconds,
             }))?
         );
         return Ok(());
@@ -136,11 +135,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         heartbeat_interval: Duration::from_secs(30),
         heartbeat_timeout: Duration::from_secs(90),
     };
-    let agent = Agent::new(config, dispatcher)?
-        .with_credential_rotation(rotation)
-        .with_response_timestamp_interval(Duration::from_secs(
-            policy.response_timestamp_interval_seconds,
-        ));
+    let agent = Agent::new(config, dispatcher)?.with_credential_rotation(rotation);
 
     let cancel = CancellationToken::new();
     let signal_cancel = cancel.clone();
