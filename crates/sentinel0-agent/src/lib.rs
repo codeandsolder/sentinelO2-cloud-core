@@ -649,7 +649,7 @@ impl<D: Dispatcher> Agent<D> {
                                         tasks.spawn(async move {
                                             let dispatch_response =
                                                 dispatch_safely(dispatcher, id.clone(), op, payload).await;
-                                            let response = if dispatch_response.binary_frame.is_some() {
+                                            let mut response = if dispatch_response.binary_frame.is_some() {
                                                 Message::Response {
                                                     id: id.clone(),
                                                     ok: false,
