@@ -1,8 +1,3 @@
-#![expect(
-    clippy::result_large_err,
-    reason = "tungstenite fixes the handshake callback Result error type"
-)]
-
 use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{
@@ -22,10 +17,26 @@ use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::{
         Message as WsMessage,
-        handshake::server::{Request, Response},
+        handshake::server::{Callback, ErrorResponse, Request, Response},
     },
 };
 use tokio_util::sync::CancellationToken;
+
+struct AssertHeaders<F>(F);
+
+impl<F> Callback for AssertHeaders<F>
+where
+    F: FnOnce(&Request),
+{
+    fn on_request(
+        self,
+        request: &Request,
+        response: Response,
+    ) -> Result<Response, ErrorResponse> {
+        (self.0)(request);
+        Ok(response)
+    }
+}
 
 fn host() -> HostInfo {
     HostInfo {
@@ -70,14 +81,13 @@ async fn accept_agent(
     listener: &TcpListener,
 ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
     let (stream, _) = listener.accept().await.unwrap();
-    accept_hdr_async(stream, |req: &Request, response: Response| {
+    accept_hdr_async(stream, AssertHeaders(|req: &Request| {
         assert_eq!(req.uri().path(), "/agent/connect");
         assert_eq!(
             req.headers().get("authorization").unwrap(),
             "Bearer compat-token"
         );
-        Ok(response)
-    })
+    }))
     .await
     .unwrap()
 }
