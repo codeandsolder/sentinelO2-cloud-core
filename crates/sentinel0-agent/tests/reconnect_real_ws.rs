@@ -25,11 +25,7 @@ impl<F> Callback for AssertHeaders<F>
 where
     F: FnOnce(&Request),
 {
-    fn on_request(
-        self,
-        request: &Request,
-        response: Response,
-    ) -> Result<Response, ErrorResponse> {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
         (self.0)(request);
         Ok(response)
     }
@@ -64,15 +60,17 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
     let server = tokio::spawn(async move {
         for n in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_hdr_async(stream, AssertHeaders(|req: &Request| {
-                assert_eq!(req.uri().path(), "/agent/connect");
-                assert_eq!(
-                    req.headers().get("authorization").unwrap(),
-                    "Bearer test-token"
-                );
-                seen.fetch_add(1, Ordering::SeqCst);
-                Ok(response)
-            })
+            let mut ws = accept_hdr_async(
+                stream,
+                AssertHeaders(|req: &Request| {
+                    assert_eq!(req.uri().path(), "/agent/connect");
+                    assert_eq!(
+                        req.headers().get("authorization").unwrap(),
+                        "Bearer test-token"
+                    );
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
             .await
             .unwrap();
 
@@ -157,13 +155,15 @@ async fn established_session_loss_discards_old_handshake_backoff() {
     let server = tokio::spawn(async move {
         for n in 0..5 {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_hdr_async(stream, AssertHeaders(|req: &Request| {
-                assert_eq!(
-                    req.headers().get("authorization").unwrap(),
-                    "Bearer test-token"
-                );
-                Ok(response)
-            })
+            let mut ws = accept_hdr_async(
+                stream,
+                AssertHeaders(|req: &Request| {
+                    assert_eq!(
+                        req.headers().get("authorization").unwrap(),
+                        "Bearer test-token"
+                    );
+                }),
+            )
             .await
             .unwrap();
             let _hello = ws.next().await.unwrap().unwrap();
