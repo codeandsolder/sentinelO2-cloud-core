@@ -346,7 +346,7 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         let finished_at = timing["finished_at"].as_f64().unwrap();
         assert!(received_at <= finished_at);
 
-        let response_at = result["sentinel0_response_at"].as_str().unwrap();
+        let response_at = result["response_time"].as_str().unwrap();
         chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").unwrap();
 
         ws.send(WsMessage::Text(
@@ -374,7 +374,8 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         else {
             panic!("expected successful second response");
         };
-        assert!(!second.contains_key("sentinel0_response_at"));
+        let response_time = second["response_time"].as_str().unwrap();
+        chrono::NaiveTime::parse_from_str(response_time, "%H:%M:%S").unwrap();
 
         tokio::time::sleep(Duration::from_millis(60)).await;
         ws.send(WsMessage::Text(
@@ -402,16 +403,14 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         else {
             panic!("expected successful third response");
         };
-        let response_at = third["sentinel0_response_at"].as_str().unwrap();
+        let response_at = third["response_time"].as_str().unwrap();
         chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").unwrap();
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
     });
 
-    let agent = Agent::new(config(addr), EchoDispatcher)
-        .unwrap()
-        .with_response_timestamp_interval(Duration::from_millis(50));
+    let agent = Agent::new(config(addr), EchoDispatcher).unwrap();
     tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
         .expect("frame-handling session did not finish")
