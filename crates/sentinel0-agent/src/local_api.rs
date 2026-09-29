@@ -1,7 +1,7 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
-    process_output::capture_bounded,
+    process_output::{CapturedOutput, capture_bounded},
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -222,6 +222,91 @@ fn valid_compatibility(value: Option<&Value>, protocol: &str) -> Result<Option<V
     Ok(Some(Value::Object(value.clone())))
 }
 
+fn parse_action(
+    endpoint_name: &str,
+    action_name: &str,
+    raw_action: &Value,
+    protocol: &str,
+) -> Result<Action, String> {
+    let action = raw_action.as_object().ok_or_else(|| {
+        format!("local_apis.{endpoint_name}.actions.{action_name} must be an object")
+    })?;
+    reject_unknown_keys(
+        action,
+        &["request", "method", "select", "description", "params"],
+        &format!("local_apis.{endpoint_name}.actions.{action_name}"),
+    )?;
+    let request = action
+        .get("request")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let method = action
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if protocol == "http"
+        && request
+            .as_deref()
+            .is_none_or(|request| request.trim().is_empty())
+    {
+        return Err(format!(
+            "local_apis.{endpoint_name}.actions.{action_name}.request is required for HTTP"
+        ));
+    }
+    if protocol == "jsonrpc"
+        && method
+            .as_deref()
+            .is_none_or(|method| method.trim().is_empty())
+    {
+        return Err(format!(
+            "local_apis.{endpoint_name}.actions.{action_name}.method is required for JSON-RPC"
+        ));
+    }
+    let select = match action.get("select") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_owned).ok_or_else(|| {
+                    format!(
+                        "local_apis.{endpoint_name}.actions.{action_name}.select must contain only strings"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "local_apis.{endpoint_name}.actions.{action_name}.select must be an array"
+            ));
+        }
+    };
+    let params_schema = match action.get("params") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(_)) => action.get("params").cloned(),
+        Some(_) => {
+            return Err(format!(
+                "local_apis.{endpoint_name}.actions.{action_name}.params must be an object"
+            ));
+        }
+    };
+    let description = match action.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err(format!(
+                "local_apis.{endpoint_name}.actions.{action_name}.description must be a string"
+            ));
+        }
+    };
+    Ok(Action {
+        request,
+        method,
+        select,
+        description,
+        params_schema,
+    })
+}
+
 fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, String> {
     let value = yaml_to_json(raw)?;
     let map = value
@@ -280,89 +365,13 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
         return Err(format!("local_apis.{name}.actions must not be empty"));
     }
 
-    let mut actions = BTreeMap::new();
-    for (action_name, raw_action) in raw_actions {
-        let action = raw_action
-            .as_object()
-            .ok_or_else(|| format!("local_apis.{name}.actions.{action_name} must be an object"))?;
-        reject_unknown_keys(
-            action,
-            &["request", "method", "select", "description", "params"],
-            &format!("local_apis.{name}.actions.{action_name}"),
-        )?;
-        let request = action
-            .get("request")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let method = action
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if protocol == "http"
-            && request
-                .as_deref()
-                .is_none_or(|request| request.trim().is_empty())
-        {
-            return Err(format!(
-                "local_apis.{name}.actions.{action_name}.request is required for HTTP"
-            ));
-        }
-        if protocol == "jsonrpc"
-            && method
-                .as_deref()
-                .is_none_or(|method| method.trim().is_empty())
-        {
-            return Err(format!(
-                "local_apis.{name}.actions.{action_name}.method is required for JSON-RPC"
-            ));
-        }
-
-        let select = match action.get("select") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(items)) => items
-                .iter()
-                .map(|item| {
-                    item.as_str().map(str::to_owned).ok_or_else(|| {
-                        format!(
-                            "local_apis.{name}.actions.{action_name}.select must contain only strings"
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            Some(_) => {
-                return Err(format!(
-                    "local_apis.{name}.actions.{action_name}.select must be an array"
-                ));
-            }
-        };
-        let params_schema = match action.get("params") {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(_)) => action.get("params").cloned(),
-            Some(_) => {
-                return Err(format!(
-                    "local_apis.{name}.actions.{action_name}.params must be an object"
-                ));
-            }
-        };
-        actions.insert(
-            action_name.clone(),
-            Action {
-                request,
-                method,
-                select,
-                description: match action.get("description") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(value)) => Some(value.clone()),
-                    Some(_) => {
-                        return Err(format!(
-                            "local_apis.{name}.actions.{action_name}.description must be a string"
-                        ));
-                    }
-                },
-                params_schema,
-            },
-        );
-    }
+    let actions = raw_actions
+        .iter()
+        .map(|(action_name, raw_action)| {
+            parse_action(name, action_name, raw_action, &protocol)
+                .map(|action| (action_name.clone(), action))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
 
     let timeout_seconds = match map.get("timeout_s") {
         None | Some(Value::Null) => 30.0,
@@ -868,6 +877,59 @@ async fn kill_and_reap_relay(
     cleanup_error
 }
 
+fn interpret_relay_output(
+    endpoint: &Endpoint,
+    executable: &Path,
+    captured: CapturedOutput,
+) -> Result<Vec<u8>, HandlerError> {
+    if captured.stdout.truncated() {
+        return Err(HandlerError::new(
+            "too_large",
+            "local-api relay response exceeded the cap",
+        ));
+    }
+    let stdout = captured.stdout.rendered();
+    if captured.status.success() && !stdout.is_empty() {
+        return Ok(stdout);
+    }
+
+    let detail = captured.stderr.rendered_trimmed_lossy();
+    let rc = captured.status.code().unwrap_or(-1);
+    if detail.contains("a password is required")
+        || detail.contains("not allowed to execute")
+        || (rc == 1 && detail.to_ascii_lowercase().contains("sudo"))
+    {
+        let user = endpoint.run_as.as_deref().unwrap_or("<unknown>");
+        return Err(HandlerError::new(
+            "run_as_not_permitted",
+            format!(
+                "{:?} declares run_as={user:?}, but this agent may not become that user. The host owner can allow only this relay with a sudoers rule such as: sentinelx ALL=({user}) NOPASSWD: {} --local-api-relay * ({})",
+                endpoint.name,
+                executable.display(),
+                detail.chars().take(120).collect::<String>()
+            ),
+        ));
+    }
+    if rc == 3 {
+        return Err(HandlerError::new(
+            "endpoint_unreachable",
+            format!(
+                "cannot open {} as {}: {}",
+                endpoint.path,
+                endpoint.run_as.as_deref().unwrap_or("<unknown>"),
+                detail.chars().take(160).collect::<String>()
+            ),
+        ));
+    }
+    Err(HandlerError::new(
+        "bad_response",
+        format!(
+            "relay failed (rc={rc}): {}",
+            detail.chars().take(160).collect::<String>()
+        ),
+    ))
+}
+
 async fn call_via_run_as(
     policy: &Policy,
     endpoint: &Endpoint,
@@ -938,54 +1000,7 @@ async fn call_via_run_as(
         }
     };
 
-    if captured.stdout.truncated() {
-        return Err(HandlerError::new(
-            "too_large",
-            "local-api relay response exceeded the cap",
-        ));
-    }
-
-    let stdout = captured.stdout.rendered();
-    if captured.status.success() && !stdout.is_empty() {
-        return Ok(stdout);
-    }
-
-    let detail = captured.stderr.rendered_trimmed_lossy();
-    let rc = captured.status.code().unwrap_or(-1);
-    if detail.contains("a password is required")
-        || detail.contains("not allowed to execute")
-        || (rc == 1 && detail.to_ascii_lowercase().contains("sudo"))
-    {
-        let user = endpoint.run_as.as_deref().unwrap_or("<unknown>");
-        return Err(HandlerError::new(
-            "run_as_not_permitted",
-            format!(
-                "{:?} declares run_as={user:?}, but this agent may not become that user. The host owner can allow only this relay with a sudoers rule such as: sentinelx ALL=({user}) NOPASSWD: {} --local-api-relay * ({})",
-                endpoint.name,
-                executable.display(),
-                detail.chars().take(120).collect::<String>()
-            ),
-        ));
-    }
-    if rc == 3 {
-        return Err(HandlerError::new(
-            "endpoint_unreachable",
-            format!(
-                "cannot open {} as {}: {}",
-                endpoint.path,
-                endpoint.run_as.as_deref().unwrap_or("<unknown>"),
-                detail.chars().take(160).collect::<String>()
-            ),
-        ));
-    }
-
-    Err(HandlerError::new(
-        "bad_response",
-        format!(
-            "relay failed (rc={rc}): {}",
-            detail.chars().take(160).collect::<String>()
-        ),
-    ))
+    interpret_relay_output(endpoint, &executable, captured)
 }
 
 async fn call_jsonrpc(
@@ -1170,6 +1185,105 @@ async fn call_action(
     Ok(project(raw, &action.select))
 }
 
+fn list_endpoints(endpoints: &BTreeMap<String, Endpoint>) -> BTreeMap<String, Value> {
+    let listed = endpoints
+        .values()
+        .filter(|endpoint| endpoint.transport == "unix")
+        .map(|endpoint| {
+            json!({
+                "name": endpoint.name,
+                "protocol": endpoint.protocol,
+                "transport": endpoint.transport,
+                "action_count": endpoint.actions.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("operation".into(), Value::String("list".into())),
+        ("endpoints".into(), Value::Array(listed)),
+    ])
+}
+
+fn describe_endpoint(endpoint: &Endpoint) -> BTreeMap<String, Value> {
+    let actions = endpoint
+        .actions
+        .iter()
+        .map(|(name, action)| {
+            let mut value = Map::from_iter([
+                (
+                    "request".into(),
+                    action.request.clone().map_or(Value::Null, Value::String),
+                ),
+                (
+                    "method".into(),
+                    action.method.clone().map_or(Value::Null, Value::String),
+                ),
+                (
+                    "returns".into(),
+                    if action.select.is_empty() {
+                        Value::String("the endpoint's own shape".into())
+                    } else {
+                        Value::Array(action.select.iter().cloned().map(Value::String).collect())
+                    },
+                ),
+                (
+                    "description".into(),
+                    action
+                        .description
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                ),
+                (
+                    "params".into(),
+                    Value::Array(param_names(action).into_iter().map(Value::String).collect()),
+                ),
+            ]);
+            if let Some(schema) = action.params_schema.clone() {
+                value.insert("params_schema".into(), schema);
+            }
+            (name.clone(), Value::Object(value))
+        })
+        .collect::<Map<_, _>>();
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("operation".into(), Value::String("describe".into())),
+        ("endpoint".into(), Value::String(endpoint.name.clone())),
+        ("protocol".into(), Value::String(endpoint.protocol.clone())),
+        ("actions".into(), Value::Object(actions)),
+    ])
+}
+
+async fn call_endpoint(
+    policy: &Policy,
+    endpoint: &Endpoint,
+    payload: &Map<String, Value>,
+) -> HandlerResult {
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let params = match payload.get("params") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(params)) => params.clone(),
+        _ => {
+            return Err(HandlerError::new(
+                "invalid_payload",
+                "params must be an object",
+            ));
+        }
+    };
+    let result = call_action(policy, endpoint, action, &params).await?;
+    Ok(BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("operation".into(), Value::String("call".into())),
+        ("endpoint".into(), Value::String(endpoint.name.clone())),
+        ("action".into(), Value::String(action.into())),
+        ("result".into(), result),
+    ]))
+}
+
 /// # Errors
 /// Returns an error when the local API request is invalid, disallowed, times out, or fails.
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -1179,25 +1293,8 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-
     if operation == "list" {
-        let listed = endpoints
-            .values()
-            .filter(|endpoint| endpoint.transport == "unix")
-            .map(|endpoint| {
-                json!({
-                    "name": endpoint.name,
-                    "protocol": endpoint.protocol,
-                    "transport": endpoint.transport,
-                    "action_count": endpoint.actions.len(),
-                })
-            })
-            .collect::<Vec<_>>();
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("operation".into(), Value::String("list".into())),
-            ("endpoints".into(), Value::Array(listed)),
-        ]));
+        return Ok(list_endpoints(&endpoints));
     }
 
     let name = payload
@@ -1215,85 +1312,14 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         )
     })?;
 
-    if operation == "describe" {
-        let actions = endpoint
-            .actions
-            .iter()
-            .map(|(name, action)| {
-                let mut value = Map::from_iter([
-                    (
-                        "request".into(),
-                        action.request.clone().map_or(Value::Null, Value::String),
-                    ),
-                    (
-                        "method".into(),
-                        action.method.clone().map_or(Value::Null, Value::String),
-                    ),
-                    (
-                        "returns".into(),
-                        if action.select.is_empty() {
-                            Value::String("the endpoint's own shape".into())
-                        } else {
-                            Value::Array(action.select.iter().cloned().map(Value::String).collect())
-                        },
-                    ),
-                    (
-                        "description".into(),
-                        action
-                            .description
-                            .clone()
-                            .map_or(Value::Null, Value::String),
-                    ),
-                    (
-                        "params".into(),
-                        Value::Array(param_names(action).into_iter().map(Value::String).collect()),
-                    ),
-                ]);
-                if let Some(schema) = action.params_schema.clone() {
-                    value.insert("params_schema".into(), schema);
-                }
-                (name.clone(), Value::Object(value))
-            })
-            .collect::<Map<_, _>>();
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("operation".into(), Value::String("describe".into())),
-            ("endpoint".into(), Value::String(endpoint.name.clone())),
-            ("protocol".into(), Value::String(endpoint.protocol.clone())),
-            ("actions".into(), Value::Object(actions)),
-        ]));
+    match operation {
+        "describe" => Ok(describe_endpoint(endpoint)),
+        "call" => call_endpoint(policy, endpoint, payload).await,
+        _ => Err(HandlerError::new(
+            "invalid_payload",
+            format!("unknown operation {operation:?}; expected list, describe or call"),
+        )),
     }
-
-    if operation == "call" {
-        let action = payload
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        let params = match payload.get("params") {
-            None | Some(Value::Null) => Map::new(),
-            Some(Value::Object(params)) => params.clone(),
-            _ => {
-                return Err(HandlerError::new(
-                    "invalid_payload",
-                    "params must be an object",
-                ));
-            }
-        };
-        let result = call_action(policy, endpoint, action, &params).await?;
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("operation".into(), Value::String("call".into())),
-            ("endpoint".into(), Value::String(endpoint.name.clone())),
-            ("action".into(), Value::String(action.into())),
-            ("result".into(), result),
-        ]));
-    }
-
-    Err(HandlerError::new(
-        "invalid_payload",
-        format!("unknown operation {operation:?}; expected list, describe or call"),
-    ))
 }
 
 #[cfg(test)]

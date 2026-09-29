@@ -352,6 +352,103 @@ fn sync_move_parents(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn move_response(src: &Path, dst: &Path, warning: Option<String>) -> BTreeMap<String, Value> {
+    let mut result = BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("op".into(), Value::String("move".into())),
+        ("src".into(), Value::String(src.display().to_string())),
+        ("dst".into(), Value::String(dst.display().to_string())),
+    ]);
+    if let Some(warning) = warning {
+        result.insert("cleanup_warning".into(), Value::String(warning));
+    }
+    result
+}
+
+fn try_direct_move(src: &Path, dst: &Path, overwrite: bool) -> Result<bool, HandlerError> {
+    let rename_result = if overwrite {
+        fs::rename(src, dst)
+    } else {
+        rename_no_replace(src, dst)
+    };
+    match rename_result {
+        Ok(()) => {
+            sync_move_parents(src, dst).map_err(|error| {
+                HandlerError::new("move_failed", format!("move sync failed: {error}"))
+            })?;
+            Ok(true)
+        }
+        Err(error) => {
+            let destination_exists = overwrite
+                && checked_entry_exists(
+                    dst,
+                    "move_failed",
+                    "cannot inspect destination after rename failure",
+                )?;
+            if error.kind() != io::ErrorKind::CrossesDevices && !destination_exists {
+                return Err(HandlerError::new(
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        "permission_denied"
+                    } else {
+                        "move_failed"
+                    },
+                    format!("move failed: {error}"),
+                ));
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn try_move_over_existing(
+    src: &Path,
+    dst: &Path,
+) -> Result<Option<BTreeMap<String, Value>>, HandlerError> {
+    let old = sibling_temp(dst, "old");
+    rename_no_replace(dst, &old).map_err(|error| {
+        HandlerError::new(
+            "move_failed",
+            format!("could not stage old destination: {error}"),
+        )
+    })?;
+    match fs::rename(src, dst) {
+        Ok(()) => {
+            sync_move_parents(src, dst).map_err(|error| {
+                HandlerError::new("move_failed", format!("move sync failed: {error}"))
+            })?;
+            let warning = cleanup_entry(&old, "move committed but old destination cleanup failed");
+            Ok(Some(move_response(src, dst, warning)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            if let Err(rollback) = rename_no_replace(&old, dst) {
+                return Err(HandlerError::new(
+                    "move_failed",
+                    format!(
+                        "cross-filesystem move detected after staging destination, and rollback failed: {rollback}; old destination remains at {}",
+                        old.display()
+                    ),
+                ));
+            }
+            Ok(None)
+        }
+        Err(error) => {
+            let rollback = rename_no_replace(&old, dst);
+            Err(HandlerError::new(
+                "move_failed",
+                rollback.map_or_else(
+                    |rollback| {
+                        format!(
+                            "move failed: {error}; rollback failed: {rollback}; old destination remains at {}",
+                            old.display()
+                        )
+                    },
+                    |()| format!("move failed: {error}"),
+                ),
+            ))
+        }
+    }
+}
+
 /// # Errors
 /// Returns an error when the move is invalid, disallowed, or cannot be completed safely.
 pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -371,14 +468,9 @@ pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
         ));
     }
     if src == dst {
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("op".into(), Value::String("move".into())),
-            ("src".into(), Value::String(src.display().to_string())),
-            ("dst".into(), Value::String(dst.display().to_string())),
-        ]));
+        return Ok(move_response(&src, &dst, None));
     }
-    let mut dst_exists = checked_entry_exists(&dst, "move_failed", "cannot inspect destination")?;
+    let dst_exists = checked_entry_exists(&dst, "move_failed", "cannot inspect destination")?;
     if dst_exists && !overwrite {
         return Err(HandlerError::new(
             "exists",
@@ -386,104 +478,15 @@ pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
         ));
     }
 
-    // Same-filesystem rename is the ideal move: atomic and no data copy.
-    // With overwrite=false, RENAME_NOREPLACE closes the exists->rename race.
-    let rename_result = if overwrite {
-        fs::rename(&src, &dst)
-    } else {
-        rename_no_replace(&src, &dst)
-    };
-    match rename_result {
-        Ok(()) => {
-            sync_move_parents(&src, &dst).map_err(|error| {
-                HandlerError::new("move_failed", format!("move sync failed: {error}"))
-            })?;
-            return Ok(BTreeMap::from([
-                ("ok".into(), Value::Bool(true)),
-                ("op".into(), Value::String("move".into())),
-                ("src".into(), Value::String(src.display().to_string())),
-                ("dst".into(), Value::String(dst.display().to_string())),
-            ]));
-        }
-        Err(error)
-            if error.kind() != io::ErrorKind::CrossesDevices
-                && !(overwrite
-                    && checked_entry_exists(
-                        &dst,
-                        "move_failed",
-                        "cannot inspect destination after rename failure",
-                    )?) =>
-        {
-            return Err(HandlerError::new(
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    "permission_denied"
-                } else {
-                    "move_failed"
-                },
-                format!("move failed: {error}"),
-            ));
-        }
-        Err(_) => {}
+    if try_direct_move(&src, &dst, overwrite)? {
+        return Ok(move_response(&src, &dst, None));
     }
 
-    // If overwrite involves incompatible/non-empty directory types, move the
-    // old destination aside first, then either commit or roll back.
-    dst_exists = checked_entry_exists(&dst, "move_failed", "cannot inspect destination")?;
-    if dst_exists {
-        let old = sibling_temp(&dst, "old");
-        rename_no_replace(&dst, &old).map_err(|error| {
-            HandlerError::new(
-                "move_failed",
-                format!("could not stage old destination: {error}"),
-            )
-        })?;
-        match fs::rename(&src, &dst) {
-            Ok(()) => {
-                sync_move_parents(&src, &dst).map_err(|error| {
-                    HandlerError::new("move_failed", format!("move sync failed: {error}"))
-                })?;
-                let mut result = BTreeMap::from([
-                    ("ok".into(), Value::Bool(true)),
-                    ("op".into(), Value::String("move".into())),
-                    ("src".into(), Value::String(src.display().to_string())),
-                    ("dst".into(), Value::String(dst.display().to_string())),
-                ]);
-                if let Some(warning) =
-                    cleanup_entry(&old, "move committed but old destination cleanup failed")
-                {
-                    result.insert("cleanup_warning".into(), Value::String(warning));
-                }
-                return Ok(result);
-            }
-            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-                if let Err(rollback) = rename_no_replace(&old, &dst) {
-                    return Err(HandlerError::new(
-                        "move_failed",
-                        format!(
-                            "cross-filesystem move detected after staging destination, and rollback failed: {rollback}; old destination remains at {}",
-                            old.display()
-                        ),
-                    ));
-                }
-            }
-            Err(error) => {
-                let rollback = rename_no_replace(&old, &dst);
-                return Err(HandlerError::new(
-                    "move_failed",
-                    match rollback {
-                        Ok(()) => format!("move failed: {error}"),
-                        Err(rollback) => format!(
-                            "move failed: {error}; rollback failed: {rollback}; old destination remains at {}",
-                            old.display()
-                        ),
-                    },
-                ));
-            }
-        }
+    let dst_exists = checked_entry_exists(&dst, "move_failed", "cannot inspect destination")?;
+    if dst_exists && let Some(result) = try_move_over_existing(&src, &dst)? {
+        return Ok(result);
     }
 
-    // Cross-filesystem move: fully copy and fsync a sibling temp at the
-    // destination, commit it, only then remove the source.
     let warning = staged_copy(&src, &dst, overwrite).map_err(|error| {
         HandlerError::new(
             "move_failed",
@@ -503,17 +506,7 @@ pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
     }
     sync_move_parents(&src, &dst)
         .map_err(|error| HandlerError::new("move_failed", format!("move sync failed: {error}")))?;
-
-    let mut result = BTreeMap::from([
-        ("ok".into(), Value::Bool(true)),
-        ("op".into(), Value::String("move".into())),
-        ("src".into(), Value::String(src.display().to_string())),
-        ("dst".into(), Value::String(dst.display().to_string())),
-    ]);
-    if let Some(warning) = warning {
-        result.insert("cleanup_warning".into(), Value::String(warning));
-    }
-    Ok(result)
+    Ok(move_response(&src, &dst, warning))
 }
 
 /// # Errors

@@ -366,7 +366,7 @@ fn select_playbook(
         let (selected, pagination) = project_selected(selected, payload)?;
         let (value, refs) = neutralize(selected);
         result.insert("playbook".into(), Value::String(playbook_name.clone()));
-        result.insert("path".into(), Value::String(path.clone()));
+        result.insert("path".into(), Value::String(path.to_owned()));
         result.insert("value".into(), value);
         if let Some(pagination) = pagination {
             let next_offset = pagination["next_offset"].as_u64();
@@ -409,13 +409,13 @@ fn select_playbook(
 fn select_path(
     payload: &Map<String, Value>,
     full: &Map<String, Value>,
-    path: String,
+    path: &str,
 ) -> HandlerResult {
     let selected = lookup(&Value::Object(full.clone()), &path)?;
     let (selected, pagination) = project_selected(selected, payload)?;
     let (value, refs) = neutralize(selected);
     let mut result = base(full);
-    result.insert("path".into(), Value::String(path.clone()));
+    result.insert("path".into(), Value::String(path.to_owned()));
     result.insert("value".into(), value);
     if let Some(pagination) = pagination {
         let next_offset = pagination["next_offset"].as_u64();
@@ -542,7 +542,7 @@ fn select_topic(
     payload: &Map<String, Value>,
     full: Map<String, Value>,
     playbooks: &BTreeMap<String, yaml_serde::Value>,
-    topic: String,
+    topic: &str,
     has_page: bool,
 ) -> HandlerResult {
     let topic = topic.to_ascii_lowercase();
@@ -622,12 +622,12 @@ pub fn select_help_response(
         );
     }
     if let Some(path) = selection.path {
-        return select_path(payload, &full, path);
+        return select_path(payload, &full, &path);
     }
     let topic = selection
         .topic
         .ok_or_else(|| HandlerError::new("invalid_payload", "topic is required"))?;
-    select_topic(payload, full, playbooks, topic, selection.has_page)
+    select_topic(payload, full, playbooks, &topic, selection.has_page)
 }
 
 #[cfg(test)]

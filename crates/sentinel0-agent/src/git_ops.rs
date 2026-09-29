@@ -643,15 +643,16 @@ async fn patch_numstat(
         LOCAL_TIMEOUT,
     )
     .await?;
-    let mut recounted = false;
-    if rc != 0 && String::from_utf8_lossy(&err).contains("corrupt patch") {
+    let recounted = if rc != 0 && String::from_utf8_lossy(&err).contains("corrupt patch") {
         let args = invoke(vec!["--recount".into(), "--numstat".into()]);
         let (retry_rc, retry_out, _) =
             run_git(policy, root, &args, Some(patch.as_bytes()), LOCAL_TIMEOUT).await?;
         rc = retry_rc;
         out = retry_out;
-        recounted = rc == 0;
-    }
+        rc == 0
+    } else {
+        false
+    };
     Ok((recounted, out))
 }
 
@@ -809,6 +810,13 @@ async fn fetch(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+fn directory_nonempty_or_unreadable(path: &Path) -> bool {
+    let Ok(mut entries) = path.read_dir() else {
+        return true;
+    };
+    entries.next().is_some()
+}
+
 async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let url = require_str(payload, "url")?;
     let dest = require_str(payload, "dest")?;
@@ -818,13 +826,6 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
             "clone destination must be under a file_ops rw path",
         ));
     };
-    fn directory_nonempty_or_unreadable(path: &Path) -> bool {
-        let Ok(mut entries) = path.read_dir() else {
-            return true;
-        };
-        entries.next().is_some()
-    }
-
     let destination_nonempty = directory_nonempty_or_unreadable(&target);
     if target.exists() && destination_nonempty {
         return Err(HandlerError::new(

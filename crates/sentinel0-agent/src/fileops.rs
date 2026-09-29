@@ -5,8 +5,8 @@ use crate::{
 use chrono::{DateTime, Utc};
 use glob::Pattern;
 use grep_matcher::Matcher;
-use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Bytes};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, sinks::Bytes};
 use ignore::WalkBuilder;
 use serde_json::{Map, Value};
 use std::{
@@ -238,6 +238,110 @@ fn scan_utf8(
     ))
 }
 
+struct Utf16ScanState {
+    units: Vec<u16>,
+    start: usize,
+    end: Option<usize>,
+    cap: usize,
+    line: usize,
+    last_selected: usize,
+    saw_any: bool,
+    last_was_newline: bool,
+    truncated: bool,
+    stopped_early: bool,
+    first_unit: bool,
+}
+
+impl Utf16ScanState {
+    fn new(start: usize, end: Option<usize>, cap: usize) -> Self {
+        Self {
+            units: Vec::with_capacity(cap.min(64 * 1024)),
+            start,
+            end,
+            cap,
+            line: 1,
+            last_selected: start.saturating_sub(1),
+            saw_any: false,
+            last_was_newline: false,
+            truncated: false,
+            stopped_early: false,
+            first_unit: true,
+        }
+    }
+
+    fn push_unit(&mut self, unit: u16) -> bool {
+        if self.first_unit && unit == 0xfeff {
+            self.first_unit = false;
+            return false;
+        }
+        self.first_unit = false;
+        self.saw_any = true;
+        self.last_was_newline = unit == 0x000a;
+        let selected = self.line >= self.start && self.end.is_none_or(|last| self.line <= last);
+
+        if unit == 0x000a {
+            if selected {
+                self.last_selected = self.line;
+                let next = self.line.saturating_add(1);
+                let next_selected = next >= self.start && self.end.is_none_or(|last| next <= last);
+                if next_selected {
+                    if self.units.len() >= self.cap {
+                        self.truncated = true;
+                        self.stopped_early = true;
+                        return true;
+                    }
+                    self.units.push(0x000a);
+                }
+            }
+            if self.end.is_some_and(|last| self.line >= last) {
+                self.stopped_early = true;
+                return true;
+            }
+            self.line = self.line.saturating_add(1);
+        } else if selected {
+            self.last_selected = self.line;
+            if self.units.len() >= self.cap {
+                self.truncated = true;
+                self.stopped_early = true;
+                return true;
+            }
+            self.units.push(unit);
+        }
+        false
+    }
+
+    fn finish(mut self) -> (String, usize, bool, bool, usize) {
+        let total_lines = if !self.saw_any {
+            0
+        } else if self.stopped_early {
+            self.line
+        } else if self.last_was_newline {
+            self.line.saturating_sub(1)
+        } else {
+            self.line
+        };
+        let mut content = String::from_utf16_lossy(&self.units);
+        let before = content.len();
+        content = clip(content, self.cap);
+        self.truncated |= content.len() < before;
+        (
+            content,
+            total_lines,
+            !self.stopped_early,
+            self.truncated,
+            self.last_selected,
+        )
+    }
+}
+
+fn utf16_unit(pair: [u8; 2], little_endian: bool) -> u16 {
+    if little_endian {
+        u16::from_le_bytes(pair)
+    } else {
+        u16::from_be_bytes(pair)
+    }
+}
+
 fn scan_utf16(
     path: &Path,
     start: usize,
@@ -249,14 +353,7 @@ fn scan_utf16(
         .map_err(|e| HandlerError::new("io_error", format!("failed to read file: {e}")))?;
     let mut buf = [0_u8; 16 * 1024];
     let mut carry: Option<u8> = None;
-    let mut units = Vec::<u16>::with_capacity(cap.min(64 * 1024));
-    let mut line = 1_usize;
-    let mut last_selected = start.saturating_sub(1);
-    let mut saw_any = false;
-    let mut last_was_newline = false;
-    let mut truncated = false;
-    let mut stopped_early = false;
-    let mut first_unit = true;
+    let mut state = Utf16ScanState::new(start, end, cap);
 
     'outer: loop {
         let n = file
@@ -265,129 +362,25 @@ fn scan_utf16(
         if n == 0 {
             break;
         }
-
         let mut index = 0;
         if let Some(first) = carry.take() {
-            if n == 0 {
-                carry = Some(first);
-                continue;
-            }
-            let pair = [first, buf[0]];
             index = 1;
-            let unit = if little_endian {
-                u16::from_le_bytes(pair)
-            } else {
-                u16::from_be_bytes(pair)
-            };
-            if first_unit && unit == 0xfeff {
-                first_unit = false;
-            } else {
-                first_unit = false;
-                saw_any = true;
-                last_was_newline = unit == 0x000a;
-                let selected = line >= start && end.is_none_or(|last| line <= last);
-                if unit == 0x000a {
-                    if selected {
-                        last_selected = line;
-                        let next = line.saturating_add(1);
-                        let next_selected = next >= start && end.is_none_or(|last| next <= last);
-                        if next_selected {
-                            if units.len() >= cap {
-                                truncated = true;
-                                stopped_early = true;
-                                break 'outer;
-                            }
-                            units.push(0x000a);
-                        }
-                    }
-                    if end.is_some_and(|last| line >= last) {
-                        stopped_early = true;
-                        break 'outer;
-                    }
-                    line = line.saturating_add(1);
-                } else if selected {
-                    last_selected = line;
-                    if units.len() >= cap {
-                        truncated = true;
-                        stopped_early = true;
-                        break 'outer;
-                    }
-                    units.push(unit);
-                }
+            if state.push_unit(utf16_unit([first, buf[0]], little_endian)) {
+                break 'outer;
             }
         }
-
         while index + 1 < n {
             let pair = [buf[index], buf[index + 1]];
             index += 2;
-            let unit = if little_endian {
-                u16::from_le_bytes(pair)
-            } else {
-                u16::from_be_bytes(pair)
-            };
-            if first_unit && unit == 0xfeff {
-                first_unit = false;
-                continue;
-            }
-            first_unit = false;
-            saw_any = true;
-            last_was_newline = unit == 0x000a;
-            let selected = line >= start && end.is_none_or(|last| line <= last);
-
-            if unit == 0x000a {
-                if selected {
-                    last_selected = line;
-                    let next = line.saturating_add(1);
-                    let next_selected = next >= start && end.is_none_or(|last| next <= last);
-                    if next_selected {
-                        if units.len() >= cap {
-                            truncated = true;
-                            stopped_early = true;
-                            break 'outer;
-                        }
-                        units.push(0x000a);
-                    }
-                }
-                if end.is_some_and(|last| line >= last) {
-                    stopped_early = true;
-                    break 'outer;
-                }
-                line = line.saturating_add(1);
-            } else if selected {
-                last_selected = line;
-                if units.len() >= cap {
-                    truncated = true;
-                    stopped_early = true;
-                    break 'outer;
-                }
-                units.push(unit);
+            if state.push_unit(utf16_unit(pair, little_endian)) {
+                break 'outer;
             }
         }
         if index < n {
             carry = Some(buf[index]);
         }
     }
-
-    let total_lines = if !saw_any {
-        0
-    } else if stopped_early {
-        line
-    } else if last_was_newline {
-        line.saturating_sub(1)
-    } else {
-        line
-    };
-    let mut content = String::from_utf16_lossy(&units);
-    let before = content.len();
-    content = clip(content, cap);
-    truncated |= content.len() < before;
-    Ok((
-        content,
-        total_lines,
-        !stopped_early,
-        truncated,
-        last_selected,
-    ))
+    Ok(state.finish())
 }
 
 /// # Errors
@@ -572,6 +565,143 @@ fn skip_search_file(path: &Path) -> bool {
         .is_some_and(|ext| SKIP_EXTS.contains(&ext.as_str()))
 }
 
+struct SearchState {
+    matches: Vec<Value>,
+    files_searched: u64,
+    errors: Vec<Value>,
+    error_count: u64,
+    cap: usize,
+}
+
+fn build_search_matcher(
+    pattern: &str,
+    is_regex: bool,
+    case_sensitive: bool,
+) -> Result<RegexMatcher, HandlerError> {
+    let mut builder = RegexMatcherBuilder::new();
+    builder.case_insensitive(!case_sensitive);
+    if is_regex {
+        builder.build(pattern).map_err(|e| {
+            HandlerError::new(
+                "invalid_payload",
+                format!("pattern is not a valid regex: {e}"),
+            )
+        })
+    } else {
+        builder.build_literals(&[pattern]).map_err(|e| {
+            HandlerError::new(
+                "invalid_payload",
+                format!("pattern could not be compiled: {e}"),
+            )
+        })
+    }
+}
+
+fn search_candidate(
+    path: &Path,
+    rel: &str,
+    matcher: &RegexMatcher,
+    searcher: &mut Searcher,
+    state: &mut SearchState,
+) -> bool {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            record_search_error(
+                &mut state.errors,
+                &mut state.error_count,
+                Some(path),
+                format!("open failed: {error}"),
+            );
+            return false;
+        }
+    };
+    let mut probe = [0_u8; PROBE];
+    let n = match file.read(&mut probe) {
+        Ok(n) => n,
+        Err(error) => {
+            record_search_error(
+                &mut state.errors,
+                &mut state.error_count,
+                Some(path),
+                format!("probe read failed: {error}"),
+            );
+            return false;
+        }
+    };
+    if probe[..n].contains(&0) {
+        return false;
+    }
+    if let Err(error) = file.rewind() {
+        record_search_error(
+            &mut state.errors,
+            &mut state.error_count,
+            Some(path),
+            format!("rewind failed: {error}"),
+        );
+        return false;
+    }
+    state.files_searched += 1;
+    let result = searcher.search_file(
+        matcher,
+        &file,
+        Bytes(|line_number, line| {
+            let line = match std::str::from_utf8(line) {
+                Ok(line) => line,
+                Err(error) => {
+                    record_search_error(
+                        &mut state.errors,
+                        &mut state.error_count,
+                        Some(path),
+                        format!("line {line_number} is not UTF-8: {error}"),
+                    );
+                    return Ok(true);
+                }
+            };
+            let found = match matcher.find(line.as_bytes()) {
+                Ok(Some(found)) => found,
+                Ok(None) => return Ok(true),
+                Err(error) => {
+                    record_search_error(
+                        &mut state.errors,
+                        &mut state.error_count,
+                        Some(path),
+                        format!("matcher failed on line {line_number}: {error}"),
+                    );
+                    return Ok(true);
+                }
+            };
+            let mut preview = line.trim().to_owned();
+            if preview.chars().count() > PREVIEW_CHARS {
+                preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
+            }
+            let byte_column = found.start() + 1;
+            let column = line
+                .char_indices()
+                .take_while(|(index, _)| *index < found.start())
+                .count()
+                + 1;
+            state.matches.push(serde_json::json!({
+                "file": rel,
+                "line": line_number,
+                "column": column,
+                "byte_column": byte_column,
+                "text": preview,
+            }));
+            Ok(state.matches.len() < state.cap)
+        }),
+    );
+    if let Err(error) = result {
+        record_search_error(
+            &mut state.errors,
+            &mut state.error_count,
+            Some(path),
+            format!("search failed: {error}"),
+        );
+    }
+    state.matches.len() >= state.cap
+}
+
 /// # Errors
 /// Returns an error when the search request is invalid, disallowed, or cannot be executed.
 pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -601,32 +731,18 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let cap = payload
         .get("max_results")
         .and_then(Value::as_u64)
-        .and_then(|v| usize::try_from(v).ok())
-        .filter(|v| *v > 0)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
         .unwrap_or(policy.file_ops_max_search_results)
         .min(policy.file_ops_max_search_results);
-
-    let mut matcher_builder = RegexMatcherBuilder::new();
-    matcher_builder.case_insensitive(!case_sensitive);
-    let matcher = if is_regex {
-        matcher_builder.build(needle)
-    } else {
-        matcher_builder.build_literals(&[needle])
-    }
-    .map_err(|e| {
-        let message = if is_regex {
-            format!("pattern is not a valid regex: {e}")
-        } else {
-            format!("pattern could not be compiled: {e}")
-        };
-        HandlerError::new("invalid_payload", message)
-    })?;
-
-    let mut search_matches = Vec::new();
-    let mut files_searched = 0_u64;
-    let mut search_errors = Vec::new();
-    let mut search_error_count = 0_u64;
-    let mut truncated = false;
+    let matcher = build_search_matcher(needle, is_regex, case_sensitive)?;
+    let mut state = SearchState {
+        matches: Vec::new(),
+        files_searched: 0,
+        errors: Vec::new(),
+        error_count: 0,
+        cap,
+    };
     let mut walker = WalkBuilder::new(&root);
     walker
         .hidden(false)
@@ -650,8 +766,8 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             Ok(entry) => entry,
             Err(error) => {
                 record_search_error(
-                    &mut search_errors,
-                    &mut search_error_count,
+                    &mut state.errors,
+                    &mut state.error_count,
                     None,
                     format!("walk failed: {error}"),
                 );
@@ -663,52 +779,13 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         }
         if file_glob
             .as_ref()
-            .is_some_and(|p| !p.matches(&entry.file_name().to_string_lossy()))
+            .is_some_and(|pattern| !pattern.matches(&entry.file_name().to_string_lossy()))
         {
             continue;
         }
-        let mut file = match fs::File::open(entry.path()) {
-            Ok(file) => file,
-            Err(error) => {
-                record_search_error(
-                    &mut search_errors,
-                    &mut search_error_count,
-                    Some(entry.path()),
-                    format!("open failed: {error}"),
-                );
-                continue;
-            }
-        };
-        let mut probe = [0_u8; PROBE];
-        let n = match file.read(&mut probe) {
-            Ok(n) => n,
-            Err(error) => {
-                record_search_error(
-                    &mut search_errors,
-                    &mut search_error_count,
-                    Some(entry.path()),
-                    format!("probe read failed: {error}"),
-                );
-                continue;
-            }
-        };
-        if probe[..n].contains(&0) {
-            continue;
-        }
-        if let Err(error) = file.rewind() {
-            record_search_error(
-                &mut search_errors,
-                &mut search_error_count,
-                Some(entry.path()),
-                format!("rewind failed: {error}"),
-            );
-            continue;
-        }
-        files_searched += 1;
-
         let rel = if root.is_file() {
             root.file_name()
-                .and_then(|n| n.to_str())
+                .and_then(|name| name.to_str())
                 .unwrap_or(raw)
                 .to_owned()
         } else {
@@ -719,66 +796,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
                 .to_string_lossy()
                 .into_owned()
         };
-        let search_result = searcher.search_file(
-            &matcher,
-            &file,
-            Bytes(|line_number, line| {
-                let line = match std::str::from_utf8(line) {
-                    Ok(line) => line,
-                    Err(error) => {
-                        record_search_error(
-                            &mut search_errors,
-                            &mut search_error_count,
-                            Some(entry.path()),
-                            format!("line {line_number} is not UTF-8: {error}"),
-                        );
-                        return Ok(true);
-                    }
-                };
-                let found = match matcher.find(line.as_bytes()) {
-                    Ok(Some(found)) => found,
-                    Ok(None) => return Ok(true),
-                    Err(error) => {
-                        record_search_error(
-                            &mut search_errors,
-                            &mut search_error_count,
-                            Some(entry.path()),
-                            format!("matcher failed on line {line_number}: {error}"),
-                        );
-                        return Ok(true);
-                    }
-                };
-                let mut preview = line.trim().to_owned();
-                if preview.chars().count() > PREVIEW_CHARS {
-                    preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
-                }
-                let byte_column = found.start() + 1;
-                let column = line
-                    .char_indices()
-                    .take_while(|(index, _)| *index < found.start())
-                    .count()
-                    + 1;
-                search_matches.push(serde_json::json!({
-                    "file": rel.as_str(),
-                    "line": line_number,
-                    "column": column,
-                    "byte_column": byte_column,
-                    "text": preview,
-                }));
-                Ok(search_matches.len() < cap)
-            }),
-        );
-        if let Err(error) = search_result {
-            record_search_error(
-                &mut search_errors,
-                &mut search_error_count,
-                Some(entry.path()),
-                format!("search failed: {error}"),
-            );
-            continue;
-        }
-        if search_matches.len() >= cap {
-            truncated = true;
+        if search_candidate(entry.path(), &rel, &matcher, &mut searcher, &mut state) {
             break;
         }
     }
@@ -787,11 +805,14 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("ok".into(), Value::Bool(true)),
         ("path".into(), Value::String(root.display().to_string())),
         ("pattern".into(), Value::String(needle.into())),
-        ("matches".into(), Value::Array(search_matches)),
-        ("files_searched".into(), Value::from(files_searched)),
-        ("search_error_count".into(), Value::from(search_error_count)),
-        ("search_errors".into(), Value::Array(search_errors)),
-        ("truncated".into(), Value::Bool(truncated)),
+        ("matches".into(), Value::Array(state.matches)),
+        ("files_searched".into(), Value::from(state.files_searched)),
+        ("search_error_count".into(), Value::from(state.error_count)),
+        ("search_errors".into(), Value::Array(state.errors)),
+        (
+            "truncated".into(),
+            Value::Bool(state.matches.len() >= state.cap),
+        ),
     ]))
 }
 

@@ -486,7 +486,7 @@ fn parse_file_ops_paths(
     }
 }
 
-fn parse_preferred_profile(value: Option<String>) -> Result<Option<String>, PolicyError> {
+fn parse_preferred_profile(value: Option<&String>) -> Result<Option<String>, PolicyError> {
     match value.as_deref() {
         Some("compact") => Ok(Some("compact".into())),
         Some("full") => Ok(Some("full".into())),
@@ -571,7 +571,7 @@ impl Policy {
         let locations = parse_locations(raw_locations)?;
         let services = parse_services(raw_services);
         let file_ops_paths = parse_file_ops_paths(paths, allowed_read_paths)?;
-        let preferred_profile = parse_preferred_profile(preferred_profile)?;
+        let preferred_profile = parse_preferred_profile(preferred_profile.as_ref())?;
         let upload_base =
             upload_base.unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/uploads"));
         let upload_base = soft_canonicalize(&upload_base).unwrap_or(upload_base);
