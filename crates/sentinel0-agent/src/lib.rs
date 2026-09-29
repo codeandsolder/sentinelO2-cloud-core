@@ -290,6 +290,7 @@ pub struct Agent<D> {
     config: AgentConfig,
     dispatcher: Arc<D>,
     rotation: Option<rotation::RotationConfig>,
+    response_timestamp_interval: Duration,
 }
 
 impl<D: Dispatcher> Agent<D> {
@@ -299,11 +300,18 @@ impl<D: Dispatcher> Agent<D> {
             config,
             dispatcher: Arc::new(dispatcher),
             rotation: None,
+            response_timestamp_interval: Duration::from_secs(60),
         })
     }
 
     pub fn with_credential_rotation(mut self, config: rotation::RotationConfig) -> Self {
         self.rotation = Some(config);
+        self
+    }
+
+    #[must_use]
+    pub fn with_response_timestamp_interval(mut self, interval: Duration) -> Self {
+        self.response_timestamp_interval = interval;
         self
     }
 
@@ -449,6 +457,7 @@ impl<D: Dispatcher> Agent<D> {
         heartbeat.tick().await;
         let mut last_pong = Instant::now();
         let (response_tx, mut response_rx) = mpsc::channel::<Outbound>(64);
+        let mut last_response_timestamp = None;
 
         loop {
             tokio::select! {
@@ -476,7 +485,25 @@ impl<D: Dispatcher> Agent<D> {
                 }
                 outbound = response_rx.recv() => {
                     if let Some(outbound) = outbound {
-                        let message = outbound.message;
+                        let mut message = outbound.message;
+                        if let Message::Response {
+                            result: Some(result),
+                            ..
+                        } = &mut message
+                        {
+                            let now = Instant::now();
+                            if last_response_timestamp.is_none_or(|last: Instant| {
+                                now.duration_since(last) >= self.response_timestamp_interval
+                            }) {
+                                result.insert(
+                                    "sentinel0_response_at".into(),
+                                    serde_json::Value::String(
+                                        Utc::now().format("%H:%M:%S").to_string(),
+                                    ),
+                                );
+                                last_response_timestamp = Some(now);
+                            }
+                        }
 
                         if let Some(frame) = outbound.binary_frame
                             && ws.send(WsMessage::Binary(frame.into())).await.is_err()

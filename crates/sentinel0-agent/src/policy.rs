@@ -47,6 +47,7 @@ pub struct Policy {
     pub playbooks: BTreeMap<String, yaml_serde::Value>,
     pub hostname_label: Option<String>,
     pub preferred_profile: Option<String>,
+    pub response_timestamp_interval_seconds: u64,
     pub exec_timeout_default: u64,
     pub exec_timeout_max: u64,
     pub exec_capture_max_bytes: usize,
@@ -73,6 +74,7 @@ impl Default for Policy {
             playbooks: BTreeMap::new(),
             hostname_label: None,
             preferred_profile: None,
+            response_timestamp_interval_seconds: 60,
             exec_timeout_default: 60,
             exec_timeout_max: 600,
             exec_capture_max_bytes: 4 * 1024 * 1024,
@@ -185,6 +187,7 @@ impl Default for RawTooling {
 struct RawAgent {
     hostname_label: Option<String>,
     preferred_profile: Option<String>,
+    response_timestamp_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +505,14 @@ impl Policy {
                 });
             }
         };
+        let response_timestamp_interval_seconds =
+            raw.agent.response_timestamp_interval_seconds.unwrap_or(60);
+        if response_timestamp_interval_seconds == 0 {
+            return Err(PolicyError::InvalidValue {
+                field: "agent.response_timestamp_interval_seconds",
+                message: "must be greater than zero".into(),
+            });
+        }
 
         let upload_base = raw
             .upload_base
@@ -536,6 +547,7 @@ impl Policy {
             playbooks: raw.playbooks,
             hostname_label: raw.agent.hostname_label,
             preferred_profile,
+            response_timestamp_interval_seconds,
             exec_timeout_default: raw.exec.timeout_default,
             exec_timeout_max: raw.exec.timeout_max,
             exec_capture_max_bytes: raw.exec.capture_max_bytes,
@@ -676,6 +688,7 @@ security:
   trusted_fetch_hosts: [drop.pensa.ar]
 agent:
   preferred_profile: compact
+  response_timestamp_interval_seconds: 75
 hub_url: https://ignored.example
 log:
   level: INFO
@@ -689,7 +702,23 @@ upload_base: /var/lib/sentinelx/uploads
         assert!(!policy.is_command_allowed("curl example.com"));
         assert!(policy.service_action_allowed("nginx", "restart"));
         assert_eq!(policy.preferred_profile.as_deref(), Some("compact"));
+        assert_eq!(policy.response_timestamp_interval_seconds, 75);
         assert_eq!(policy.file_ops_paths.len(), 2);
+    }
+
+    #[test]
+    fn response_timestamp_interval_defaults_to_one_minute_and_rejects_zero() {
+        assert_eq!(parse("").response_timestamp_interval_seconds, 60,);
+
+        let raw: RawPolicy =
+            yaml_serde::from_str("agent:\n  response_timestamp_interval_seconds: 0\n").unwrap();
+        assert!(matches!(
+            Policy::from_raw(raw),
+            Err(PolicyError::InvalidValue {
+                field: "agent.response_timestamp_interval_seconds",
+                ..
+            })
+        ));
     }
 
     #[test]

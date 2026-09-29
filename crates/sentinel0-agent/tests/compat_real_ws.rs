@@ -346,11 +346,72 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         let finished_at = timing["finished_at"].as_f64().unwrap();
         assert!(received_at <= finished_at);
 
+        let response_at = result["sentinel0_response_at"].as_str().unwrap();
+        chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").unwrap();
+
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "request",
+                "id": "req_state_2",
+                "op": "state",
+                "payload": {},
+                "deadline": null,
+                "opaque_ref": null
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let second = next_non_heartbeat(&mut ws).await;
+        let WsMessage::Text(second) = second else {
+            panic!("expected second response");
+        };
+        let Message::Response {
+            result: Some(second),
+            ..
+        } = serde_json::from_str::<Message>(&second).unwrap()
+        else {
+            panic!("expected successful second response");
+        };
+        assert!(!second.contains_key("sentinel0_response_at"));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "request",
+                "id": "req_state_3",
+                "op": "state",
+                "payload": {},
+                "deadline": null,
+                "opaque_ref": null
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let third = next_non_heartbeat(&mut ws).await;
+        let WsMessage::Text(third) = third else {
+            panic!("expected third response");
+        };
+        let Message::Response {
+            result: Some(third),
+            ..
+        } = serde_json::from_str::<Message>(&third).unwrap()
+        else {
+            panic!("expected successful third response");
+        };
+        let response_at = third["sentinel0_response_at"].as_str().unwrap();
+        chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").unwrap();
+
         server_cancel.cancel();
         let _ = ws.close(None).await;
     });
 
-    let agent = Agent::new(config(addr), EchoDispatcher).unwrap();
+    let agent = Agent::new(config(addr), EchoDispatcher)
+        .unwrap()
+        .with_response_timestamp_interval(Duration::from_millis(50));
     tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
         .expect("frame-handling session did not finish")
