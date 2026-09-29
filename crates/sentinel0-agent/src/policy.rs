@@ -286,170 +286,158 @@ impl Default for RawService {
     }
 }
 
-impl Policy {
-    /// # Errors
-    /// Returns an error when the policy file cannot be read, parsed, or validated.
-    pub fn from_file(path: &Path) -> Result<Self, PolicyError> {
-        if !path.exists() {
-            warn!(path = %path.display(), "policy file missing; loading built-in defaults");
-            return Ok(Self::default());
-        }
-
-        let text = fs::read_to_string(path).map_err(|source| PolicyError::Read {
-            path: path.into(),
-            source,
-        })?;
-        let raw: RawPolicy = yaml_serde::from_str(&text).map_err(|source| PolicyError::Parse {
-            path: path.into(),
-            source,
-        })?;
-        Self::from_raw(raw)
+fn validate_raw_policy(raw: &RawPolicy) -> Result<(), PolicyError> {
+    const PLAYBOOK_KEYS: &[&str] = &[
+        "description",
+        "commands",
+        "when",
+        "steps",
+        "requires",
+        "notes",
+    ];
+    if raw.exec.timeout_default == 0 {
+        return Err(PolicyError::InvalidValue {
+            field: "exec.timeout_default",
+            message: "must be greater than zero".into(),
+        });
     }
-
-    fn from_raw(raw: RawPolicy) -> Result<Self, PolicyError> {
-        const PLAYBOOK_KEYS: &[&str] = &[
-            "description",
-            "commands",
-            "when",
-            "steps",
-            "requires",
-            "notes",
-        ];
-        if raw.exec.timeout_default == 0 {
-            return Err(PolicyError::InvalidValue {
-                field: "exec.timeout_default",
-                message: "must be greater than zero".into(),
-            });
-        }
-        if raw.exec.timeout_max < raw.exec.timeout_default {
-            return Err(PolicyError::InvalidValue {
-                field: "exec.timeout_max",
-                message: format!(
-                    "must be >= exec.timeout_default ({})",
-                    raw.exec.timeout_default
-                ),
-            });
-        }
-        if raw.exec.capture_max_bytes < 64 * 1024 {
-            return Err(PolicyError::InvalidValue {
-                field: "exec.capture_max_bytes",
-                message: "must be at least 65536 bytes".into(),
-            });
-        }
-        if raw.security.file_url_timeout_seconds == 0 {
-            return Err(PolicyError::InvalidValue {
-                field: "security.file_url_timeout_seconds",
-                message: "must be greater than zero".into(),
-            });
-        }
-        for (field, value) in [
-            ("file_ops.max_read_bytes", raw.file_ops.max_read_bytes),
-            ("file_ops.max_list_entries", raw.file_ops.max_list_entries),
-            (
-                "file_ops.max_search_results",
-                raw.file_ops.max_search_results,
+    if raw.exec.timeout_max < raw.exec.timeout_default {
+        return Err(PolicyError::InvalidValue {
+            field: "exec.timeout_max",
+            message: format!(
+                "must be >= exec.timeout_default ({})",
+                raw.exec.timeout_default
             ),
-        ] {
-            if value == 0 {
-                return Err(PolicyError::InvalidValue {
-                    field,
-                    message: "must be greater than zero".into(),
-                });
-            }
+        });
+    }
+    if raw.exec.capture_max_bytes < 64 * 1024 {
+        return Err(PolicyError::InvalidValue {
+            field: "exec.capture_max_bytes",
+            message: "must be at least 65536 bytes".into(),
+        });
+    }
+    if raw.security.file_url_timeout_seconds == 0 {
+        return Err(PolicyError::InvalidValue {
+            field: "security.file_url_timeout_seconds",
+            message: "must be greater than zero".into(),
+        });
+    }
+    for (field, value) in [
+        ("file_ops.max_read_bytes", raw.file_ops.max_read_bytes),
+        ("file_ops.max_list_entries", raw.file_ops.max_list_entries),
+        (
+            "file_ops.max_search_results",
+            raw.file_ops.max_search_results,
+        ),
+    ] {
+        if value == 0 {
+            return Err(PolicyError::InvalidValue {
+                field,
+                message: "must be greater than zero".into(),
+            });
         }
-        for op in &raw.disabled_ops {
-            let op = op.trim();
-            if !op.is_empty()
-                && !sentinel0_proto::Op::ALL
-                    .iter()
-                    .any(|known| known.as_str() == op)
-            {
-                return Err(PolicyError::InvalidValue {
-                    field: "disabled_ops",
-                    message: format!("unknown operation {op:?}"),
-                });
-            }
+    }
+    for op in &raw.disabled_ops {
+        let op = op.trim();
+        if !op.is_empty()
+            && !sentinel0_proto::Op::ALL
+                .iter()
+                .any(|known| known.as_str() == op)
+        {
+            return Err(PolicyError::InvalidValue {
+                field: "disabled_ops",
+                message: format!("unknown operation {op:?}"),
+            });
         }
-        crate::local_api::validate_config(&raw.local_apis).map_err(|message| {
-            PolicyError::InvalidValue {
-                field: "local_apis",
-                message,
-            }
-        })?;
-
-        for (name, value) in &raw.playbooks {
-            if !matches!(value, yaml_serde::Value::Mapping(_)) {
-                return Err(PolicyError::InvalidValue {
-                    field: "playbooks",
-                    message: format!("playbook {name:?} must be an object"),
-                });
-            }
-            let json = serde_json::to_value(value).map_err(|error| PolicyError::InvalidValue {
-                field: "playbooks",
-                message: format!("playbook {name:?} is not JSON-representable: {error}"),
-            })?;
-            let object = json.as_object().ok_or_else(|| PolicyError::InvalidValue {
+    }
+    crate::local_api::validate_config(&raw.local_apis).map_err(|message| {
+        PolicyError::InvalidValue {
+            field: "local_apis",
+            message,
+        }
+    })?;
+    for (name, value) in &raw.playbooks {
+        if !matches!(value, yaml_serde::Value::Mapping(_)) {
+            return Err(PolicyError::InvalidValue {
                 field: "playbooks",
                 message: format!("playbook {name:?} must be an object"),
-            })?;
-            if let Some(key) = object
-                .keys()
-                .find(|key| !PLAYBOOK_KEYS.contains(&key.as_str()))
-            {
-                return Err(PolicyError::InvalidValue {
-                    field: "playbooks",
-                    message: format!("playbook {name:?} contains unknown key {key:?}"),
-                });
-            }
+            });
         }
-
-        let mut locations = BTreeMap::new();
-        for (name, location) in raw.locations {
-            let (path, description) = match location {
-                RawLocation::Path(path) => (path, String::new()),
-                RawLocation::Detailed(RawLocationDetailed { path, description }) => {
-                    (path, description)
-                }
-            };
-            if path.trim().is_empty() {
-                return Err(PolicyError::InvalidValue {
-                    field: "locations",
-                    message: format!("location {name:?} has an empty path"),
-                });
-            }
-            locations.insert(name, LocationSpec { path, description });
+        let json = serde_json::to_value(value).map_err(|error| PolicyError::InvalidValue {
+            field: "playbooks",
+            message: format!("playbook {name:?} is not JSON-representable: {error}"),
+        })?;
+        let object = json.as_object().ok_or_else(|| PolicyError::InvalidValue {
+            field: "playbooks",
+            message: format!("playbook {name:?} must be an object"),
+        })?;
+        if let Some(key) = object
+            .keys()
+            .find(|key| !PLAYBOOK_KEYS.contains(&key.as_str()))
+        {
+            return Err(PolicyError::InvalidValue {
+                field: "playbooks",
+                message: format!("playbook {name:?} contains unknown key {key:?}"),
+            });
         }
+    }
+    Ok(())
+}
 
-        let services = raw
-            .services
+fn parse_locations(
+    raw_locations: BTreeMap<String, RawLocation>,
+) -> Result<BTreeMap<String, LocationSpec>, PolicyError> {
+    let mut locations = BTreeMap::new();
+    for (name, location) in raw_locations {
+        let (path, description) = match location {
+            RawLocation::Path(path) => (path, String::new()),
+            RawLocation::Detailed(RawLocationDetailed { path, description }) => (path, description),
+        };
+        if path.trim().is_empty() {
+            return Err(PolicyError::InvalidValue {
+                field: "locations",
+                message: format!("location {name:?} has an empty path"),
+            });
+        }
+        locations.insert(name, LocationSpec { path, description });
+    }
+    Ok(locations)
+}
+
+fn parse_services(raw_services: BTreeMap<String, RawService>) -> BTreeMap<String, ServiceSpec> {
+    raw_services
+        .into_iter()
+        .map(|(name, service)| {
+            let unit = service.unit.unwrap_or_else(|| name.clone());
+            (
+                name,
+                ServiceSpec {
+                    unit,
+                    actions: service.actions,
+                    requires_sudo: service.requires_sudo,
+                    description: service.description,
+                    domain: service.domain,
+                    backend: service.backend,
+                },
+            )
+        })
+        .collect()
+}
+
+fn parse_file_ops_paths(
+    paths: Option<Vec<RawFilePath>>,
+    allowed_read_paths: Option<Vec<String>>,
+) -> Result<Vec<FileOpsPath>, PolicyError> {
+    if let Some(paths) = paths {
+        if allowed_read_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+        {
+            warn!("file_ops has both paths and allowed_read_paths; using paths");
+        }
+        paths
             .into_iter()
-            .map(|(name, service)| {
-                let unit = service.unit.unwrap_or_else(|| name.clone());
-                (
-                    name,
-                    ServiceSpec {
-                        unit,
-                        actions: service.actions,
-                        requires_sudo: service.requires_sudo,
-                        description: service.description,
-                        domain: service.domain,
-                        backend: service.backend,
-                    },
-                )
-            })
-            .collect();
-
-        let file_ops_paths = if let Some(paths) = raw.file_ops.paths {
-            if raw
-                .file_ops
-                .allowed_read_paths
-                .as_ref()
-                .is_some_and(|p| !p.is_empty())
-            {
-                warn!("file_ops has both paths and allowed_read_paths; using paths");
-            }
-            let mut parsed = Vec::with_capacity(paths.len());
-            for entry in paths {
+            .map(|entry| {
                 let (path, access) = match entry {
                     RawFilePath::Path(path) => (path, FileAccess::Read),
                     RawFilePath::Detailed(RawFilePathDetailed { path, access }) => {
@@ -472,84 +460,147 @@ impl Policy {
                         message: "must not be empty".into(),
                     });
                 }
-                parsed.push(FileOpsPath {
+                Ok(FileOpsPath {
                     path: PathBuf::from(path),
                     access,
-                });
-            }
-            parsed
-        } else {
-            let mut parsed = Vec::new();
-            for path in raw.file_ops.allowed_read_paths.unwrap_or_default() {
+                })
+            })
+            .collect()
+    } else {
+        allowed_read_paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| {
                 if path.trim().is_empty() {
                     return Err(PolicyError::InvalidValue {
                         field: "file_ops.allowed_read_paths[]",
                         message: "must not be empty".into(),
                     });
                 }
-                parsed.push(FileOpsPath {
+                Ok(FileOpsPath {
                     path: PathBuf::from(path),
                     access: FileAccess::Read,
-                });
-            }
-            parsed
-        };
+                })
+            })
+            .collect()
+    }
+}
 
-        let preferred_profile = match raw.agent.preferred_profile.as_deref() {
-            Some("compact") => Some("compact".into()),
-            Some("full") => Some("full".into()),
-            None => None,
-            Some(other) => {
-                return Err(PolicyError::InvalidValue {
-                    field: "agent.preferred_profile",
-                    message: format!("must be \"compact\" or \"full\", got {other:?}"),
-                });
-            }
-        };
-        let upload_base = raw
-            .upload_base
-            .unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/uploads"));
+fn parse_preferred_profile(value: Option<String>) -> Result<Option<String>, PolicyError> {
+    match value.as_deref() {
+        Some("compact") => Ok(Some("compact".into())),
+        Some("full") => Ok(Some("full".into())),
+        None => Ok(None),
+        Some(other) => Err(PolicyError::InvalidValue {
+            field: "agent.preferred_profile",
+            message: format!("must be \"compact\" or \"full\", got {other:?}"),
+        }),
+    }
+}
+
+fn parse_tooling(raw: RawTooling) -> Tooling {
+    Tooling {
+        search_path: raw.path.unwrap_or_else(|| Tooling::default().search_path),
+        executables: raw.executables,
+        uv_python: if raw.uv_python.trim().is_empty() {
+            "3".into()
+        } else {
+            raw.uv_python
+        },
+        forbid_direct_python: raw.forbid_direct_python,
+    }
+}
+
+impl Policy {
+    /// # Errors
+    /// Returns an error when the policy file cannot be read, parsed, or validated.
+    pub fn from_file(path: &Path) -> Result<Self, PolicyError> {
+        if !path.exists() {
+            warn!(path = %path.display(), "policy file missing; loading built-in defaults");
+            return Ok(Self::default());
+        }
+
+        let text = fs::read_to_string(path).map_err(|source| PolicyError::Read {
+            path: path.into(),
+            source,
+        })?;
+        let raw: RawPolicy = yaml_serde::from_str(&text).map_err(|source| PolicyError::Parse {
+            path: path.into(),
+            source,
+        })?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: RawPolicy) -> Result<Self, PolicyError> {
+        validate_raw_policy(&raw)?;
+
+        let RawPolicy {
+            agent,
+            exec,
+            allowed_commands,
+            services: raw_services,
+            locations: raw_locations,
+            playbooks,
+            _hub_url: _,
+            _log: _,
+            upload_base,
+            security,
+            file_ops,
+            local_apis,
+            tooling,
+            disabled_ops,
+            exec_strict,
+        } = raw;
+        let RawAgent {
+            hostname_label,
+            preferred_profile,
+            _response_timestamp_interval_seconds: _,
+        } = agent;
+        let RawSecurity {
+            trusted_fetch_hosts,
+            file_url_timeout_seconds,
+        } = security;
+        let RawFileOps {
+            paths,
+            allowed_read_paths,
+            max_read_bytes,
+            max_list_entries,
+            max_search_results,
+        } = file_ops;
+
+        let locations = parse_locations(raw_locations)?;
+        let services = parse_services(raw_services);
+        let file_ops_paths = parse_file_ops_paths(paths, allowed_read_paths)?;
+        let preferred_profile = parse_preferred_profile(preferred_profile)?;
+        let upload_base =
+            upload_base.unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/uploads"));
         let upload_base = soft_canonicalize(&upload_base).unwrap_or(upload_base);
-
-        let tooling = Tooling {
-            search_path: raw
-                .tooling
-                .path
-                .unwrap_or_else(|| Tooling::default().search_path),
-            executables: raw.tooling.executables,
-            uv_python: if raw.tooling.uv_python.trim().is_empty() {
-                "3".into()
-            } else {
-                raw.tooling.uv_python
-            },
-            forbid_direct_python: raw.tooling.forbid_direct_python,
-        };
+        let tooling = parse_tooling(tooling);
 
         let policy = Self {
-            exec_strict: raw.exec_strict,
-            exec_enforce_allowlist: raw.exec.enforce_allowlist || raw.exec_strict,
-            disabled_ops: raw
-                .disabled_ops
+            exec_strict,
+            exec_enforce_allowlist: exec.enforce_allowlist || exec_strict,
+            disabled_ops: disabled_ops
                 .into_iter()
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
                 .collect(),
-            allowed_commands: raw.allowed_commands,
+            allowed_commands,
             services,
-            playbooks: raw.playbooks,
-            hostname_label: raw.agent.hostname_label,
+            playbooks,
+            hostname_label,
             preferred_profile,
-            exec_timeout_default: raw.exec.timeout_default,
-            exec_timeout_max: raw.exec.timeout_max,
-            exec_capture_max_bytes: raw.exec.capture_max_bytes,
+            exec_timeout_default: exec.timeout_default,
+            exec_timeout_max: exec.timeout_max,
+            exec_capture_max_bytes: exec.capture_max_bytes,
             upload_base,
-            trusted_fetch_hosts: raw.security.trusted_fetch_hosts,
-            file_url_timeout_seconds: raw.security.file_url_timeout_seconds,
+            trusted_fetch_hosts,
+            file_url_timeout_seconds,
             file_ops_paths,
-            file_ops_max_read_bytes: raw.file_ops.max_read_bytes,
-            file_ops_max_list_entries: raw.file_ops.max_list_entries,
-            file_ops_max_search_results: raw.file_ops.max_search_results,
-            local_apis: raw.local_apis,
+            file_ops_max_read_bytes: max_read_bytes,
+            file_ops_max_list_entries: max_list_entries,
+            file_ops_max_search_results: max_search_results,
+            local_apis,
             locations,
             tooling,
         };

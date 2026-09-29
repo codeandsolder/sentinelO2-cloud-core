@@ -165,17 +165,104 @@ impl CoreDispatcher {
         }
     }
 
-    fn capabilities_result(&self, payload: &Map<String, Value>) -> HandlerResult {
-        let detail = crate::progressive_help::capabilities_detail(payload)?;
+    fn capability_ops(&self) -> Vec<String> {
         let mut ops = self
             .capabilities()
             .into_iter()
             .filter(|name| name != "opaque_ref")
             .collect::<Vec<_>>();
         ops.sort();
+        ops
+    }
 
-        let services = self
-            .policy
+    fn capabilities_summary(&self, ops: Vec<String>) -> BTreeMap<String, Value> {
+        let location_count = self.policy.locations.len()
+            + usize::from(!self.policy.locations.contains_key("config"));
+        BTreeMap::from([
+            ("agent".into(), Value::String("sentinelx-cloud-core".into())),
+            ("version".into(), Value::String(self.agent_version.clone())),
+            (
+                "host".into(),
+                json!({
+                    "hostname": host::hostname(),
+                    "label": self.policy.hostname_label,
+                    "kernel": host::kernel(),
+                    "arch": std::env::consts::ARCH,
+                }),
+            ),
+            (
+                "ops_supported".into(),
+                Value::Array(ops.into_iter().map(Value::String).collect()),
+            ),
+            (
+                "limits".into(),
+                json!({
+                    "exec_timeout_default": self.policy.exec_timeout_default,
+                    "exec_timeout_max": self.policy.exec_timeout_max,
+                    "exec_capture_max_bytes": self.policy.exec_capture_max_bytes,
+                    "exec_enforce_allowlist": self.policy.exec_enforce_allowlist,
+                }),
+            ),
+            (
+                "upload_base".into(),
+                Value::String(self.policy.upload_base.display().to_string()),
+            ),
+            (
+                "file_ops_limits".into(),
+                json!({
+                    "max_read_bytes": self.policy.file_ops_max_read_bytes,
+                    "max_list_entries": self.policy.file_ops_max_list_entries,
+                    "max_search_results": self.policy.file_ops_max_search_results,
+                }),
+            ),
+            (
+                "policy_summary".into(),
+                json!({
+                    "allowed_commands": self.policy.allowed_commands.len(),
+                    "services": self.policy.services.len(),
+                    "locations": location_count,
+                    "playbooks": self.policy.playbooks.len(),
+                    "file_ops_paths": self.policy.file_ops_paths.len(),
+                    "writable_paths": self
+                        .policy
+                        .file_ops_paths
+                        .iter()
+                        .filter(|entry| entry.access == crate::policy::FileAccess::ReadWrite)
+                        .count(),
+                    "trusted_fetch_hosts": self.policy.trusted_fetch_hosts.len(),
+                }),
+            ),
+            (
+                "query_contract".into(),
+                json!({
+                    "help": ["topic", "path", "playbook", "offset", "limit"],
+                    "capabilities_detail": ["summary", "full"],
+                    "max_page_limit": 100,
+                    "legacy_empty_payload": "full",
+                }),
+            ),
+            (
+                "next".into(),
+                json!({
+                    "help_index": {
+                        "backend_operation": "help",
+                        "payload": {"topic": "index"},
+                    },
+                    "playbook": {
+                        "backend_operation": "help",
+                        "payload": {"playbook": "<name>"},
+                    },
+                    "full_capabilities": {
+                        "backend_operation": "capabilities",
+                        "payload": {"detail": "full"},
+                    },
+                }),
+            ),
+        ])
+    }
+
+    fn capability_services(&self) -> Map<String, Value> {
+        self.policy
             .services
             .iter()
             .map(|(name, spec)| {
@@ -190,8 +277,10 @@ impl CoreDispatcher {
                     }),
                 )
             })
-            .collect::<Map<String, Value>>();
+            .collect()
+    }
 
+    fn capability_paths(&self) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
         let paths = self
             .policy
             .file_ops_paths
@@ -219,95 +308,11 @@ impl CoreDispatcher {
             .filter(|entry| entry.access == crate::policy::FileAccess::ReadWrite)
             .map(|entry| Value::String(entry.path.display().to_string()))
             .collect::<Vec<_>>();
+        (paths, readable, writable)
+    }
 
-        if detail == "summary" {
-            let location_count = self.policy.locations.len()
-                + usize::from(!self.policy.locations.contains_key("config"));
-            return Ok(BTreeMap::from([
-                ("agent".into(), Value::String("sentinelx-cloud-core".into())),
-                ("version".into(), Value::String(self.agent_version.clone())),
-                (
-                    "host".into(),
-                    json!({
-                        "hostname": host::hostname(),
-                        "label": self.policy.hostname_label,
-                        "kernel": host::kernel(),
-                        "arch": std::env::consts::ARCH,
-                    }),
-                ),
-                (
-                    "ops_supported".into(),
-                    Value::Array(ops.into_iter().map(Value::String).collect()),
-                ),
-                (
-                    "limits".into(),
-                    json!({
-                        "exec_timeout_default": self.policy.exec_timeout_default,
-                        "exec_timeout_max": self.policy.exec_timeout_max,
-                        "exec_capture_max_bytes": self.policy.exec_capture_max_bytes,
-                        "exec_enforce_allowlist": self.policy.exec_enforce_allowlist,
-                    }),
-                ),
-                (
-                    "upload_base".into(),
-                    Value::String(self.policy.upload_base.display().to_string()),
-                ),
-                (
-                    "file_ops_limits".into(),
-                    json!({
-                        "max_read_bytes": self.policy.file_ops_max_read_bytes,
-                        "max_list_entries": self.policy.file_ops_max_list_entries,
-                        "max_search_results": self.policy.file_ops_max_search_results,
-                    }),
-                ),
-                (
-                    "policy_summary".into(),
-                    json!({
-                        "allowed_commands": self.policy.allowed_commands.len(),
-                        "services": self.policy.services.len(),
-                        "locations": location_count,
-                        "playbooks": self.policy.playbooks.len(),
-                        "file_ops_paths": self.policy.file_ops_paths.len(),
-                        "writable_paths": self
-                            .policy
-                            .file_ops_paths
-                            .iter()
-                            .filter(|entry| entry.access == crate::policy::FileAccess::ReadWrite)
-                            .count(),
-                        "trusted_fetch_hosts": self.policy.trusted_fetch_hosts.len(),
-                    }),
-                ),
-                (
-                    "query_contract".into(),
-                    json!({
-                        "help": ["topic", "path", "playbook", "offset", "limit"],
-                        "capabilities_detail": ["summary", "full"],
-                        "max_page_limit": 100,
-                        "legacy_empty_payload": "full",
-                    }),
-                ),
-                (
-                    "next".into(),
-                    json!({
-                        "help_index": {
-                            "backend_operation": "help",
-                            "payload": {"topic": "index"},
-                        },
-                        "playbook": {
-                            "backend_operation": "help",
-                            "payload": {"playbook": "<name>"},
-                        },
-                        "full_capabilities": {
-                            "backend_operation": "capabilities",
-                            "payload": {"detail": "full"},
-                        },
-                    }),
-                ),
-            ]));
-        }
-
-        let playbooks = self
-            .policy
+    fn capability_playbooks(&self) -> Result<Map<String, Value>, HandlerError> {
+        self.policy
             .playbooks
             .iter()
             .map(|(name, value)| {
@@ -320,8 +325,10 @@ impl CoreDispatcher {
                         )
                     })
             })
-            .collect::<Result<Map<String, Value>, HandlerError>>()?;
+            .collect()
+    }
 
+    fn capability_locations(&self) -> Result<Map<String, Value>, HandlerError> {
         let mut locations = self
             .policy
             .locations
@@ -343,6 +350,14 @@ impl CoreDispatcher {
                 "description": "The agent's active config.yaml.",
             })
         });
+        Ok(locations)
+    }
+
+    fn capabilities_full(&self, ops: Vec<String>) -> HandlerResult {
+        let services = self.capability_services();
+        let (paths, readable, writable) = self.capability_paths();
+        let playbooks = self.capability_playbooks()?;
+        let locations = self.capability_locations()?;
 
         Ok(BTreeMap::from([
             ("agent".into(), Value::String("sentinelx-cloud-core".into())),
@@ -437,6 +452,16 @@ impl CoreDispatcher {
                 Value::String(self.config_path.display().to_string()),
             ),
         ]))
+    }
+
+    fn capabilities_result(&self, payload: &Map<String, Value>) -> HandlerResult {
+        let detail = crate::progressive_help::capabilities_detail(payload)?;
+        let ops = self.capability_ops();
+        if detail == "summary" {
+            Ok(self.capabilities_summary(ops))
+        } else {
+            self.capabilities_full(ops)
+        }
     }
 
     fn help_ops_live(&self, ops: &[Op]) -> bool {
@@ -578,30 +603,8 @@ impl CoreDispatcher {
         ])
     }
 
-    fn help(&self, payload: &Map<String, Value>) -> HandlerResult {
-        let paths = &self.policy.file_ops_paths;
-        let writable = paths
-            .iter()
-            .filter(|entry| entry.access == crate::policy::FileAccess::ReadWrite)
-            .count();
-        let playbook_names = self.policy.playbooks.keys().cloned().collect::<Vec<_>>();
-
-        let full = Map::from_iter([
-            ("agent".into(), Value::String("sentinelx-cloud-core".into())),
-            ("version".into(), Value::String(self.agent_version.clone())),
-            (
-                "host_label".into(),
-                self.policy
-                    .hostname_label
-                    .clone()
-                    .map_or(Value::Null, Value::String),
-            ),
-            (
-                "summary".into(),
-                Value::String(
-                    "SentinelX provides policy-gated, auditable remote host operations over an authenticated outbound connection. The host policy and OS permissions are independent gates.".into(),
-                ),
-            ),
+    fn help_static_sections() -> Map<String, Value> {
+        Map::from_iter([
             (
                 "security_model".into(),
                 json!({
@@ -623,20 +626,73 @@ impl CoreDispatcher {
                 ]),
             ),
             (
-                "navigation".into(),
-                Value::Object(self.help_navigation()),
-            ),
-            (
-                "extending_access".into(),
-                Value::Object(self.help_extending_access()),
-            ),
-            (
                 "managing_hosts".into(),
                 json!({
                     "add_a_host": "Install and enroll the SentinelX agent on the additional host; it joins the same account.",
                     "update_this_agent": "Use the repository/installer maintenance path for the installed implementation, then restart the agent.",
                     "targeting": "With multiple hosts, pass host_id on each operation or set a default host in the Hub integration.",
                 }),
+            ),
+            (
+                "examples".into(),
+                json!([
+                    "Diagnose why a service is failing and show the evidence before changing it.",
+                    "Check disk usage and identify what is consuming space.",
+                    "Review a bounded slice of a log for suspicious events.",
+                    "Restart an allowlisted service and confirm it returned healthy.",
+                    "Explain which policy entry is needed for a blocked operation.",
+                ]),
+            ),
+            (
+                "resources".into(),
+                json!({
+                    "dashboard": "https://mcp.sentinelx.app/dashboard",
+                    "upstream": "https://github.com/pensados/sentinelx-cloud-core",
+                    "compatibility_fork": "https://github.com/codeandsolder/sentinelO2-cloud-core",
+                    "issues": "https://github.com/codeandsolder/sentinelO2-cloud-core/issues",
+                }),
+            ),
+            (
+                "about".into(),
+                json!({
+                    "project": "SentinelO2 is a Rust compatibility reimplementation of the SentinelX host agent.",
+                    "scope": "Match the hosted SentinelX protocol and Linux feature set while fixing implementation bugs rather than reproducing them.",
+                }),
+            ),
+        ])
+    }
+
+    fn help_document(&self) -> Map<String, Value> {
+        let paths = &self.policy.file_ops_paths;
+        let writable = paths
+            .iter()
+            .filter(|entry| entry.access == crate::policy::FileAccess::ReadWrite)
+            .count();
+        let playbook_names = self.policy.playbooks.keys().cloned().collect::<Vec<_>>();
+        let mut full = Self::help_static_sections();
+        full.extend([
+            ("agent".into(), Value::String("sentinelx-cloud-core".into())),
+            ("version".into(), Value::String(self.agent_version.clone())),
+            (
+                "host_label".into(),
+                self.policy
+                    .hostname_label
+                    .clone()
+                    .map_or(Value::Null, Value::String),
+            ),
+            (
+                "summary".into(),
+                Value::String(
+                    "SentinelX provides policy-gated, auditable remote host operations over an authenticated outbound connection. The host policy and OS permissions are independent gates.".into(),
+                ),
+            ),
+            (
+                "navigation".into(),
+                Value::Object(self.help_navigation()),
+            ),
+            (
+                "extending_access".into(),
+                Value::Object(self.help_extending_access()),
             ),
             (
                 "playbooks".into(),
@@ -660,40 +716,21 @@ impl CoreDispatcher {
                 }),
             ),
             (
-                "examples".into(),
-                json!([
-                    "Diagnose why a service is failing and show the evidence before changing it.",
-                    "Check disk usage and identify what is consuming space.",
-                    "Review a bounded slice of a log for suspicious events.",
-                    "Restart an allowlisted service and confirm it returned healthy.",
-                    "Explain which policy entry is needed for a blocked operation.",
-                ]),
-            ),
-            (
                 "getting_started".into(),
                 Value::String(
                     "Start with capabilities for the effective policy and state for current host status. If something is blocked, use the returned error to determine whether policy or OS permissions need attention.".into(),
                 ),
             ),
-            (
-                "resources".into(),
-                json!({
-                    "dashboard": "https://mcp.sentinelx.app/dashboard",
-                    "upstream": "https://github.com/pensados/sentinelx-cloud-core",
-                    "compatibility_fork": "https://github.com/codeandsolder/sentinelO2-cloud-core",
-                    "issues": "https://github.com/codeandsolder/sentinelO2-cloud-core/issues",
-                }),
-            ),
-            (
-                "about".into(),
-                json!({
-                    "project": "SentinelO2 is a Rust compatibility reimplementation of the SentinelX host agent.",
-                    "scope": "Match the hosted SentinelX protocol and Linux feature set while fixing implementation bugs rather than reproducing them.",
-                }),
-            ),
         ]);
+        full
+    }
 
-        crate::progressive_help::select_help_response(payload, full, &self.policy.playbooks)
+    fn help(&self, payload: &Map<String, Value>) -> HandlerResult {
+        crate::progressive_help::select_help_response(
+            payload,
+            self.help_document(),
+            &self.policy.playbooks,
+        )
     }
 
     async fn exec(&self, payload: &Map<String, Value>) -> HandlerResult {
