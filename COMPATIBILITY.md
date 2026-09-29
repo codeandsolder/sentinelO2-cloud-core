@@ -57,7 +57,7 @@ Reference surfaces:
 - Official response bounding is checked against Python-generated fixtures and
   applied to foreground and background responses.
 - 0.18 `_sx_timing` metadata is attached to ordinary foreground results for Hub-side timing; the hosted Hub consumes and strips it before caller-visible tool output.
-- Sentinel0² additionally attaches caller-visible `sentinel0_response_at` (RFC 3339 UTC) inside successful foreground `result` maps. Keeping this additive extension inside `result` preserves the strict v1 response envelope while giving chat/model clients a clock sample on every normal tool return.
+- Sentinel0² additionally attaches caller-visible `sentinel0_response_at` inside successful foreground `result` maps. The value is compact UTC `HH:MM:SS`, emitted at most once per WebSocket session interval (default 60 s, configurable as `agent.response_timestamp_interval_seconds`). The first eligible response in a new session is stamped. Keeping this additive extension inside `result` preserves the strict v1 response envelope while giving chat/model clients periodic clock samples without paying the token cost on every tool return.
 
 ### Host configuration and operations
 
