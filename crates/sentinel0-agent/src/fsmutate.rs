@@ -336,10 +336,10 @@ fn staged_copy(src: &Path, dst: &Path, overwrite: bool) -> io::Result<Option<Str
         Ok(warning) => Ok(warning),
         Err(error) => {
             let cleanup = cleanup_entry(&staged, "commit failed");
-            Err(io::Error::other(match cleanup {
-                Some(cleanup) => format!("{error}; {cleanup}"),
-                None => error.to_string(),
-            }))
+            Err(io::Error::other(cleanup.map_or_else(
+                || error.to_string(),
+                |cleanup| format!("{error}; {cleanup}"),
+            )))
         }
     }
 }

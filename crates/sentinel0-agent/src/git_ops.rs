@@ -376,9 +376,17 @@ fn parse_name_status(raw: &[u8], keep: usize) -> (Vec<(String, String, Option<St
     (out, total)
 }
 
-async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    let requested = require_str(payload, "path")?;
-    let root = git_root(policy, requested, false).await?;
+struct DiffOptions<'a> {
+    base_ref: &'a str,
+    staged: bool,
+    unstaged: bool,
+    include_untracked: bool,
+    context: u64,
+    max_files: usize,
+    max_patch: usize,
+}
+
+fn diff_options(payload: &Map<String, Value>) -> Result<DiffOptions<'_>, HandlerError> {
     let base_ref = payload
         .get("base_ref")
         .and_then(Value::as_str)
@@ -412,17 +420,60 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .unwrap_or(50)
         .clamp(1, 50);
     let max_files = usize::try_from(max_files).unwrap_or(50);
+    let max_patch_limit = u64::try_from(MAX_DIFF_PATCH).unwrap_or(u64::MAX);
     let max_patch = payload
         .get("max_patch_bytes")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| u64::try_from(MAX_DIFF_PATCH).unwrap_or(u64::MAX))
-        .clamp(1024, u64::try_from(MAX_DIFF_PATCH).unwrap_or(u64::MAX));
+        .unwrap_or(max_patch_limit)
+        .clamp(1024, max_patch_limit);
     let max_patch = usize::try_from(max_patch).unwrap_or(MAX_DIFF_PATCH);
+    Ok(DiffOptions {
+        base_ref,
+        staged,
+        unstaged,
+        include_untracked,
+        context,
+        max_files,
+        max_patch,
+    })
+}
 
-    let selector = if staged && unstaged {
-        vec!["diff".into(), base_ref.into()]
-    } else if staged {
-        vec!["diff".into(), "--cached".into(), base_ref.into()]
+async fn collect_untracked(
+    policy: &Policy,
+    root: &Path,
+    max_files: usize,
+    include: bool,
+) -> Result<(Vec<String>, usize), HandlerError> {
+    if !include {
+        return Ok((Vec::new(), 0));
+    }
+    let args = vec![
+        "ls-files".into(),
+        "--others".into(),
+        "--exclude-standard".into(),
+        "-z".into(),
+    ];
+    let (_, out, _) = run_git(policy, root, &args, None, LOCAL_TIMEOUT).await?;
+    let decoded = String::from_utf8_lossy(&out);
+    let mut kept = Vec::with_capacity(max_files);
+    let mut total = 0_usize;
+    for path in decoded.split(char::from(0)).filter(|path| !path.is_empty()) {
+        total += 1;
+        if kept.len() < max_files {
+            kept.push(path.to_owned());
+        }
+    }
+    Ok((kept, total))
+}
+
+async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+    let requested = require_str(payload, "path")?;
+    let root = git_root(policy, requested, false).await?;
+    let options = diff_options(payload)?;
+    let selector = if options.staged && options.unstaged {
+        vec!["diff".into(), options.base_ref.into()]
+    } else if options.staged {
+        vec!["diff".into(), "--cached".into(), options.base_ref.into()]
     } else {
         vec!["diff".into()]
     };
@@ -435,37 +486,18 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let mut args = selector.clone();
     args.extend(["--no-ext-diff".into(), "--name-status".into(), "-z".into()]);
     let (_, names, _) = run_git(policy, &root, &args, None, LOCAL_TIMEOUT).await?;
-    let (changed, changed_total) = parse_name_status(&names, max_files);
+    let (changed, changed_total) = parse_name_status(&names, options.max_files);
 
-    let (untracked, untracked_total) = if include_untracked {
-        let args = vec![
-            "ls-files".into(),
-            "--others".into(),
-            "--exclude-standard".into(),
-            "-z".into(),
-        ];
-        let (_, out, _) = run_git(policy, &root, &args, None, LOCAL_TIMEOUT).await?;
-        let decoded = String::from_utf8_lossy(&out);
-        let mut kept = Vec::with_capacity(max_files);
-        let mut total = 0_usize;
-        for path in decoded.split(char::from(0)).filter(|path| !path.is_empty()) {
-            total += 1;
-            if kept.len() < max_files {
-                kept.push(path.to_owned());
-            }
-        }
-        (kept, total)
-    } else {
-        (Vec::new(), 0)
-    };
+    let (untracked, untracked_total) =
+        collect_untracked(policy, &root, options.max_files, options.include_untracked).await?;
     let mut entries = Vec::new();
-    let mut truncated_files = changed_total > max_files;
+    let mut truncated_files = changed_total > options.max_files;
     let mut truncated_patch = false;
     for (path, status, old_path) in changed {
         let mut patch_args = selector.clone();
         patch_args.extend([
             "--no-ext-diff".into(),
-            format!("--unified={context}"),
+            format!("--unified={}", options.context),
             "--".into(),
         ]);
         if let Some(old) = old_path.as_ref() {
@@ -477,7 +509,8 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         // it exceeds that limit: retain at most max_patch + 1 bytes while
         // continuing to drain git to completion.
         let (_, patch, _, patch_exceeded) =
-            run_git_capped_stdout(policy, &root, &patch_args, max_patch, LOCAL_TIMEOUT).await?;
+            run_git_capped_stdout(policy, &root, &patch_args, options.max_patch, LOCAL_TIMEOUT)
+                .await?;
         let patch_value = if patch_exceeded {
             truncated_patch = true;
             Value::Null
@@ -495,7 +528,7 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         entries.push(Value::Object(entry));
     }
 
-    let remaining_slots = max_files.saturating_sub(entries.len());
+    let remaining_slots = options.max_files.saturating_sub(entries.len());
     for path in untracked.iter().take(remaining_slots) {
         entries.push(json!({
             "path": path,
@@ -514,7 +547,7 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("ok".into(), Value::Bool(true)),
         ("version".into(), Value::from(1)),
         ("root".into(), Value::String(root.display().to_string())),
-        ("base_ref".into(), Value::String(base_ref.into())),
+        ("base_ref".into(), Value::String(options.base_ref.into())),
         (
             "summary".into(),
             json!({
@@ -590,6 +623,38 @@ fn validate_patch_paths(
     Ok(())
 }
 
+async fn patch_numstat(
+    policy: &Policy,
+    root: &Path,
+    patch: &str,
+) -> Result<(bool, Vec<u8>), HandlerError> {
+    let invoke = |extra: Vec<String>| {
+        let mut args = vec!["apply".into()];
+        args.extend(extra);
+        args.extend(["--no-3way".into(), "-".into()]);
+        args
+    };
+    let num_args = invoke(vec!["--numstat".into()]);
+    let (mut rc, mut out, err) = run_git(
+        policy,
+        root,
+        &num_args,
+        Some(patch.as_bytes()),
+        LOCAL_TIMEOUT,
+    )
+    .await?;
+    let mut recounted = false;
+    if rc != 0 && String::from_utf8_lossy(&err).contains("corrupt patch") {
+        let args = invoke(vec!["--recount".into(), "--numstat".into()]);
+        let (retry_rc, retry_out, _) =
+            run_git(policy, root, &args, Some(patch.as_bytes()), LOCAL_TIMEOUT).await?;
+        rc = retry_rc;
+        out = retry_out;
+        recounted = rc == 0;
+    }
+    Ok((recounted, out))
+}
+
 async fn apply_patch(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let requested = payload
         .get("root")
@@ -618,35 +683,8 @@ async fn apply_patch(policy: &Policy, payload: &Map<String, Value>) -> HandlerRe
     }
     validate_patch_paths(policy, &root, &paths)?;
 
-    let mut recounted = false;
-    let invoke = |extra: Vec<String>| {
-        let mut args = vec!["apply".into()];
-        args.extend(extra);
-        args.extend(["--no-3way".into(), "-".into()]);
-        args
-    };
-
-    let num_args = invoke(vec!["--numstat".into()]);
-    let (mut ns_rc, mut ns_out, ns_err) = run_git(
-        policy,
-        &root,
-        &num_args,
-        Some(patch.as_bytes()),
-        LOCAL_TIMEOUT,
-    )
-    .await?;
-    if ns_rc != 0 && String::from_utf8_lossy(&ns_err).contains("corrupt patch") {
-        let mut args = vec!["apply".into(), "--recount".into(), "--numstat".into()];
-        args.extend(["--no-3way".into(), "-".into()]);
-        let (retry_rc, retry_out, _) =
-            run_git(policy, &root, &args, Some(patch.as_bytes()), LOCAL_TIMEOUT).await?;
-        ns_rc = retry_rc;
-        ns_out = retry_out;
-        if ns_rc == 0 {
-            recounted = true;
-        }
-    }
-    let (_, insertions, deletions) = parse_numstat(&ns_out);
+    let (recounted, numstat) = patch_numstat(policy, &root, patch).await?;
+    let (_, insertions, deletions) = parse_numstat(&numstat);
     let files = patch_paths(patch).len() as u64;
 
     let mut check_args = vec!["apply".into()];
@@ -780,10 +818,14 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
             "clone destination must be under a file_ops rw path",
         ));
     };
-    let destination_nonempty = match target.read_dir() {
-        Ok(mut entries) => entries.next().is_some(),
-        Err(_) => true,
-    };
+    fn directory_nonempty_or_unreadable(path: &Path) -> bool {
+        let Ok(mut entries) = path.read_dir() else {
+            return true;
+        };
+        entries.next().is_some()
+    }
+
+    let destination_nonempty = directory_nonempty_or_unreadable(&target);
     if target.exists() && destination_nonempty {
         return Err(HandlerError::new(
             "dest_not_empty",

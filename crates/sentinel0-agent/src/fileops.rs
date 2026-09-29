@@ -540,7 +540,7 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         let rel = entry
             .path()
             .strip_prefix(&root)
-            .unwrap_or(entry.path())
+            .unwrap_or_else(|_| entry.path())
             .to_string_lossy()
             .into_owned();
         entries.push(serde_json::json!({

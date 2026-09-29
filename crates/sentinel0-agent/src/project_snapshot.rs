@@ -299,6 +299,24 @@ fn sum_numstat(raw: &[u8]) -> (u64, u64, u64) {
     (files, ins, dels)
 }
 
+fn parse_recent_commits(raw: &[u8]) -> Vec<Value> {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('\x1f').collect::<Vec<_>>();
+            (fields.len() == 4).then(|| {
+                json!({
+                    "hash": fields[0],
+                    "subject": fields[1].chars().take(120).collect::<String>(),
+                    "author": fields[2],
+                    "date": fields[3],
+                })
+            })
+        })
+        .take(MAX_RECENT_COMMITS)
+        .collect()
+}
+
 async fn git_snapshot(
     policy: &Policy,
     root: &Path,
@@ -349,21 +367,7 @@ async fn git_snapshot(
     if log_rc != 0 && !status.get("head").is_some_and(serde_json::Value::is_null) {
         require_git_success("log", log_rc, &log_err)?;
     }
-    let commits = String::from_utf8_lossy(&log_raw)
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split('\x1f').collect::<Vec<_>>();
-            (fields.len() == 4).then(|| {
-                json!({
-                    "hash": fields[0],
-                    "subject": fields[1].chars().take(120).collect::<String>(),
-                    "author": fields[2],
-                    "date": fields[3],
-                })
-            })
-        })
-        .take(MAX_RECENT_COMMITS)
-        .collect::<Vec<_>>();
+    let commits = parse_recent_commits(&log_raw);
 
     Ok(BTreeMap::from([
         ("ok".into(), Value::Bool(true)),

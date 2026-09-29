@@ -414,11 +414,10 @@ fn run_validator(
     let stdout_reader = std::thread::spawn(move || read_bounded_sync(stdout, per_stream));
     let stderr_reader = std::thread::spawn(move || read_bounded_sync(stderr, per_stream));
 
-    let status = if let Some(status) = child.wait_timeout(VALIDATOR_TIMEOUT).map_err(|e| {
+    let Some(status) = child.wait_timeout(VALIDATOR_TIMEOUT).map_err(|e| {
         HandlerError::new("validation_failed", format!("validator wait failed: {e}"))
-    })? {
-        status
-    } else {
+    })?
+    else {
         let mut cleanup_error = None;
         #[cfg(unix)]
         {
