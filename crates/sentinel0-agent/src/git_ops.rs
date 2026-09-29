@@ -780,11 +780,11 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
             "clone destination must be under a file_ops rw path",
         ));
     };
-    if target.exists()
-        && target
-            .read_dir()
-            .is_err_or(|mut iter| iter.next().is_some())
-    {
+    let destination_nonempty = match target.read_dir() {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => true,
+    };
+    if target.exists() && destination_nonempty {
         return Err(HandlerError::new(
             "dest_not_empty",
             "clone refuses to write into a non-empty destination",

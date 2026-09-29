@@ -136,11 +136,11 @@ fn interpret_escapes(input: &str) -> String {
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
+            Some('\\') | None => out.push('\\'),
             Some(other) => {
                 out.push('\\');
                 out.push(other);
             }
-            Some('\\') | None => out.push('\\'),
         }
     }
     out
