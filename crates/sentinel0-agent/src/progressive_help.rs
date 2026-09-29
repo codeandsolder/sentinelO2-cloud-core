@@ -47,7 +47,10 @@ const TOPICS: &[(&str, &str, &str)] = &[
 ];
 
 fn query(op: &str, payload: Value) -> Value {
-    json!({"backend_operation": op, "payload": payload})
+    Value::Object(Map::from_iter([
+        ("backend_operation".into(), Value::String(op.into())),
+        ("payload".into(), payload),
+    ]))
 }
 
 fn string_field(payload: &Map<String, Value>, key: &str) -> Result<Option<String>, HandlerError> {
@@ -178,15 +181,21 @@ fn lookup(root: &Value, path: &str) -> Result<Value, HandlerError> {
 }
 
 fn neutralize(value: Value) -> (Value, BTreeMap<String, String>) {
-    fn pattern() -> &'static Regex {
-        static PATTERN: OnceLock<Regex> = OnceLock::new();
-        PATTERN.get_or_init(|| Regex::new(r"\bsentinel_([a-z][a-z0-9_]*)\b").expect("valid regex"))
+    fn pattern() -> Option<&'static Regex> {
+        static PATTERN: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+        PATTERN
+            .get_or_init(|| Regex::new(r"\bsentinel_([a-z][a-z0-9_]*)\b"))
+            .as_ref()
+            .ok()
     }
 
     fn visit(value: Value, refs: &mut BTreeMap<String, String>) -> Value {
         match value {
             Value::String(text) => {
-                let replaced = pattern()
+                let Some(pattern) = pattern() else {
+                    return Value::String(text);
+                };
+                let replaced = pattern
                     .replace_all(&text, |captures: &regex::Captures<'_>| {
                         let source = captures.get(0).map_or("", |value| value.as_str());
                         let operation = captures.get(1).map_or("", |value| value.as_str());
@@ -213,12 +222,17 @@ fn neutralize(value: Value) -> (Value, BTreeMap<String, String>) {
 }
 
 fn presentation(refs: BTreeMap<String, String>) -> Option<Value> {
-    (!refs.is_empty()).then(|| {
-        json!({
-            "tool_reference_map": refs,
-            "note": "Progressive guidance rewrites full-profile sentinel_* names as op:<name>. Route op:<name> through the active Hub profile.",
-        })
-    })
+    if refs.is_empty() {
+        return None;
+    }
+    let reference_map = refs
+        .into_iter()
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect::<Map<_, _>>();
+    Some(json!({
+        "tool_reference_map": reference_map,
+        "note": "Progressive guidance rewrites full-profile sentinel_* names as op:<name>. Route op:<name> through the active Hub profile.",
+    }))
 }
 
 fn base(full: &Map<String, Value>) -> BTreeMap<String, Value> {
@@ -256,6 +270,8 @@ fn project_selected(
     }
 }
 
+/// # Errors
+/// Returns an error when the requested capabilities detail level is invalid.
 pub fn capabilities_detail(payload: &Map<String, Value>) -> Result<&'static str, HandlerError> {
     let unknown = payload
         .keys()
@@ -279,6 +295,8 @@ pub fn capabilities_detail(payload: &Map<String, Value>) -> Result<&'static str,
     }
 }
 
+/// # Errors
+/// Returns an error when the requested help path or detail selection is invalid.
 pub fn select_help_response(
     payload: &Map<String, Value>,
     full: Map<String, Value>,

@@ -63,7 +63,7 @@ fn resolve(policy: &Policy, raw: &str) -> Result<PathBuf, HandlerError> {
     })
 }
 
-fn access_error(raw: &str, error: std::io::Error) -> HandlerError {
+fn access_error(raw: &str, error: &std::io::Error) -> HandlerError {
     match error.kind() {
         std::io::ErrorKind::NotFound => {
             HandlerError::new("not_found", format!("path does not exist: {raw:?}"))
@@ -390,10 +390,12 @@ fn scan_utf16(
     ))
 }
 
+/// # Errors
+/// Returns an error when the path is invalid, disallowed, unreadable, or the payload is malformed.
 pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let path = resolve(policy, raw)?;
-    let meta = fs::metadata(&path).map_err(|error| access_error(raw, error))?;
+    let meta = fs::metadata(&path).map_err(|error| access_error(raw, &error))?;
     if meta.is_dir() {
         return Err(HandlerError::new(
             "is_directory",
@@ -428,9 +430,9 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .map_err(|e| HandlerError::new("io_error", format!("cannot read {raw:?}: {e}")))?;
     probe.truncate(n);
 
-    let utf16_le = probe.starts_with(&[0xff, 0xfe]);
-    let utf16_be = probe.starts_with(&[0xfe, 0xff]);
-    if !utf16_le && !utf16_be && probe.contains(&0) {
+    let is_utf16_le = probe.starts_with(&[0xff, 0xfe]);
+    let is_utf16_be = probe.starts_with(&[0xfe, 0xff]);
+    if !is_utf16_le && !is_utf16_be && probe.contains(&0) {
         let preview = probe
             .iter()
             .take(256)
@@ -451,8 +453,8 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     }
 
     let (start, end) = range.unwrap_or((1, None));
-    let (content, total_lines, total_exact, truncated, last) = if utf16_le || utf16_be {
-        scan_utf16(&path, start, end, cap, utf16_le)?
+    let (content, total_lines, total_exact, truncated, last) = if is_utf16_le || is_utf16_be {
+        scan_utf16(&path, start, end, cap, is_utf16_le)?
     } else {
         scan_utf8(&path, start, end, cap)?
     };
@@ -463,7 +465,7 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         (
             "encoding".into(),
             Value::String(
-                if utf16_le || utf16_be {
+                if is_utf16_le || is_utf16_be {
                     "utf-16"
                 } else {
                     "utf-8"
@@ -491,10 +493,12 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     Ok(result)
 }
 
+/// # Errors
+/// Returns an error when the directory request is invalid, disallowed, or cannot be read.
 pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let root = resolve(policy, raw)?;
-    let meta = fs::metadata(&root).map_err(|error| access_error(raw, error))?;
+    let meta = fs::metadata(&root).map_err(|error| access_error(raw, &error))?;
     if !meta.is_dir() {
         return Err(HandlerError::new(
             "is_file",
@@ -578,6 +582,8 @@ fn skip_search_file(path: &Path) -> bool {
         .is_some_and(|ext| SKIP_EXTS.contains(&ext.as_str()))
 }
 
+/// # Errors
+/// Returns an error when the search request is invalid, disallowed, or cannot be executed.
 pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let needle = require_str(payload, "pattern")?;
@@ -626,7 +632,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         HandlerError::new("invalid_payload", message)
     })?;
 
-    let mut matches = Vec::new();
+    let mut search_matches = Vec::new();
     let mut files_searched = 0_u64;
     let mut search_errors = Vec::new();
     let mut search_error_count = 0_u64;
@@ -762,14 +768,14 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
                     .take_while(|(index, _)| *index < found.start())
                     .count()
                     + 1;
-                matches.push(serde_json::json!({
+                search_matches.push(serde_json::json!({
                     "file": rel.as_str(),
                     "line": line_number,
                     "column": column,
                     "byte_column": byte_column,
                     "text": preview,
                 }));
-                Ok(matches.len() < cap)
+                Ok(search_matches.len() < cap)
             }),
         );
         if let Err(error) = search_result {
@@ -781,7 +787,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             );
             continue;
         }
-        if matches.len() >= cap {
+        if search_matches.len() >= cap {
             truncated = true;
             break;
         }
@@ -791,7 +797,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("ok".into(), Value::Bool(true)),
         ("path".into(), Value::String(root.display().to_string())),
         ("pattern".into(), Value::String(needle.into())),
-        ("matches".into(), Value::Array(matches)),
+        ("matches".into(), Value::Array(search_matches)),
         ("files_searched".into(), Value::from(files_searched)),
         ("search_error_count".into(), Value::from(search_error_count)),
         ("search_errors".into(), Value::Array(search_errors)),
@@ -819,7 +825,7 @@ mod tests {
     fn permission_denied_is_not_reported_as_internal_io_error() {
         let error = access_error(
             "/restricted/tree",
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         assert_eq!(error.code, "permission_denied");
         assert!(error.message.contains("/restricted/tree"));
@@ -905,7 +911,7 @@ mod tests {
         payload.insert("file_glob".into(), Value::String("*.rs".into()));
         let result = search(&policy(dir.path()), &payload).unwrap();
         let matches = result["matches"].as_array().unwrap();
-        assert_eq!(matches.len(), 1);
+        assert_eq!(search_matches.len(), 1);
         assert_eq!(matches[0]["file"], "keep.rs");
         assert_eq!(result["files_searched"], 1);
     }

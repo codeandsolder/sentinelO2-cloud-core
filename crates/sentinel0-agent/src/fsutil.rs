@@ -1,6 +1,8 @@
 use std::{io, path::Path};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// # Errors
+/// Returns an I/O error when the source cannot be renamed to the destination without replacement.
 pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
     use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
 
@@ -9,6 +11,8 @@ pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+/// # Errors
+/// Returns an I/O error when the source cannot be renamed to the destination without replacement.
 pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(dst) {
         Ok(_) => {

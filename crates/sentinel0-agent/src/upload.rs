@@ -261,6 +261,8 @@ async fn fetch_to(
     Ok((size, hex_bytes(hasher.finalize())))
 }
 
+/// # Errors
+/// Returns an error when the upload request is invalid, disallowed, cannot be fetched, or cannot be finalized safely.
 pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let target = require_str(payload, "target_path")?;
     let overwrite = payload
@@ -395,6 +397,8 @@ pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> Handl
     ]))
 }
 
+/// # Errors
+/// Returns an error when upload metadata is invalid or the staging area cannot be prepared.
 pub fn upload_init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let target = require_str(payload, "target_path")?;
     let overwrite = payload
@@ -462,6 +466,8 @@ pub fn upload_init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResu
     ]))
 }
 
+/// # Errors
+/// Returns an error when the transfer identifier or chunk is invalid, or the part cannot be written.
 pub fn write_transfer_part_at(
     upload_base: &Path,
     upload_id: &str,
@@ -487,6 +493,8 @@ pub fn write_transfer_part_at(
     Ok(data.len())
 }
 
+/// # Errors
+/// Returns an error when the transfer is invalid, disallowed, or the part cannot be written.
 pub fn write_transfer_part(
     policy: &Policy,
     upload_id: &str,
@@ -496,6 +504,8 @@ pub fn write_transfer_part(
     write_transfer_part_at(&policy.upload_base, upload_id, index, data)
 }
 
+/// # Errors
+/// Returns an error when the upload chunk payload is invalid or cannot be written.
 pub fn upload_chunk(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let id = require_str(payload, "upload_id")?;
     let index = payload
@@ -525,6 +535,8 @@ pub fn upload_chunk(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     ]))
 }
 
+/// # Errors
+/// Returns an error when the staged upload cannot be validated or finalized safely.
 pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let id = require_str(payload, "upload_id")?;
     let id = valid_upload_id(Some(&Value::String(id.into())))?;

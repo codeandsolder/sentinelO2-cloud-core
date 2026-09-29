@@ -836,8 +836,9 @@ async fn kill_and_reap_relay(
     #[cfg(unix)]
     if should_kill {
         if let Some(pid) = pid {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+            let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+            if let Err(error) =
+                nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
                 && error != nix::errno::Errno::ESRCH
             {
                 let message = format!("failed killing local-api relay process group: {error}");
@@ -1166,6 +1167,8 @@ async fn call_action(
     Ok(project(raw, &action.select))
 }
 
+/// # Errors
+/// Returns an error when the local API request is invalid, disallowed, times out, or fails.
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let endpoints = endpoints(policy)?;
     let operation = payload

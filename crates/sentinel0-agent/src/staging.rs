@@ -29,6 +29,8 @@ pub fn fallback_root() -> PathBuf {
         .join(STAGING_DIRNAME)
 }
 
+/// # Errors
+/// Returns an I/O error when a usable staging directory cannot be created or resolved.
 pub fn staging_root(upload_base: &Path) -> std::io::Result<PathBuf> {
     let primary = upload_base.join(STAGING_DIRNAME);
     match writable_dir(&primary) {

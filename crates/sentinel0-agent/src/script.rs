@@ -20,7 +20,7 @@ use tokio::{fs as async_fs, process::Command};
 const TIMEOUT_MIN: u64 = 1;
 const TIMEOUT_MAX: u64 = 600;
 
-fn staging_oserror(error: std::io::Error, path: &Path) -> HandlerError {
+fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
     match error.raw_os_error() {
         Some(code) if code == nix::libc::ENOSPC => HandlerError::new(
             "no_space",
@@ -193,7 +193,7 @@ fn build_command(
     if sudo {
         let sudo = policy.tooling.command("sudo").display().to_string();
         if let Some(cwd) = cwd {
-            let mut argv = vec![
+            let mut command_argv = vec![
                 sudo,
                 "-n".into(),
                 policy.tooling.command("bash").display().to_string(),
@@ -202,18 +202,20 @@ fn build_command(
                 "bash".into(),
                 cwd.into(),
             ];
-            argv.extend(inner);
-            (argv, None)
+            command_argv.extend(inner);
+            (command_argv, None)
         } else {
-            let mut argv = vec![sudo, "-n".into()];
-            argv.extend(inner);
-            (argv, None)
+            let mut command_argv = vec![sudo, "-n".into()];
+            command_argv.extend(inner);
+            (command_argv, None)
         }
     } else {
         (inner, cwd.map(PathBuf::from))
     }
 }
 
+/// # Errors
+/// Returns an error when the script request is invalid, disallowed, cannot be staged, or execution fails.
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let interpreter = require_str(payload, "interpreter")?;
     if !["bash", "python3", "powershell", "pwsh"].contains(&interpreter) {
@@ -291,11 +293,11 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         .map_err(|e| {
             HandlerError::new("internal_error", format!("staging setup task failed: {e}"))
         })?
-        .map_err(|e| staging_oserror(e, &upload_base_for_error))?;
+        .map_err(|e| staging_oserror(&e, &upload_base_for_error))?;
     let workdir = root.join(format!("script_job_{:016x}", rand::rng().random::<u64>()));
     async_fs::create_dir_all(&workdir)
         .await
-        .map_err(|e| staging_oserror(e, &workdir))?;
+        .map_err(|e| staging_oserror(&e, &workdir))?;
     let script_path = workdir.join(filename);
     if let Err(error) = async_fs::write(&script_path, content).await {
         let cleanup_error = if cleanup {
@@ -304,7 +306,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
             None
         };
         return Err(with_cleanup_detail(
-            staging_oserror(error, &script_path),
+            staging_oserror(&error, &script_path),
             cleanup_error,
         ));
     }
@@ -317,16 +319,17 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
             None
         };
         return Err(with_cleanup_detail(
-            staging_oserror(error, &script_path),
+            staging_oserror(&error, &script_path),
             cleanup_error,
         ));
     }
 
-    let (argv, spawn_cwd) = build_command(policy, interpreter, &script_path, &args, sudo, cwd);
+    let (command_argv, spawn_cwd) =
+        build_command(policy, interpreter, &script_path, &args, sudo, cwd);
     let started = Instant::now();
-    let mut command = Command::new(&argv[0]);
+    let mut command = Command::new(&command_argv[0]);
     command
-        .args(&argv[1..])
+        .args(&command_argv[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -414,10 +417,11 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     if let Some(pid) = pid {
-                        let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                        if let Err(kill_error) =
-                            nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                            && kill_error != nix::errno::Errno::ESRCH
+                        let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+                        if let Err(kill_error) = nix::sys::signal::killpg(
+                            process_group,
+                            nix::sys::signal::Signal::SIGKILL,
+                        ) && kill_error != nix::errno::Errno::ESRCH
                         {
                             let message = format!(
                                 "failed killing script after output-capture error: {kill_error}"
@@ -463,7 +467,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                     cwd,
                     cleanup,
                 },
-                argv.clone(),
+                command_argv.clone(),
                 merged_output(&captured),
                 (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
                 rc,
@@ -487,10 +491,16 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                     }
                 };
                 if child_is_live {
-                    let pgid = nix::unistd::Pid::from_raw(pid as i32);
+                    let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
                     if sudo {
                         let status = Command::new(policy.tooling.command("sudo"))
-                            .args(["-n", "kill", "-9", "--", &format!("-{}", pgid.as_raw())])
+                            .args([
+                                "-n",
+                                "kill",
+                                "-9",
+                                "--",
+                                &format!("-{}", process_group.as_raw()),
+                            ])
                             .env("PATH", policy.tooling.path_env()?)
                             .status()
                             .await;
@@ -499,7 +509,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                             Ok(status) => {
                                 let message = format!(
                                     "sudo kill of timed-out process group {} exited with {status}",
-                                    pgid.as_raw()
+                                    process_group.as_raw()
                                 );
                                 tracing::warn!(%message);
                                 cleanup_error = Some(message);
@@ -512,7 +522,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                             }
                         }
                     } else if let Err(error) =
-                        nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                        nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
                         && error != nix::errno::Errno::ESRCH
                     {
                         let message = format!("failed killing timed-out process group: {error}");
@@ -533,7 +543,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
                     cwd,
                     cleanup,
                 },
-                argv.clone(),
+                command_argv.clone(),
                 "⏱️ Timeout".into(),
                 (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
                 -1,
@@ -575,25 +585,25 @@ mod tests {
     fn staging_host_conditions_have_specific_error_codes() {
         let path = Path::new("/var/lib/sentinelx/uploads/.sentinelx_uploads/script_job_x");
         assert_eq!(
-            staging_oserror(std::io::Error::from_raw_os_error(nix::libc::ENOSPC), path).code,
+            staging_oserror(&std::io::Error::from_raw_os_error(nix::libc::ENOSPC), path).code,
             "no_space"
         );
         for code in [nix::libc::EACCES, nix::libc::EPERM] {
             assert_eq!(
-                staging_oserror(std::io::Error::from_raw_os_error(code), path).code,
+                staging_oserror(&std::io::Error::from_raw_os_error(code), path).code,
                 "permission_denied"
             );
         }
         assert_eq!(
-            staging_oserror(std::io::Error::from_raw_os_error(nix::libc::EROFS), path).code,
+            staging_oserror(&std::io::Error::from_raw_os_error(nix::libc::EROFS), path).code,
             "read_only_filesystem"
         );
         assert_eq!(
-            staging_oserror(std::io::Error::from_raw_os_error(nix::libc::EIO), path).code,
+            staging_oserror(&std::io::Error::from_raw_os_error(nix::libc::EIO), path).code,
             "staging_failed"
         );
         let message =
-            staging_oserror(std::io::Error::from_raw_os_error(nix::libc::ENOSPC), path).message;
+            staging_oserror(&std::io::Error::from_raw_os_error(nix::libc::ENOSPC), path).message;
         assert!(message.contains("host condition"));
         assert!(message.contains("unstable"));
         assert!(message.contains(&path.display().to_string()));

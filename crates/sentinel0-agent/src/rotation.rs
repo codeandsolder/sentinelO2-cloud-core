@@ -7,6 +7,7 @@ use base64::{
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
 };
 use nix::unistd::{AccessFlags, access};
+use num_traits::ToPrimitive;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -69,7 +70,11 @@ fn numeric_claim(claims: &Value, name: &str) -> Option<f64> {
 }
 
 fn now_seconds() -> f64 {
-    chrono::Utc::now().timestamp_millis() as f64 / 1000.0
+    chrono::Utc::now()
+        .timestamp_millis()
+        .to_f64()
+        .unwrap_or(f64::MAX)
+        / 1000.0
 }
 
 #[must_use]
@@ -203,6 +208,8 @@ fn persist_rotated_to(
     Ok(())
 }
 
+/// # Errors
+/// Returns an error when credential rotation is required but cannot be completed safely.
 pub async fn maybe_rotate(
     config: &RotationConfig,
     token: &AuthToken,

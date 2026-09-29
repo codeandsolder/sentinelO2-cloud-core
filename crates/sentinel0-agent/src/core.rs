@@ -6,6 +6,7 @@ use crate::{
     segment, shell,
 };
 use chrono::Utc;
+use num_traits::ToPrimitive;
 use sentinel0_proto::{Message, Op};
 use serde_json::{Map, Value, json};
 use std::{
@@ -71,18 +72,18 @@ impl CoreDispatcher {
         }
     }
 
-    fn ping(&self) -> HandlerResult {
-        Ok(BTreeMap::from([
+    fn ping(&self) -> BTreeMap<String, Value> {
+        BTreeMap::from([
             ("pong".into(), Value::Bool(true)),
             (
                 "agent_version".into(),
                 Value::String(self.agent_version.clone()),
             ),
-        ]))
+        ])
     }
 
-    fn state(&self) -> HandlerResult {
-        Ok(BTreeMap::from([
+    fn state(&self) -> BTreeMap<String, Value> {
+        BTreeMap::from([
             ("hostname".into(), Value::String(host::hostname())),
             (
                 "kernel".into(),
@@ -110,7 +111,7 @@ impl CoreDispatcher {
                 }),
             ),
             ("tooling".into(), self.policy.tooling.report()),
-        ]))
+        ])
     }
 
     fn no_new_privileges() -> bool {
@@ -700,7 +701,12 @@ impl CoreDispatcher {
         let timeout_secs = payload
             .get("timeout")
             .and_then(Value::as_f64)
-            .unwrap_or(self.policy.exec_timeout_default as f64)
+            .unwrap_or_else(|| {
+                self.policy
+                    .exec_timeout_default
+                    .to_f64()
+                    .unwrap_or(f64::MAX)
+            })
             .max(0.001);
         let ceiling = if payload
             .get("background")
@@ -713,7 +719,7 @@ impl CoreDispatcher {
         } else {
             self.policy.exec_timeout_max
         };
-        let timeout_secs = timeout_secs.min(ceiling as f64);
+        let timeout_secs = timeout_secs.min(ceiling.to_f64().unwrap_or(f64::MAX));
 
         if let Some(kind) = self.policy.tooling.direct_python_violation(command) {
             let replacement = if kind == "pip" {
@@ -859,18 +865,23 @@ impl CoreDispatcher {
     }
 
     async fn read_audit(&self, payload: &Map<String, Value>) -> HandlerResult {
-        let limit = payload
+        let max_lines = i64::try_from(crate::local_audit::MAX_LINES).unwrap_or(i64::MAX);
+        let requested_limit = payload
             .get("limit")
             .and_then(Value::as_i64)
             .unwrap_or(200)
-            .clamp(1, crate::local_audit::MAX_LINES as i64) as usize;
+            .clamp(1, max_lines);
+        let limit = usize::try_from(requested_limit).unwrap_or(crate::local_audit::MAX_LINES);
         let entries = tokio::task::spawn_blocking(move || crate::local_audit::read_recent(limit))
             .await
             .map_err(|error| {
                 HandlerError::new("internal_error", format!("audit reader failed: {error}"))
             })?;
         Ok(BTreeMap::from([
-            ("count".into(), Value::from(entries.len() as u64)),
+            (
+                "count".into(),
+                Value::from(u64::try_from(entries.len()).unwrap_or(u64::MAX)),
+            ),
             ("entries".into(), Value::Array(entries)),
             (
                 "source".into(),
@@ -878,7 +889,7 @@ impl CoreDispatcher {
             ),
             (
                 "max_retained".into(),
-                Value::from(crate::local_audit::MAX_LINES as u64),
+                Value::from(u64::try_from(crate::local_audit::MAX_LINES).unwrap_or(u64::MAX)),
             ),
         ]))
     }
@@ -928,10 +939,10 @@ impl Dispatcher for CoreDispatcher {
         let started = Instant::now();
         let audit_payload = crate::local_audit::summarize_payload(&payload);
         let (result, binary_frame) = match op {
-            Op::Ping => (self.ping(), None),
+            Op::Ping => (Ok(self.ping()), None),
             Op::Capabilities => (self.capabilities_result(&payload), None),
             Op::Help => (self.help(&payload), None),
-            Op::State => (self.state(), None),
+            Op::State => (Ok(self.state()), None),
             Op::Exec => (self.exec(&payload).await, None),
             Op::ScriptRun => (crate::script::handle(&self.policy, &payload).await, None),
             Op::UploadFile => (
@@ -995,7 +1006,7 @@ impl Dispatcher for CoreDispatcher {
                 None,
             ),
         };
-        let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let op_name = op.as_str().to_owned();
         let audit_task = tokio::task::spawn_blocking(move || {
             crate::local_audit::record(

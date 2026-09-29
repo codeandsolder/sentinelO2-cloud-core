@@ -351,6 +351,8 @@ fn sync_move_parents(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// # Errors
+/// Returns an error when the move is invalid, disallowed, or cannot be completed safely.
 pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let src_raw = require_str(payload, "src")?;
     let dst_raw = require_str(payload, "dst")?;
@@ -513,6 +515,8 @@ pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
     Ok(result)
 }
 
+/// # Errors
+/// Returns an error when the copy is invalid, disallowed, or cannot be completed safely.
 pub fn copy_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let src_raw = require_str(payload, "src")?;
     let dst_raw = require_str(payload, "dst")?;
@@ -575,6 +579,8 @@ pub fn copy_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
     Ok(result)
 }
 
+/// # Errors
+/// Returns an error when deletion is invalid, disallowed, or cannot be completed safely.
 pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let target = resolve_leaf_rw(policy, raw, "path")?;
@@ -638,6 +644,8 @@ pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     Ok(result)
 }
 
+/// # Errors
+/// Returns an error when the mode change is invalid, disallowed, or fails.
 pub fn chmod(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let mode_raw = require_str(payload, "mode")?;
@@ -664,6 +672,8 @@ pub fn chmod(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the ownership change is invalid, disallowed, or fails.
 pub fn chown(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     use nix::unistd::{Gid, Group, Uid, User};
 
@@ -739,6 +749,8 @@ pub fn chown(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the requested filesystem mutation is invalid, disallowed, or fails.
 pub fn handle(
     policy: &Policy,
     op: sentinel0_proto::Op,

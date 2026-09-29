@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use num_traits::ToPrimitive;
 use sentinel0_proto::Message;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -32,7 +33,11 @@ pub fn build_completed_event_data(
         _ => (false, None, None),
     };
 
-    let duration_s = ((finished_at - started_at).num_milliseconds() as f64 / 10.0).round() / 100.0;
+    let duration_ms = (finished_at - started_at)
+        .num_milliseconds()
+        .to_f64()
+        .unwrap_or(f64::MAX);
+    let duration_s = (duration_ms / 10.0).round() / 100.0;
 
     let (status, exit_code, output, error_message) = if ok {
         let timed_out = result

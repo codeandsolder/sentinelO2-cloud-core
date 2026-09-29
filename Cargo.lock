@@ -1624,6 +1624,7 @@ dependencies = [
  "http",
  "ignore",
  "nix",
+ "num-traits",
  "proptest",
  "rand 0.10.3",
  "regex",

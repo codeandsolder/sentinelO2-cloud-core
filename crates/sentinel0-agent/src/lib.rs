@@ -32,6 +32,7 @@ pub mod upload;
 use chrono::Utc;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
+use num_traits::ToPrimitive;
 use rand::RngExt;
 use sentinel0_proto::{HostInfo, Message, Op, PreferredProfile, bounding::bound_response_default};
 use std::{
@@ -204,13 +205,13 @@ pub trait Dispatcher: Send + Sync + 'static {
 pub struct UnsupportedDispatcher;
 
 impl Dispatcher for UnsupportedDispatcher {
-    async fn dispatch(
+    fn dispatch(
         &self,
         id: &str,
         op: Op,
         _payload: serde_json::Map<String, serde_json::Value>,
-    ) -> DispatchResponse {
-        DispatchResponse::message(Message::Response {
+    ) -> impl std::future::Future<Output = DispatchResponse> + Send {
+        std::future::ready(DispatchResponse::message(Message::Response {
             id: id.into(),
             ok: false,
             result: None,
@@ -219,7 +220,7 @@ impl Dispatcher for UnsupportedDispatcher {
                 message: format!("agent does not support op: {op}"),
                 details: None,
             }),
-        })
+        }))
     }
 }
 
@@ -238,6 +239,8 @@ pub enum ConfigError {
 }
 
 impl AgentConfig {
+    /// # Errors
+    /// Returns an error when the agent configuration is internally inconsistent or invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.hub_ws_base.trim().is_empty() {
             return Err(ConfigError::EmptyHubUrl);
@@ -307,6 +310,8 @@ pub struct Agent<D> {
 }
 
 impl<D: Dispatcher> Agent<D> {
+    /// # Errors
+    /// Returns an error when the supplied agent configuration fails validation.
     pub fn new(config: AgentConfig, dispatcher: D) -> Result<Self, ConfigError> {
         config.validate()?;
         Ok(Self {
@@ -322,6 +327,8 @@ impl<D: Dispatcher> Agent<D> {
         self
     }
 
+    /// # Errors
+    /// Returns an error when a hub session cannot be established or a non-recoverable agent failure occurs.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), AgentError> {
         let mut attempt = 0usize;
         let mut retry_hint = None;
@@ -604,7 +611,7 @@ impl<D: Dispatcher> Agent<D> {
                                             .and_then(serde_json::Value::as_str).map_or_else(|| {
                                                 format!(
                                                     "job_{:012x}",
-                                                    rand::rng().random::<u64>() & 0xffffffffffff
+                                                    rand::rng().random::<u64>() & 0xffff_ffff_ffff
                                                 )
                                             }, ToOwned::to_owned);
                                         let mut ack = Message::Response {
@@ -631,10 +638,10 @@ impl<D: Dispatcher> Agent<D> {
                                         let host_id = self.config.host.id.clone();
                                         let upload_base = self.config.upload_base.clone();
                                         tasks.spawn(async move {
-                                            let dispatched =
+                                            let dispatch_response =
                                                 dispatch_safely(dispatcher, id.clone(), op, payload).await;
-                                            let mut response = dispatched.message;
-                                            if dispatched.binary_frame.is_some() {
+                                            let mut response = dispatch_response.message;
+                                            if dispatch_response.binary_frame.is_some() {
                                                 response = Message::Response {
                                                     id: id.clone(),
                                                     ok: false,
@@ -700,12 +707,12 @@ impl<D: Dispatcher> Agent<D> {
                                         });
                                     } else {
                                         tasks.spawn(async move {
-                                            let mut dispatched =
+                                            let mut dispatch_response =
                                                 dispatch_safely(dispatcher, id.clone(), op, payload).await;
                                             if let Message::Response {
                                                 result: Some(result),
                                                 ..
-                                            } = &mut dispatched.message
+                                            } = &mut dispatch_response.message
                                             {
                                                 result.insert(
                                                     "_sx_timing".into(),
@@ -717,8 +724,8 @@ impl<D: Dispatcher> Agent<D> {
                                             }
                                             if let Err(error) = response_tx
                                                 .send(Outbound {
-                                                    message: dispatched.message,
-                                                    binary_frame: dispatched.binary_frame,
+                                                    message: dispatch_response.message,
+                                                    binary_frame: dispatch_response.binary_frame,
                                                     clear_after_send: None,
                                                 })
                                                 .await
@@ -946,7 +953,7 @@ fn decode_transfer_id_hex(value: &str) -> Result<[u8; 16], String> {
 }
 
 fn unix_time_seconds() -> f64 {
-    Utc::now().timestamp_micros() as f64 / 1_000_000.0
+    Utc::now().timestamp_micros().to_f64().unwrap_or(f64::MAX) / 1_000_000.0
 }
 
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);

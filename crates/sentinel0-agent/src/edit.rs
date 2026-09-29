@@ -425,8 +425,9 @@ fn run_validator(
         let mut cleanup_error = None;
         #[cfg(unix)]
         {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+            let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+            if let Err(error) =
+                nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
                 && error != nix::errno::Errno::ESRCH
             {
                 let message = format!("failed killing validator process group: {error}");
@@ -676,6 +677,8 @@ fn sudo_replace(
     Ok(())
 }
 
+/// # Errors
+/// Returns an error when the edit request is invalid, disallowed, or cannot be applied safely.
 pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let started = Instant::now();
     let raw_path = require_str(payload, "path")?;

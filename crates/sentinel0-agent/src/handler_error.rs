@@ -43,6 +43,8 @@ impl HandlerError {
 
 pub type HandlerResult = Result<BTreeMap<String, Value>, HandlerError>;
 
+/// # Errors
+/// Returns an error when the required payload field is missing or is not a string.
 pub fn require_str<'a>(
     payload: &'a Map<String, Value>,
     key: &'static str,

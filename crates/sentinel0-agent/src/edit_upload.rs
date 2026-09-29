@@ -30,6 +30,8 @@ fn upload_dir(policy: &Policy, upload_id: &str) -> Result<PathBuf, HandlerError>
     Ok(dir)
 }
 
+/// # Errors
+/// Returns an error when the staging area cannot be prepared.
 pub fn init(policy: &Policy) -> HandlerResult {
     let upload_id = format!(
         "{:016x}{:016x}",
@@ -46,6 +48,8 @@ pub fn init(policy: &Policy) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the upload payload is invalid or the staged file cannot be written.
 pub fn file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let upload_id = require_str(payload, "upload_id")?;
     let role = require_str(payload, "role")?;
@@ -99,6 +103,8 @@ pub fn file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the staged edit cannot be validated or finalized safely.
 pub fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let upload_id = require_str(payload, "upload_id")?;
     let mode = require_str(payload, "mode")?;

@@ -59,7 +59,7 @@ fn scalar_string(value: serde_json::Value) -> String {
     }
 }
 
-fn validate_token(token: String, path: &Path) -> Result<String, IdentityError> {
+fn validate_token(token: &str, path: &Path) -> Result<String, IdentityError> {
     let token = token.trim().to_owned();
     if token.is_empty() {
         return Err(IdentityError::EmptyToken { path: path.into() });
@@ -81,6 +81,8 @@ fn validate_token(token: String, path: &Path) -> Result<String, IdentityError> {
     Ok(token)
 }
 
+/// # Errors
+/// Returns an error when the identity file cannot be read, parsed, or validated.
 pub fn load_identity(path: &Path) -> Result<Identity, IdentityError> {
     if !path.exists() {
         return Err(IdentityError::Missing(path.into()));
@@ -110,7 +112,7 @@ pub fn load_identity(path: &Path) -> Result<Identity, IdentityError> {
         .map(scalar_string)?
         .trim()
         .to_owned();
-    let token = validate_token(token, path)?;
+    let token = validate_token(&token, path)?;
 
     Ok(Identity {
         host_id,

@@ -74,6 +74,8 @@ fn ensure_session_capacity(map: &SessionMap, transfer_id: &str) -> Result<(), Ha
     ))
 }
 
+/// # Errors
+/// Returns an error when the requested export path is invalid, disallowed, or unreadable.
 pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let transfer_id = valid_transfer_id(payload)?;
     let source = require_str(payload, "source_path")?;
@@ -154,6 +156,8 @@ pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the export session is invalid or the requested chunk cannot be read.
 pub async fn chunk(payload: &Map<String, Value>) -> Result<ExportChunk, HandlerError> {
     let transfer_id = valid_transfer_id(payload)?;
     let index = payload
@@ -238,6 +242,8 @@ pub async fn chunk(payload: &Map<String, Value>) -> Result<ExportChunk, HandlerE
     })
 }
 
+/// # Errors
+/// Returns an error when the export session is invalid or cannot be finalized.
 pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
     let transfer_id = valid_transfer_id(payload)?;
     let session = {

@@ -206,8 +206,10 @@ fn tail_lines(path: &Path, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
     let mut buffer = Vec::new();
     let mut newline_count = 0;
     while position > 0 && newline_count <= limit {
-        let step = position.min(TAIL_BLOCK as u64) as usize;
-        position -= step as u64;
+        let tail_block = u64::try_from(TAIL_BLOCK).unwrap_or(u64::MAX);
+        let step_u64 = position.min(tail_block);
+        let step = usize::try_from(step_u64).unwrap_or(TAIL_BLOCK);
+        position -= step_u64;
         file.seek(SeekFrom::Start(position))?;
         let mut chunk = vec![0_u8; step];
         file.read_exact(&mut chunk)?;

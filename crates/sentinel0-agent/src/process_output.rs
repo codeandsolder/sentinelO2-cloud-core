@@ -156,6 +156,8 @@ pub(crate) async fn wait_bounded_with_limits(
     }
 }
 
+/// # Errors
+/// Returns an I/O error when waiting for the child or capturing its output fails.
 pub async fn wait_bounded(
     child: &mut Child,
     timeout_duration: Duration,
@@ -180,6 +182,8 @@ where
     }
 }
 
+/// # Errors
+/// Returns an I/O error when reading from the supplied stream fails.
 pub fn read_bounded_sync<R: Read>(mut reader: R, limit: usize) -> io::Result<CapturedStream> {
     let mut capture = CapturedStream::new(limit);
     let mut buffer = vec![0_u8; READ_CHUNK];

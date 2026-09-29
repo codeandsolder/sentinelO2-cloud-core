@@ -71,8 +71,8 @@ fn kill_group(pid: Option<u32>) -> Option<String> {
     let Some(pid) = pid else {
         return Some("child PID was unavailable; process group could not be killed".into());
     };
-    let pgid = nix::unistd::Pid::from_raw(pid as i32);
-    match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
+    let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+    match nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => None,
         Err(error) => {
             let message = format!("failed killing timed-out process group {pid}: {error}");
@@ -101,6 +101,8 @@ fn kill_live_group(child: &mut tokio::process::Child, pid: Option<u32>) -> Optio
     }
 }
 
+/// # Errors
+/// Returns an error when process setup, execution, timeout handling, or output capture fails.
 pub async fn run_argv(
     policy: &Policy,
     argv: &[String],
@@ -188,6 +190,8 @@ pub async fn run_argv(
     }
 }
 
+/// # Errors
+/// Returns an error when the shell command is invalid, disallowed, or execution fails.
 pub async fn run_shell(
     policy: &Policy,
     command: &str,

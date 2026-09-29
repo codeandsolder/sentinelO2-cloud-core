@@ -287,6 +287,8 @@ impl Default for RawService {
 }
 
 impl Policy {
+    /// # Errors
+    /// Returns an error when the policy file cannot be read, parsed, or validated.
     pub fn from_file(path: &Path) -> Result<Self, PolicyError> {
         if !path.exists() {
             warn!(path = %path.display(), "policy file missing; loading built-in defaults");

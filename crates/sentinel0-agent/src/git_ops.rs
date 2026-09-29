@@ -41,8 +41,9 @@ async fn cleanup_git_child(
     #[cfg(unix)]
     if should_kill {
         if let Some(pid) = pid {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+            let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+            if let Err(error) =
+                nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
                 && error != nix::errno::Errno::ESRCH
             {
                 let message = format!("failed killing git process group: {error}");
@@ -492,8 +493,8 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         entries.push(Value::Object(entry));
     }
 
-    let room = max_files.saturating_sub(entries.len());
-    for path in untracked.iter().take(room) {
+    let remaining_slots = max_files.saturating_sub(entries.len());
+    for path in untracked.iter().take(remaining_slots) {
         entries.push(json!({
             "path": path,
             "status": "untracked",
@@ -503,7 +504,7 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             "patch": null,
         }));
     }
-    if untracked_total > room {
+    if untracked_total > remaining_slots {
         truncated_files = true;
     }
 
@@ -536,15 +537,18 @@ fn patch_paths(patch: &str) -> Vec<String> {
             .strip_prefix("--- ")
             .or_else(|| line.strip_prefix("+++ "));
         let Some(raw) = raw else { continue };
-        let mut path = raw.split('\t').next().unwrap_or("").trim();
-        if path == "/dev/null" || path.is_empty() {
+        let mut file_path = raw.split('\t').next().unwrap_or("").trim();
+        if file_path == "/dev/null" || file_path.is_empty() {
             continue;
         }
-        if let Some(rest) = path.strip_prefix("a/").or_else(|| path.strip_prefix("b/")) {
-            path = rest;
+        if let Some(rest) = file_path
+            .strip_prefix("a/")
+            .or_else(|| file_path.strip_prefix("b/"))
+        {
+            file_path = rest;
         }
-        if !out.iter().any(|existing| existing == path) {
-            out.push(path.to_owned());
+        if !out.iter().any(|existing| existing == file_path) {
+            out.push(file_path.to_owned());
         }
     }
     out
@@ -864,6 +868,8 @@ async fn push(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the Git request is invalid, disallowed, times out, or Git fails.
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     match payload.get("operation").and_then(Value::as_str) {
         Some("diff") => diff(policy, payload).await,
