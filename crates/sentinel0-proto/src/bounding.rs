@@ -1,18 +1,19 @@
 use serde_json::{Map, Value, json};
 
 pub const RESPONSE_SOFT_LIMIT_BYTES: usize = 131_072;
-pub const RESPONSE_HEAD_RATIO: f64 = 0.6;
 pub const TRUNCATION_KEY: &str = "_truncation";
 
 const META_RESERVE: usize = 512;
-const SHRINK_SLACK: f64 = 0.95;
+const RESPONSE_HEAD_NUMERATOR: usize = 3;
+const RESPONSE_HEAD_DENOMINATOR: usize = 5;
+const SHRINK_SLACK_NUMERATOR: usize = 19;
+const SHRINK_SLACK_DENOMINATOR: usize = 20;
 const MAX_PASSES: usize = 64;
 const MIN_TRUNCATABLE: usize = 256;
 
 pub fn serialized_size(value: &Value) -> usize {
     match value {
-        Value::Null => 4,
-        Value::Bool(true) => 4,
+        Value::Null | Value::Bool(true) => 4,
         Value::Bool(false) => 5,
         Value::Number(number) => number.to_string().len(),
         Value::String(text) => python_json_string_size(text),
@@ -54,10 +55,9 @@ fn decode_utf8_ignoring_invalid(mut bytes: &[u8]) -> String {
             Err(error) => {
                 let valid = error.valid_up_to();
                 if valid > 0 {
-                    // SAFETY: from_utf8 reported this prefix as valid.
-                    out.push_str(
-                        std::str::from_utf8(&bytes[..valid]).expect("validated UTF-8 prefix"),
-                    );
+                    if let Ok(prefix) = std::str::from_utf8(&bytes[..valid]) {
+                        out.push_str(prefix);
+                    }
                 }
                 let skip = error.error_len().unwrap_or(bytes.len() - valid);
                 bytes = &bytes[(valid + skip).min(bytes.len())..];
@@ -71,6 +71,15 @@ fn marker(omitted: usize) -> String {
     format!("\n…[sentinelx: truncated {omitted} bytes]…\n")
 }
 
+fn mul_div_floor(value: usize, numerator: usize, denominator: usize) -> usize {
+    if denominator == 0 {
+        return 0;
+    }
+
+    let scaled = u128::from(value) * u128::from(numerator) / u128::from(denominator);
+    usize::try_from(scaled).unwrap_or(usize::MAX)
+}
+
 fn truncate_text(text: &str, keep_bytes: usize) -> String {
     let raw = text.as_bytes();
     let original = raw.len();
@@ -78,7 +87,11 @@ fn truncate_text(text: &str, keep_bytes: usize) -> String {
         return text.to_owned();
     }
 
-    let head_budget = (keep_bytes as f64 * RESPONSE_HEAD_RATIO) as usize;
+    let head_budget = mul_div_floor(
+        keep_bytes,
+        RESPONSE_HEAD_NUMERATOR,
+        RESPONSE_HEAD_DENOMINATOR,
+    );
     let tail_budget = keep_bytes - head_budget;
     let head = decode_utf8_ignoring_invalid(&raw[..head_budget.min(original)]);
     let tail = if tail_budget > 0 {
@@ -168,8 +181,12 @@ fn shrink_largest(response: &mut Value, root_key: &str, budget: usize) -> bool {
             return false;
         };
 
-        let proportional =
-            (raw_len as f64 * (budget as f64 / current as f64) * SHRINK_SLACK) as usize;
+        let within_budget = mul_div_floor(raw_len, budget, current);
+        let proportional = mul_div_floor(
+            within_budget,
+            SHRINK_SLACK_NUMERATOR,
+            SHRINK_SLACK_DENOMINATOR,
+        );
         let keep = proportional
             .max(MIN_TRUNCATABLE)
             .min(raw_len.saturating_sub(1));
@@ -272,5 +289,20 @@ mod tests {
         let original = response.clone();
         assert!(bound_response_default(&mut response).is_none());
         assert_eq!(response, original);
+    }
+
+    #[test]
+    fn integer_ratio_scaling_is_exact_and_overflow_safe() {
+        assert_eq!(mul_div_floor(10, 3, 5), 6);
+        assert_eq!(mul_div_floor(usize::MAX, 1, 1), usize::MAX);
+        assert_eq!(mul_div_floor(usize::MAX, 1, 2), usize::MAX / 2);
+        assert_eq!(mul_div_floor(123, 1, 0), 0);
+    }
+
+    #[test]
+    fn truncation_keeps_the_configured_three_fifths_head_ratio() {
+        let truncated = truncate_text(&"x".repeat(1_000), 100);
+        assert!(truncated.starts_with(&"x".repeat(60)));
+        assert!(truncated.ends_with(&"x".repeat(40)));
     }
 }

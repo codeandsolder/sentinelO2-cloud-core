@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
-//! SentinelX v1 wire compatibility types.
+//! `SentinelX` v1 wire compatibility types.
 //!
 //! This models the wire contract, not the Python implementation. The legacy
 //! protocol stays isolated so Sentinel0² can evolve independently.
@@ -135,6 +135,7 @@ impl Op {
         Self::LocalApi,
     ];
 
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -231,10 +232,10 @@ pub enum Message {
     },
 }
 
-fn default_heartbeat() -> u64 {
+const fn default_heartbeat() -> u64 {
     HEARTBEAT_INTERVAL_SECS
 }
-fn yes() -> bool {
+const fn yes() -> bool {
     true
 }
 
@@ -253,7 +254,7 @@ where
     Ok(value)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseError {
     pub code: String,
@@ -303,10 +304,17 @@ pub enum BinaryFrameError {
     TooShort,
 }
 
-pub fn is_binary_transfer_frame(frame: &[u8]) -> bool {
+#[must_use]
+pub const fn is_binary_transfer_frame(frame: &[u8]) -> bool {
     frame.len() >= BINARY_HEADER_BYTES
 }
 
+/// Decodes a binary transfer frame into its header fields and payload.
+///
+/// # Errors
+///
+/// Returns [`BinaryFrameError::TooShort`] when `frame` is shorter than the
+/// fixed binary-transfer header.
 pub fn decode_binary_frame(frame: &[u8]) -> Result<BinaryFrame<'_>, BinaryFrameError> {
     if frame.len() < BINARY_HEADER_BYTES {
         return Err(BinaryFrameError::TooShort);
@@ -326,6 +334,7 @@ pub fn decode_binary_frame(frame: &[u8]) -> Result<BinaryFrame<'_>, BinaryFrameE
     })
 }
 
+#[must_use]
 pub fn encode_binary_frame(
     transfer_id: [u8; TRANSFER_ID_BYTES],
     chunk_index: u32,
