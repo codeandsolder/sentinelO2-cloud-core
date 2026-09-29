@@ -86,7 +86,7 @@ pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
         }
 
         let mut reply = Vec::new();
-        let mut chunk = [0_u8; 65_536];
+        let mut chunk = vec![0_u8; 65_536];
         loop {
             match stream.read(&mut chunk) {
                 Ok(0) => break,
@@ -383,8 +383,9 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
         timeout: Duration::from_secs_f64(timeout_seconds),
         run_as: match map.get("run_as") {
             None | Some(Value::Null) => None,
-            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_owned()),
-            Some(Value::String(_)) => None,
+            Some(Value::String(value)) => {
+                (!value.trim().is_empty()).then(|| value.trim().to_owned())
+            }
             Some(_) => {
                 return Err(format!("local_apis.{name}.run_as must be a string"));
             }
@@ -1119,13 +1120,15 @@ async fn ensure_compatible(policy: &Policy, endpoint: &Endpoint) -> Result<(), H
         ));
     };
 
-    let accepted = if let Some(exact) = accept.get("exact") {
-        found == exact
-    } else if let Some(allowed) = accept.get("allowed").and_then(Value::as_array) {
-        allowed.iter().any(|value| value == found)
-    } else {
-        false
-    };
+    let accepted = accept.get("exact").map_or_else(
+        || {
+            accept
+                .get("allowed")
+                .and_then(Value::as_array)
+                .is_some_and(|allowed| allowed.iter().any(|value| value == found))
+        },
+        |exact| found == exact,
+    );
 
     if accepted {
         Ok(())

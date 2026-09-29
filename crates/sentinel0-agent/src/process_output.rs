@@ -145,15 +145,14 @@ pub(crate) async fn wait_bounded_with_limits(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> io::Result<WaitOutcome> {
-    match timeout(
+    timeout(
         timeout_duration,
         capture_bounded(child, stdout_limit, stderr_limit),
     )
     .await
-    {
-        Ok(result) => result.map(WaitOutcome::Completed),
-        Err(_) => Ok(WaitOutcome::TimedOut),
-    }
+    .map_or(Ok(WaitOutcome::TimedOut), |result| {
+        result.map(WaitOutcome::Completed)
+    })
 }
 
 /// # Errors

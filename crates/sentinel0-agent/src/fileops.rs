@@ -179,14 +179,14 @@ fn scan_utf8(
         for &byte in &buf[..n] {
             saw_any = true;
             last_was_newline = byte == b'\n';
-            let selected = line >= start && end.map_or(true, |last| line <= last);
+            let selected = line >= start && end.is_none_or(|last| line <= last);
 
             if byte == b'\n' {
                 if selected {
                     last_selected = line;
                     let next_line = line.saturating_add(1);
                     let next_selected =
-                        next_line >= start && end.map_or(true, |last| next_line <= last);
+                        next_line >= start && end.is_none_or(|last| next_line <= last);
                     if next_selected {
                         if out.len() >= cap {
                             truncated = true;
@@ -285,12 +285,12 @@ fn scan_utf16(
                 first_unit = false;
                 saw_any = true;
                 last_was_newline = unit == 0x000a;
-                let selected = line >= start && end.map_or(true, |last| line <= last);
+                let selected = line >= start && end.is_none_or(|last| line <= last);
                 if unit == 0x000a {
                     if selected {
                         last_selected = line;
                         let next = line.saturating_add(1);
-                        let next_selected = next >= start && end.map_or(true, |last| next <= last);
+                        let next_selected = next >= start && end.is_none_or(|last| next <= last);
                         if next_selected {
                             if units.len() >= cap {
                                 truncated = true;
@@ -332,13 +332,13 @@ fn scan_utf16(
             first_unit = false;
             saw_any = true;
             last_was_newline = unit == 0x000a;
-            let selected = line >= start && end.map_or(true, |last| line <= last);
+            let selected = line >= start && end.is_none_or(|last| line <= last);
 
             if unit == 0x000a {
                 if selected {
                     last_selected = line;
                     let next = line.saturating_add(1);
-                    let next_selected = next >= start && end.map_or(true, |last| next <= last);
+                    let next_selected = next >= start && end.is_none_or(|last| next <= last);
                     if next_selected {
                         if units.len() >= cap {
                             truncated = true;
@@ -430,14 +430,10 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .map_err(|e| HandlerError::new("io_error", format!("cannot read {raw:?}: {e}")))?;
     probe.truncate(n);
 
-    let is_utf16_le = probe.starts_with(&[0xff, 0xfe]);
-    let is_utf16_be = probe.starts_with(&[0xfe, 0xff]);
-    if !is_utf16_le && !is_utf16_be && probe.contains(&0) {
-        let preview = probe
-            .iter()
-            .take(256)
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+    let utf16_little_endian = probe.starts_with(&[0xff, 0xfe]);
+    let has_utf16_bom = utf16_little_endian || probe.starts_with(&[0xfe, 0xff]);
+    if !has_utf16_bom && probe.contains(&0) {
+        let preview = crate::hex_lower(&probe[..probe.len().min(256)]);
         return Ok(BTreeMap::from([
             ("ok".into(), Value::Bool(true)),
             ("path".into(), Value::String(path.display().to_string())),
@@ -453,8 +449,8 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     }
 
     let (start, end) = range.unwrap_or((1, None));
-    let (content, total_lines, total_exact, truncated, last) = if is_utf16_le || is_utf16_be {
-        scan_utf16(&path, start, end, cap, is_utf16_le)?
+    let (content, total_lines, total_exact, truncated, last) = if has_utf16_bom {
+        scan_utf16(&path, start, end, cap, utf16_little_endian)?
     } else {
         scan_utf8(&path, start, end, cap)?
     };
@@ -464,14 +460,7 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("path".into(), Value::String(path.display().to_string())),
         (
             "encoding".into(),
-            Value::String(
-                if is_utf16_le || is_utf16_be {
-                    "utf-16"
-                } else {
-                    "utf-8"
-                }
-                .into(),
-            ),
+            Value::String(if has_utf16_bom { "utf-16" } else { "utf-8" }.into()),
         ),
         ("content".into(), Value::String(content.clone())),
         ("total_lines".into(), Value::from(total_lines as u64)),
@@ -510,7 +499,8 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("depth")
         .and_then(Value::as_i64)
         .unwrap_or(1)
-        .clamp(1, 5) as usize;
+        .clamp(1, 5);
+    let depth = usize::try_from(depth).unwrap_or(5);
     let hidden = payload
         .get("show_hidden")
         .and_then(Value::as_bool)
@@ -725,7 +715,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             entry
                 .path()
                 .strip_prefix(&root)
-                .unwrap_or(entry.path())
+                .unwrap_or_else(|_| entry.path())
                 .to_string_lossy()
                 .into_owned()
         };
@@ -911,7 +901,7 @@ mod tests {
         payload.insert("file_glob".into(), Value::String("*.rs".into()));
         let result = search(&policy(dir.path()), &payload).unwrap();
         let matches = result["matches"].as_array().unwrap();
-        assert_eq!(search_matches.len(), 1);
+        assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["file"], "keep.rs");
         assert_eq!(result["files_searched"], 1);
     }

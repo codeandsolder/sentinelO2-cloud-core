@@ -69,21 +69,22 @@ pub async fn verify_enrollment(hub_ws_base: &str, token: &AuthToken) -> Prefligh
         Err(_) => PreflightResult::accepted(),
         Ok(None) => PreflightResult::failed("closed", "hub closed before hello"),
         Ok(Some(Err(error))) => PreflightResult::failed("closed", error.to_string()),
-        Ok(Some(Ok(WsMessage::Text(text)))) => {
-            match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(value) => PreflightResult::failed(
-                    value
-                        .get("code")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("rejected"),
-                    value
-                        .get("message")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or(""),
-                ),
-                Err(_) => PreflightResult::failed("rejected", "hub sent data before hello"),
-            }
-        }
+        Ok(Some(Ok(WsMessage::Text(text)))) => serde_json::from_str::<serde_json::Value>(&text)
+            .map_or_else(
+                |_| PreflightResult::failed("rejected", "hub sent data before hello"),
+                |value| {
+                    PreflightResult::failed(
+                        value
+                            .get("code")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("rejected"),
+                        value
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                    )
+                },
+            ),
         Ok(Some(Ok(WsMessage::Close(frame)))) => {
             let detail = frame
                 .map(|frame| format!("{}: {}", u16::from(frame.code), frame.reason))

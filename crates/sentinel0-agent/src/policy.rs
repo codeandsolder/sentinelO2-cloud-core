@@ -307,6 +307,14 @@ impl Policy {
     }
 
     fn from_raw(raw: RawPolicy) -> Result<Self, PolicyError> {
+        const PLAYBOOK_KEYS: &[&str] = &[
+            "description",
+            "commands",
+            "when",
+            "steps",
+            "requires",
+            "notes",
+        ];
         if raw.exec.timeout_default == 0 {
             return Err(PolicyError::InvalidValue {
                 field: "exec.timeout_default",
@@ -384,14 +392,6 @@ impl Policy {
                 field: "playbooks",
                 message: format!("playbook {name:?} must be an object"),
             })?;
-            const PLAYBOOK_KEYS: &[&str] = &[
-                "description",
-                "commands",
-                "when",
-                "steps",
-                "requires",
-                "notes",
-            ];
             if let Some(key) = object
                 .keys()
                 .find(|key| !PLAYBOOK_KEYS.contains(&key.as_str()))
@@ -701,26 +701,26 @@ upload_base: /var/lib/sentinelx/uploads
     #[test]
     fn allowlist_enforcement_is_opt_in_but_legacy_strict_still_enforces() {
         let policy = parse(
-            r#"
+            r"
 allowed_commands: [git]
-"#,
+",
         );
         assert!(!policy.exec_enforce_allowlist);
 
         let policy = parse(
-            r#"
+            r"
 allowed_commands: [git]
 exec:
   enforce_allowlist: true
-"#,
+",
         );
         assert!(policy.exec_enforce_allowlist);
 
         let policy = parse(
-            r#"
+            r"
 allowed_commands: [git]
 exec_strict: true
-"#,
+",
         );
         assert!(policy.exec_enforce_allowlist);
     }
@@ -855,11 +855,11 @@ exec_strict: true
     #[test]
     fn legacy_read_paths_stay_read_only() {
         let policy = parse(
-            r#"
+            r"
 file_ops:
   allowed_read_paths:
     - /tmp
-"#,
+",
         );
         assert_eq!(policy.file_ops_paths[0].access, FileAccess::Read);
     }

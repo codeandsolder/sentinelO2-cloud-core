@@ -36,9 +36,11 @@ fn audit_value(value: &Value) -> Value {
     }
 }
 
-/// Preserve the request that was actually made. The only generic failsafe is
-/// deliberately cheap: long mixed alphanumeric chunks look more like opaque
-/// keys/tokens than prose, so strings containing one are replaced.
+/// Preserve the request that was actually made.
+///
+/// The only generic failsafe is deliberately cheap: long mixed alphanumeric
+/// chunks look more like opaque keys/tokens than prose, so strings containing
+/// one are replaced.
 #[must_use]
 pub fn summarize_payload(payload: &Map<String, Value>) -> Map<String, Value> {
     payload
@@ -213,7 +215,7 @@ fn tail_lines(path: &Path, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
         file.seek(SeekFrom::Start(position))?;
         let mut chunk = vec![0_u8; step];
         file.read_exact(&mut chunk)?;
-        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        newline_count += memchr::memchr_iter(b'\n', &chunk).count();
         chunk.extend(buffer);
         buffer = chunk;
     }

@@ -67,10 +67,7 @@ fn safe_name(job_id: &str) -> String {
     }
 
     let digest = Sha256::digest(job_id.as_bytes());
-    let suffix = digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let suffix = crate::hex_lower(&digest[..16]);
     format!("~{prefix}-{suffix}")
 }
 
@@ -174,7 +171,7 @@ fn record_at_result_with_limit(
                 }
                 break candidate;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     };

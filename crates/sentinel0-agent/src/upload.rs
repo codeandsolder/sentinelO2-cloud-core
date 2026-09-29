@@ -106,11 +106,7 @@ fn safe_dest(upload_base: &Path, target: &str) -> Result<PathBuf, HandlerError> 
 }
 
 fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::hex_lower(bytes.as_ref())
 }
 
 fn hash_bytes(data: &[u8]) -> String {
@@ -372,12 +368,14 @@ pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> Handl
         };
         return Err(HandlerError::new(
             code,
-            match cleanup {
-                Some(cleanup) => format!(
-                    "failed finalizing upload: {error}; staged-file cleanup also failed: {cleanup}"
-                ),
-                None => format!("failed finalizing upload: {error}"),
-            },
+            cleanup.map_or_else(
+                || format!("failed finalizing upload: {error}"),
+                |cleanup| {
+                    format!(
+                        "failed finalizing upload: {error}; staged-file cleanup also failed: {cleanup}"
+                    )
+                },
+            ),
         ));
     }
 

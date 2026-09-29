@@ -33,11 +33,11 @@ pub fn build_completed_event_data(
         _ => (false, None, None),
     };
 
-    let duration_ms = (finished_at - started_at)
+    let elapsed_millis = (finished_at - started_at)
         .num_milliseconds()
         .to_f64()
         .unwrap_or(f64::MAX);
-    let duration_s = (duration_ms / 10.0).round() / 100.0;
+    let duration_seconds = (elapsed_millis / 10.0).round() / 100.0;
 
     let (status, exit_code, output, error_message) = if ok {
         let timed_out = result
@@ -93,7 +93,7 @@ pub fn build_completed_event_data(
             "finished_at".into(),
             Value::String(finished_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false)),
         ),
-        ("duration_s".into(), Value::from(duration_s)),
+        ("duration_s".into(), Value::from(duration_seconds)),
         ("output".into(), Value::String(output)),
         ("output_truncated".into(), Value::Bool(output_truncated)),
         (

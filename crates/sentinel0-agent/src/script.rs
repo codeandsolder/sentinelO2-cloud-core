@@ -99,6 +99,7 @@ fn merged_output(captured: &CapturedOutput) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
 struct ResultMeta<'a> {
     interpreter: &'a str,
     sudo: bool,

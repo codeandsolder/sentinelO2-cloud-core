@@ -410,12 +410,14 @@ async fn diff(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("max_files")
         .and_then(Value::as_u64)
         .unwrap_or(50)
-        .clamp(1, 50) as usize;
+        .clamp(1, 50);
+    let max_files = usize::try_from(max_files).unwrap_or(50);
     let max_patch = payload
         .get("max_patch_bytes")
         .and_then(Value::as_u64)
-        .unwrap_or(MAX_DIFF_PATCH as u64)
-        .clamp(1024, MAX_DIFF_PATCH as u64) as usize;
+        .unwrap_or_else(|| u64::try_from(MAX_DIFF_PATCH).unwrap_or(u64::MAX))
+        .clamp(1024, u64::try_from(MAX_DIFF_PATCH).unwrap_or(u64::MAX));
+    let max_patch = usize::try_from(max_patch).unwrap_or(MAX_DIFF_PATCH);
 
     let selector = if staged && unstaged {
         vec!["diff".into(), base_ref.into()]
@@ -781,14 +783,14 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     if target.exists()
         && target
             .read_dir()
-            .map_or(true, |mut iter| iter.next().is_some())
+            .is_err_or(|mut iter| iter.next().is_some())
     {
         return Err(HandlerError::new(
             "dest_not_empty",
             "clone refuses to write into a non-empty destination",
         ));
     }
-    let parent = target.parent().unwrap_or(Path::new("."));
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let mut args = vec!["clone".into()];
     if let Some(depth) = payload.get("depth").and_then(Value::as_u64) {
         args.extend(["--depth".into(), depth.clamp(1, 1000).to_string()]);

@@ -94,8 +94,7 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
             if payload
                 .get("pattern")
                 .and_then(Value::as_str)
-                .as_ref()
-                .is_none_or(|v| !!v.is_empty())
+                .is_none_or(str::is_empty)
             {
                 return Err(HandlerError::new(
                     "invalid_payload",
@@ -109,8 +108,7 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
                 if payload
                     .get(key)
                     .and_then(Value::as_str)
-                    .as_ref()
-                    .is_none_or(|v| !!v.is_empty())
+                    .is_none_or(str::is_empty)
                 {
                     return Err(HandlerError::new(
                         "invalid_payload",
@@ -138,12 +136,11 @@ fn interpret_escapes(input: &str) -> String {
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
-            Some('\\') => out.push('\\'),
             Some(other) => {
                 out.push('\\');
                 out.push(other);
             }
-            None => out.push('\\'),
+            Some('\\') | None => out.push('\\'),
         }
     }
     out
@@ -520,7 +517,7 @@ impl Drop for RemoveFileOnDrop {
 
 fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
     let base = backup_dir.map_or_else(
-        || target.parent().unwrap_or(Path::new(".")).to_owned(),
+        || target.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
         PathBuf::from,
     );
     base.join(format!(
@@ -559,7 +556,7 @@ fn atomic_replace(
             .open(&candidate)
         {
             Ok(file) => break (candidate, file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(HandlerError::new(
                     "write_failed",

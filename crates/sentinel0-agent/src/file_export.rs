@@ -136,12 +136,14 @@ pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         hasher: Sha256::new(),
         next_index: 0,
     };
-    let mut map = sessions()
-        .lock()
-        .map_err(|_| HandlerError::new("internal_error", "export session lock poisoned"))?;
-    sweep(&mut map);
-    ensure_session_capacity(&map, &transfer_id)?;
-    map.insert(transfer_id.clone(), Arc::new(Mutex::new(session)));
+    {
+        let mut map = sessions()
+            .lock()
+            .map_err(|_| HandlerError::new("internal_error", "export session lock poisoned"))?;
+        sweep(&mut map);
+        ensure_session_capacity(&map, &transfer_id)?;
+        map.insert(transfer_id.clone(), Arc::new(Mutex::new(session)));
+    }
 
     Ok(BTreeMap::from([
         ("transfer_id".into(), Value::String(transfer_id)),
@@ -222,6 +224,7 @@ pub async fn chunk(payload: &Map<String, Value>) -> Result<ExportChunk, HandlerE
             session.next_index += 1;
         }
         let eof = index + 1 >= session.num_chunks;
+        drop(session);
         Ok::<_, HandlerError>((data, eof, count))
     })
     .await
@@ -235,7 +238,10 @@ pub async fn chunk(payload: &Map<String, Value>) -> Result<ExportChunk, HandlerE
         result: BTreeMap::from([
             ("transfer_id".into(), Value::String(transfer_id)),
             ("chunk_index".into(), Value::from(index)),
-            ("bytes".into(), Value::from(bytes as u64)),
+            (
+                "bytes".into(),
+                Value::from(u64::try_from(bytes).unwrap_or(u64::MAX)),
+            ),
             ("eof".into(), Value::Bool(eof)),
         ]),
         binary_frame,
@@ -264,13 +270,8 @@ pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
         .map_err(|_| HandlerError::new("internal_error", "export session lock poisoned"))?;
     let complete = session.next_index == session.num_chunks;
     let digest = complete.then(|| {
-        session
-            .hasher
-            .clone()
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+        let digest = session.hasher.clone().finalize();
+        crate::hex_lower(digest.as_ref())
     });
 
     Ok(BTreeMap::from([

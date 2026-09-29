@@ -98,12 +98,12 @@ fn backup_file(path: &Path) -> Result<PathBuf, HandlerError> {
         };
         return Err(HandlerError::new(
             "backup_failed",
-            match cleanup {
-                Some(cleanup) => {
+            cleanup.map_or_else(
+                || format!("backup failed: {error}"),
+                |cleanup| {
                     format!("backup failed: {error}; partial backup cleanup also failed: {cleanup}")
-                }
-                None => format!("backup failed: {error}"),
-            },
+                },
+            ),
         ));
     }
     Ok(backup)
@@ -149,7 +149,8 @@ fn backup_dir(path: &Path) -> Result<PathBuf, HandlerError> {
         {
             error
                 .message
-                .push_str(&format!("; partial archive cleanup also failed: {cleanup}"));
+                .push_str("; partial archive cleanup also failed: ");
+            error.message.push_str(&cleanup.to_string());
         }
         return Err(error);
     }
@@ -326,10 +327,10 @@ fn staged_copy(src: &Path, dst: &Path, overwrite: bool) -> io::Result<Option<Str
     let copy_result = copy_entry(src, &staged);
     if let Err(error) = copy_result {
         let cleanup = cleanup_entry(&staged, "copy failed");
-        return Err(io::Error::other(match cleanup {
-            Some(cleanup) => format!("{error}; {cleanup}"),
-            None => error.to_string(),
-        }));
+        return Err(io::Error::other(cleanup.map_or_else(
+            || error.to_string(),
+            |cleanup| format!("{error}; {cleanup}"),
+        )));
     }
     match commit_staged(dst, &staged, overwrite) {
         Ok(warning) => Ok(warning),

@@ -29,6 +29,16 @@ pub mod staging;
 pub mod tooling;
 pub mod upload;
 
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 use chrono::Utc;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use http::{HeaderValue, header::AUTHORIZATION};
@@ -522,8 +532,7 @@ impl<D: Dispatcher> Agent<D> {
                 }
                 item = ws.next() => {
                     match item {
-                        None => return Ok(SessionEnd::Lost(None)),
-                        Some(Err(_)) => return Ok(SessionEnd::Lost(None)),
+                        None | Some(Err(_)) => return Ok(SessionEnd::Lost(None)),
                         Some(Ok(WsMessage::Close(frame))) => {
                             let hint = frame.as_ref().and_then(|frame| parse_retry_after(frame.reason.as_str()));
                             return Ok(if frame.as_ref().is_some_and(|frame| frame.code == CloseCode::Restart) {
@@ -640,9 +649,8 @@ impl<D: Dispatcher> Agent<D> {
                                         tasks.spawn(async move {
                                             let dispatch_response =
                                                 dispatch_safely(dispatcher, id.clone(), op, payload).await;
-                                            let mut response = dispatch_response.message;
-                                            if dispatch_response.binary_frame.is_some() {
-                                                response = Message::Response {
+                                            let response = if dispatch_response.binary_frame.is_some() {
+                                                Message::Response {
                                                     id: id.clone(),
                                                     ok: false,
                                                     result: None,
@@ -651,8 +659,10 @@ impl<D: Dispatcher> Agent<D> {
                                                         message: "binary responses cannot be persisted as background jobs".into(),
                                                         details: None,
                                                     }),
-                                                };
-                                            }
+                                                }
+                                            } else {
+                                                dispatch_response.message
+                                            };
                                             match serde_json::to_value(&response) {
                                                 Ok(mut bounded) => {
                                                     let _truncation = bound_response_default(&mut bounded);
@@ -749,11 +759,7 @@ impl<D: Dispatcher> Agent<D> {
                                 warn!("discarding malformed binary transfer frame");
                                 continue;
                             };
-                            let transfer_id = frame
-                                .transfer_id
-                                .iter()
-                                .map(|byte| format!("{byte:02x}"))
-                                .collect::<String>();
+                            let transfer_id = hex_lower(&frame.transfer_id);
                             let chunk_index = frame.chunk_index;
                             if tasks.len() >= MAX_IN_FLIGHT_TASKS {
                                 let data = BTreeMap::from([
