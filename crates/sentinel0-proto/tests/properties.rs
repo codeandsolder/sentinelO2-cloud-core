@@ -12,10 +12,14 @@ proptest! {
         let wire = encode_binary_frame(transfer_id, chunk_index, &payload);
         prop_assert_eq!(wire.len(), BINARY_HEADER_BYTES + payload.len());
 
-        let decoded = decode_binary_frame(&wire).expect("encoded frame must decode");
-        prop_assert_eq!(decoded.transfer_id, transfer_id);
-        prop_assert_eq!(decoded.chunk_index, chunk_index);
-        prop_assert_eq!(decoded.payload, payload.as_slice());
+        match decode_binary_frame(&wire) {
+            Ok(decoded) => {
+                prop_assert_eq!(decoded.transfer_id, transfer_id);
+                prop_assert_eq!(decoded.chunk_index, chunk_index);
+                prop_assert_eq!(decoded.payload, payload.as_slice());
+            }
+            Err(error) => prop_assert!(false, "encoded frame failed to decode: {error}"),
+        }
     }
 
     #[test]

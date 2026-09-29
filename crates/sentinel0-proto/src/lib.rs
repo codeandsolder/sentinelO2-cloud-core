@@ -352,14 +352,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn binary_frame_roundtrip_matches_spec() {
+    fn binary_frame_roundtrip_matches_spec() -> Result<(), BinaryFrameError> {
         let id = [0x5a; 16];
         let wire = encode_binary_frame(id, 0x0102_0304, b"payload");
         assert_eq!(&wire[16..20], &[1, 2, 3, 4]);
-        let decoded = decode_binary_frame(&wire).unwrap();
+        let decoded = decode_binary_frame(&wire)?;
         assert_eq!(decoded.transfer_id, id);
         assert_eq!(decoded.chunk_index, 0x0102_0304);
         assert_eq!(decoded.payload, b"payload");
+        Ok(())
     }
 
     #[test]
