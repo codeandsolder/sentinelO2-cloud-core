@@ -889,22 +889,19 @@ async fn dispatch_safely<D: Dispatcher>(
     AssertUnwindSafe(dispatcher.dispatch(&id, op, payload))
         .catch_unwind()
         .await
-        .map_or_else(
-            |_| {
-                warn!(%id, %op, "dispatcher panicked; converting panic into internal_error");
-                DispatchResponse::message(Message::Response {
-                    id,
-                    ok: false,
-                    result: None,
-                    error: Some(sentinel0_proto::ResponseError {
-                        code: "internal_error".into(),
-                        message: "operation handler panicked".into(),
-                        details: None,
-                    }),
-                })
-            },
-            |response| response,
-        )
+        .unwrap_or_else(|_| {
+            warn!(%id, %op, "dispatcher panicked; converting panic into internal_error");
+            DispatchResponse::message(Message::Response {
+                id,
+                ok: false,
+                result: None,
+                error: Some(sentinel0_proto::ResponseError {
+                    code: "internal_error".into(),
+                    message: "operation handler panicked".into(),
+                    details: None,
+                }),
+            })
+        })
 }
 
 async fn drain_pending(upload_base: PathBuf) -> Vec<(PathBuf, serde_json::Value)> {

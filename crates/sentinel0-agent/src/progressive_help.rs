@@ -295,13 +295,14 @@ pub fn capabilities_detail(payload: &Map<String, Value>) -> Result<&'static str,
     }
 }
 
-/// # Errors
-/// Returns an error when the requested help path or detail selection is invalid.
-pub fn select_help_response(
-    payload: &Map<String, Value>,
-    full: Map<String, Value>,
-    playbooks: &BTreeMap<String, yaml_serde::Value>,
-) -> HandlerResult {
+struct HelpSelection {
+    topic: Option<String>,
+    path: Option<String>,
+    playbook: Option<String>,
+    has_page: bool,
+}
+
+fn help_selection(payload: &Map<String, Value>) -> Result<HelpSelection, HandlerError> {
     let allowed = BTreeSet::from(["topic", "path", "playbook", "offset", "limit"]);
     let unknown = payload
         .keys()
@@ -314,108 +315,57 @@ pub fn select_help_response(
             format!("unknown help field(s): {}", unknown.join(", ")),
         ));
     }
-
     let topic = string_field(payload, "topic")?;
     let path = string_field(payload, "path")?;
     let playbook = string_field(payload, "playbook")?;
-    let has_page = payload.contains_key("offset") || payload.contains_key("limit");
-
     if topic.is_some() && (path.is_some() || playbook.is_some()) {
         return Err(HandlerError::new(
             "invalid_payload",
             "topic is mutually exclusive with path/playbook",
         ));
     }
+    Ok(HelpSelection {
+        topic,
+        path,
+        playbook,
+        has_page: payload.contains_key("offset") || payload.contains_key("limit"),
+    })
+}
 
-    if topic.is_none() && path.is_none() && playbook.is_none() {
-        if has_page {
-            return Err(HandlerError::new(
-                "invalid_payload",
-                "offset/limit require an index or list-valued path",
-            ));
-        }
-        return Ok(full.into_iter().collect());
-    }
-
-    let full_value = Value::Object(full.clone());
-    let mut result = base(&full);
-
-    if let Some(playbook_name) = playbook {
-        let Some(definition) = playbooks.get(&playbook_name) else {
-            let names = playbooks
-                .keys()
-                .cloned()
-                .map(Value::String)
-                .collect::<Vec<_>>();
-            let (names, metadata) = page(names, &Map::new())?;
-            return Err(HandlerError::with_details(
-                "invalid_payload",
-                format!("unknown playbook: {playbook_name}"),
-                Map::from_iter([(
-                    "available_playbooks".into(),
-                    json!({
-                        "names": names,
-                        "total": metadata["total"],
-                        "offset": metadata["offset"],
-                        "limit": metadata["limit"],
-                        "next_offset": metadata["next_offset"],
-                        "truncated": metadata["truncated"],
-                    }),
-                )]),
-            ));
-        };
-        let definition = serde_json::to_value(definition).unwrap_or(Value::Null);
-
-        if let Some(path) = path {
-            let selected = lookup(&definition, &path)?;
-            let (selected, pagination) = project_selected(selected, payload)?;
-            let (value, refs) = neutralize(selected);
-            result.insert("playbook".into(), Value::String(playbook_name.clone()));
-            result.insert("path".into(), Value::String(path.clone()));
-            result.insert("value".into(), value);
-            if let Some(pagination) = pagination {
-                let next_offset = pagination["next_offset"].as_u64();
-                result.insert("pagination".into(), pagination.clone());
-                if let Some(next_offset) = next_offset {
-                    result.insert(
-                        "next".into(),
-                        query(
-                            "help",
-                            json!({
-                                "playbook": playbook_name,
-                                "path": path,
-                                "offset": next_offset,
-                                "limit": pagination["limit"],
-                            }),
-                        ),
-                    );
-                }
-            }
-            if let Some(presentation) = presentation(refs) {
-                result.insert("presentation".into(), presentation);
-            }
-            return Ok(result);
-        }
-
-        if has_page {
-            return Err(HandlerError::new(
-                "invalid_payload",
-                "offset/limit require a playbook subpath",
-            ));
-        }
-        let (definition, refs) = neutralize(definition);
-        result.insert("playbook".into(), Value::String(playbook_name));
-        result.insert("definition".into(), definition);
-        if let Some(presentation) = presentation(refs) {
-            result.insert("presentation".into(), presentation);
-        }
-        return Ok(result);
-    }
-
+fn select_playbook(
+    payload: &Map<String, Value>,
+    full: &Map<String, Value>,
+    playbooks: &BTreeMap<String, yaml_serde::Value>,
+    playbook_name: String,
+    path: Option<String>,
+    has_page: bool,
+) -> HandlerResult {
+    let Some(definition) = playbooks.get(&playbook_name) else {
+        let names = playbooks.keys().cloned().map(Value::String).collect();
+        let (names, metadata) = page(names, &Map::new())?;
+        return Err(HandlerError::with_details(
+            "invalid_payload",
+            format!("unknown playbook: {playbook_name}"),
+            Map::from_iter([(
+                "available_playbooks".into(),
+                json!({
+                    "names": names,
+                    "total": metadata["total"],
+                    "offset": metadata["offset"],
+                    "limit": metadata["limit"],
+                    "next_offset": metadata["next_offset"],
+                    "truncated": metadata["truncated"],
+                }),
+            )]),
+        ));
+    };
+    let definition = serde_json::to_value(definition).unwrap_or(Value::Null);
+    let mut result = base(full);
     if let Some(path) = path {
-        let selected = lookup(&full_value, &path)?;
+        let selected = lookup(&definition, &path)?;
         let (selected, pagination) = project_selected(selected, payload)?;
         let (value, refs) = neutralize(selected);
+        result.insert("playbook".into(), Value::String(playbook_name.clone()));
         result.insert("path".into(), Value::String(path.clone()));
         result.insert("value".into(), value);
         if let Some(pagination) = pagination {
@@ -427,6 +377,7 @@ pub fn select_help_response(
                     query(
                         "help",
                         json!({
+                            "playbook": playbook_name,
                             "path": path,
                             "offset": next_offset,
                             "limit": pagination["limit"],
@@ -440,10 +391,161 @@ pub fn select_help_response(
         }
         return Ok(result);
     }
+    if has_page {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            "offset/limit require a playbook subpath",
+        ));
+    }
+    let (definition, refs) = neutralize(definition);
+    result.insert("playbook".into(), Value::String(playbook_name));
+    result.insert("definition".into(), definition);
+    if let Some(presentation) = presentation(refs) {
+        result.insert("presentation".into(), presentation);
+    }
+    Ok(result)
+}
 
-    let topic = topic.ok_or_else(|| HandlerError::new("invalid_payload", "topic is required"))?;
+fn select_path(
+    payload: &Map<String, Value>,
+    full: &Map<String, Value>,
+    path: String,
+) -> HandlerResult {
+    let selected = lookup(&Value::Object(full.clone()), &path)?;
+    let (selected, pagination) = project_selected(selected, payload)?;
+    let (value, refs) = neutralize(selected);
+    let mut result = base(full);
+    result.insert("path".into(), Value::String(path.clone()));
+    result.insert("value".into(), value);
+    if let Some(pagination) = pagination {
+        let next_offset = pagination["next_offset"].as_u64();
+        result.insert("pagination".into(), pagination.clone());
+        if let Some(next_offset) = next_offset {
+            result.insert(
+                "next".into(),
+                query(
+                    "help",
+                    json!({
+                        "path": path,
+                        "offset": next_offset,
+                        "limit": pagination["limit"],
+                    }),
+                ),
+            );
+        }
+    }
+    if let Some(presentation) = presentation(refs) {
+        result.insert("presentation".into(), presentation);
+    }
+    Ok(result)
+}
+
+fn topic_index(
+    payload: &Map<String, Value>,
+    full: &Map<String, Value>,
+    playbooks: &BTreeMap<String, yaml_serde::Value>,
+) -> HandlerResult {
+    let names = playbooks.keys().cloned().map(Value::String).collect();
+    let (names, metadata) = page(names, payload)?;
+    let topics = TOPICS
+        .iter()
+        .map(|(name, _, description)| ((*name).to_owned(), Value::String((*description).into())))
+        .collect::<Map<_, _>>();
+    let mut result = base(full);
+    result.insert(
+        "summary".into(),
+        full.get("summary").cloned().unwrap_or(Value::Null),
+    );
+    result.insert("topics".into(), Value::Object(topics));
+    result.insert(
+        "path_examples".into(),
+        json!([
+            "security_model.permission_errors",
+            "security_model.allowlist_errors",
+            "navigation.exec",
+            "managing_hosts.targeting",
+        ]),
+    );
+    result.insert(
+        "playbooks".into(),
+        json!({
+            "names": names,
+            "total": metadata["total"],
+            "offset": metadata["offset"],
+            "limit": metadata["limit"],
+            "next_offset": metadata["next_offset"],
+            "truncated": metadata["truncated"],
+        }),
+    );
+    result.insert(
+        "next".into(),
+        json!({
+            "topic": query("help", json!({"topic": "security"})),
+            "path": query("help", json!({"path": "security_model.permission_errors"})),
+            "playbook": query("help", json!({"playbook": "<name>"})),
+            "next_page": metadata["next_offset"].as_u64().map(|next_offset| {
+                query(
+                    "help",
+                    json!({
+                        "topic": "index",
+                        "offset": next_offset,
+                        "limit": metadata["limit"],
+                    }),
+                )
+            }),
+            "full": query("help", json!({"topic": "all"})),
+        }),
+    );
+    Ok(result)
+}
+
+fn topic_playbooks(
+    payload: &Map<String, Value>,
+    full: &Map<String, Value>,
+    playbooks: &BTreeMap<String, yaml_serde::Value>,
+) -> HandlerResult {
+    let names = playbooks.keys().cloned().map(Value::String).collect();
+    let (names, metadata) = page(names, payload)?;
+    let mut result = base(full);
+    result.insert("topic".into(), Value::String("playbooks".into()));
+    result.insert(
+        "playbooks".into(),
+        json!({
+            "names": names,
+            "total": metadata["total"],
+            "offset": metadata["offset"],
+            "limit": metadata["limit"],
+            "next_offset": metadata["next_offset"],
+            "truncated": metadata["truncated"],
+        }),
+    );
+    result.insert(
+        "next".into(),
+        json!({
+            "playbook": query("help", json!({"playbook": "<name>"})),
+            "next_page": metadata["next_offset"].as_u64().map(|next_offset| {
+                query(
+                    "help",
+                    json!({
+                        "topic": "playbooks",
+                        "offset": next_offset,
+                        "limit": metadata["limit"],
+                    }),
+                )
+            }),
+        }),
+    );
+    Ok(result)
+}
+
+fn select_topic(
+    payload: &Map<String, Value>,
+    full: Map<String, Value>,
+    playbooks: &BTreeMap<String, yaml_serde::Value>,
+    topic: String,
+    has_page: bool,
+) -> HandlerResult {
     let topic = topic.to_ascii_lowercase();
-
     if topic == "all" {
         if has_page {
             return Err(HandlerError::new(
@@ -453,67 +555,9 @@ pub fn select_help_response(
         }
         return Ok(full.into_iter().collect());
     }
-
     if topic == "index" {
-        let names = playbooks
-            .keys()
-            .cloned()
-            .map(Value::String)
-            .collect::<Vec<_>>();
-        let (names, metadata) = page(names, payload)?;
-        let topics = TOPICS
-            .iter()
-            .map(|(name, _, description)| {
-                ((*name).to_owned(), Value::String((*description).into()))
-            })
-            .collect::<Map<_, _>>();
-        result.insert(
-            "summary".into(),
-            full.get("summary").cloned().unwrap_or(Value::Null),
-        );
-        result.insert("topics".into(), Value::Object(topics));
-        result.insert(
-            "path_examples".into(),
-            json!([
-                "security_model.permission_errors",
-                "security_model.allowlist_errors",
-                "navigation.exec",
-                "managing_hosts.targeting",
-            ]),
-        );
-        result.insert(
-            "playbooks".into(),
-            json!({
-                "names": names,
-                "total": metadata["total"],
-                "offset": metadata["offset"],
-                "limit": metadata["limit"],
-                "next_offset": metadata["next_offset"],
-                "truncated": metadata["truncated"],
-            }),
-        );
-        result.insert(
-            "next".into(),
-            json!({
-                "topic": query("help", json!({"topic": "security"})),
-                "path": query("help", json!({"path": "security_model.permission_errors"})),
-                "playbook": query("help", json!({"playbook": "<name>"})),
-                "next_page": metadata["next_offset"].as_u64().map(|next_offset| {
-                    query(
-                        "help",
-                        json!({
-                            "topic": "index",
-                            "offset": next_offset,
-                            "limit": metadata["limit"],
-                        }),
-                    )
-                }),
-                "full": query("help", json!({"topic": "all"})),
-            }),
-        );
-        return Ok(result);
+        return topic_index(payload, &full, playbooks);
     }
-
     let Some((_, key, _)) = TOPICS.iter().find(|(name, _, _)| *name == topic) else {
         return Err(HandlerError::with_details(
             "invalid_payload",
@@ -530,60 +574,60 @@ pub fn select_help_response(
             )]),
         ));
     };
-
     if topic == "playbooks" {
-        let names = playbooks
-            .keys()
-            .cloned()
-            .map(Value::String)
-            .collect::<Vec<_>>();
-        let (names, metadata) = page(names, payload)?;
-        result.insert("topic".into(), Value::String(topic));
-        result.insert(
-            "playbooks".into(),
-            json!({
-                "names": names,
-                "total": metadata["total"],
-                "offset": metadata["offset"],
-                "limit": metadata["limit"],
-                "next_offset": metadata["next_offset"],
-                "truncated": metadata["truncated"],
-            }),
-        );
-        result.insert(
-            "next".into(),
-            json!({
-                "playbook": query("help", json!({"playbook": "<name>"})),
-                "next_page": metadata["next_offset"].as_u64().map(|next_offset| {
-                    query(
-                        "help",
-                        json!({
-                            "topic": "playbooks",
-                            "offset": next_offset,
-                            "limit": metadata["limit"],
-                        }),
-                    )
-                }),
-            }),
-        );
-        return Ok(result);
+        return topic_playbooks(payload, &full, playbooks);
     }
-
     if has_page {
         return Err(HandlerError::new(
             "invalid_payload",
             "offset/limit are valid only for paged lists",
         ));
     }
-
     let value = full.get(*key).cloned().unwrap_or(Value::Null);
     let (value, refs) = neutralize(value);
+    let mut result = base(&full);
     result.insert("topic".into(), Value::String(topic));
     result.insert((*key).into(), value);
     if let Some(presentation) = presentation(refs) {
         result.insert("presentation".into(), presentation);
     }
     Ok(result)
+}
+
+/// # Errors
+/// Returns an error when the requested help path or detail selection is invalid.
+pub fn select_help_response(
+    payload: &Map<String, Value>,
+    full: Map<String, Value>,
+    playbooks: &BTreeMap<String, yaml_serde::Value>,
+) -> HandlerResult {
+    let selection = help_selection(payload)?;
+    if selection.topic.is_none() && selection.path.is_none() && selection.playbook.is_none() {
+        if selection.has_page {
+            return Err(HandlerError::new(
+                "invalid_payload",
+                "offset/limit require an index or list-valued path",
+            ));
+        }
+        return Ok(full.into_iter().collect());
+    }
+    if let Some(playbook) = selection.playbook {
+        return select_playbook(
+            payload,
+            &full,
+            playbooks,
+            playbook,
+            selection.path,
+            selection.has_page,
+        );
+    }
+    if let Some(path) = selection.path {
+        return select_path(payload, &full, path);
+    }
+    let topic = selection
+        .topic
+        .ok_or_else(|| HandlerError::new("invalid_payload", "topic is required"))?;
+    select_topic(payload, full, playbooks, topic, selection.has_page)
 }
 
 #[cfg(test)]
