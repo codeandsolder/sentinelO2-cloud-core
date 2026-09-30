@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Return success when a Cargo.lock is safe to build fully offline from crates.io cache."""
+"""Return success when a Cargo.lock is fully satisfiable from the local Cargo cache."""
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 CRATES_IO_SOURCES = {
     "registry+https://github.com/rust-lang/crates.io-index",
@@ -22,6 +24,62 @@ def index_rel(name: str) -> Path:
     if len(name) == 3:
         return Path("3") / name[0] / name
     return Path(name[:2]) / name[2:4] / name
+
+
+def git_output(*args: str) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def git_source_ready(source: str, cargo_home: Path) -> bool:
+    if "#" not in source:
+        return False
+    oid = source.rsplit("#", 1)[1].lower()
+    if len(oid) not in (40, 64) or any(ch not in "0123456789abcdef" for ch in oid):
+        return False
+
+    checkout_root = cargo_home / "git" / "checkouts"
+    db_root = (cargo_home / "git" / "db").resolve()
+    if not checkout_root.is_dir() or not db_root.is_dir():
+        return False
+
+    for repo_dir in checkout_root.iterdir():
+        if not repo_dir.is_dir():
+            continue
+        for checkout in repo_dir.iterdir():
+            if not checkout.is_dir() or not (checkout / ".cargo-ok").is_file():
+                continue
+            if git_output("-C", str(checkout), "rev-parse", "HEAD") != oid:
+                continue
+
+            origin = git_output("-C", str(checkout), "config", "--get", "remote.origin.url")
+            if not origin:
+                continue
+            parsed = urlparse(origin)
+            if parsed.scheme != "file":
+                continue
+            db_path = Path(unquote(parsed.path)).resolve()
+            try:
+                db_path.relative_to(db_root)
+            except ValueError:
+                continue
+            if (
+                git_output(
+                    f"--git-dir={db_path}",
+                    "cat-file",
+                    "-e",
+                    f"{oid}^{{commit}}",
+                )
+                is not None
+            ):
+                return True
+    return False
 
 
 def main() -> int:
@@ -41,20 +99,26 @@ def main() -> int:
 
     cache_dirs = sorted((cargo_home / "registry" / "cache").glob("index.crates.io-*"))
     index_dirs = sorted((cargo_home / "registry" / "index").glob("index.crates.io-*"))
-    if not cache_dirs or not index_dirs:
-        return 1
-
-    # Sparse/index metadata needs config.json as well as each package entry.
     usable_index_dirs = [d for d in index_dirs if (d / "config.json").is_file()]
-    if not usable_index_dirs:
-        return 1
+    checked_git: dict[str, bool] = {}
 
     for pkg in data.get("package", []):
         source = pkg.get("source")
         if source is None:
             continue
+        if source.startswith("git+"):
+            ready = checked_git.get(source)
+            if ready is None:
+                ready = git_source_ready(source, cargo_home)
+                checked_git[source] = ready
+            if not ready:
+                return 1
+            continue
+
         if source not in CRATES_IO_SOURCES:
-            # Git and alternate registries stay on Cargo's normal online path.
+            # Alternate registries stay on Cargo's normal online path.
+            return 1
+        if not cache_dirs or not usable_index_dirs:
             return 1
 
         name = pkg.get("name")
