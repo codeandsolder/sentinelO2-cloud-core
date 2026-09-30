@@ -487,7 +487,7 @@ fn parse_file_ops_paths(
 }
 
 fn parse_preferred_profile(value: Option<&String>) -> Result<Option<String>, PolicyError> {
-    match value.as_deref() {
+    match value.map(String::as_str) {
         Some("compact") => Ok(Some("compact".into())),
         Some("full") => Ok(Some("full".into())),
         None => Ok(None),

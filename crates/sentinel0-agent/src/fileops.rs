@@ -801,6 +801,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         }
     }
 
+    let truncated = state.matches.len() >= state.cap;
     Ok(BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
         ("path".into(), Value::String(root.display().to_string())),
@@ -809,10 +810,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("files_searched".into(), Value::from(state.files_searched)),
         ("search_error_count".into(), Value::from(state.error_count)),
         ("search_errors".into(), Value::Array(state.errors)),
-        (
-            "truncated".into(),
-            Value::Bool(state.matches.len() >= state.cap),
-        ),
+        ("truncated".into(), Value::Bool(truncated)),
     ]))
 }
 
