@@ -401,11 +401,11 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
 EOF
 printf 'crate\n' >"$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
 printf 'index\n' >"$offline_home/registry/index/index.crates.io-test/.cache/se/rd/serde"
-"$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"
+python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"
 
 # Missing archive is a conservative miss.
 rm "$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
-if "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
+if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
     echo "offline readiness unexpectedly accepted a missing archive" >&2
     exit 1
 fi
@@ -419,7 +419,7 @@ name = "example"
 version = "1.0.0"
 source = "git+https://example.invalid/repo#0123456789abcdef"
 EOF
-if "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
+if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
     echo "offline readiness unexpectedly accepted a git dependency" >&2
     exit 1
 fi
