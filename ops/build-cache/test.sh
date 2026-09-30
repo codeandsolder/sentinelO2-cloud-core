@@ -410,17 +410,52 @@ if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
     exit 1
 fi
 
-# Git/alternate sources must never take the auto-offline path.
+# A locked git dependency is ready only when Cargo has both the exact object
+# in its git DB and a completed checkout at that OID.
+git_src="$tmp/offline-git-src"
+git_db="$offline_home/git/db/example-ident"
+git_checkout_root="$offline_home/git/checkouts/example-ident"
+mkdir -p "$git_src" "$(dirname "$git_db")" "$git_checkout_root"
+git -C "$git_src" init -q
+git -C "$git_src" config user.name test
+git -C "$git_src" config user.email test@example.invalid
+printf 'cached git\n' >"$git_src/lib.rs"
+git -C "$git_src" add lib.rs
+git -C "$git_src" commit -qm initial
+git_oid="$(git -C "$git_src" rev-parse HEAD)"
+git clone -q --bare "$git_src" "$git_db"
+git_checkout="$git_checkout_root/${git_oid:0:7}"
+git clone -q "$git_db" "$git_checkout"
+git -C "$git_checkout" config remote.origin.url "file://$git_db"
+touch "$git_checkout/.cargo-ok"
+
+cat >"$offline_ws/Cargo.lock" <<EOF
+version = 4
+
+[[package]]
+name = "example"
+version = "1.0.0"
+source = "git+https://example.invalid/repo#$git_oid"
+EOF
+python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"
+
+rm "$git_checkout/.cargo-ok"
+if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
+    echo "offline readiness unexpectedly accepted a stale git checkout" >&2
+    exit 1
+fi
+
+# Alternate registries remain conservative misses.
 cat >"$offline_ws/Cargo.lock" <<'EOF'
 version = 4
 
 [[package]]
 name = "example"
 version = "1.0.0"
-source = "git+https://example.invalid/repo#0123456789abcdef"
+source = "registry+https://example.invalid/index"
 EOF
 if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
-    echo "offline readiness unexpectedly accepted a git dependency" >&2
+    echo "offline readiness unexpectedly accepted an alternate registry" >&2
     exit 1
 fi
 
