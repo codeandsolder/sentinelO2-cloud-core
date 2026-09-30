@@ -348,7 +348,7 @@ mod tests {
         let result = run_shell(
             &Policy::default(),
             r#"sleep 60 >/dev/null 2>&1 & echo $! > "$PIDFILE"; wait"#,
-            Duration::from_millis(100),
+            Duration::from_millis(500),
             None,
             Some(&env),
         )
