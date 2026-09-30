@@ -4,19 +4,139 @@ set -uo pipefail
 CONF="${SENTINELX_BUILD_SCRATCH_CONF:-/etc/sentinelx/build-scratch.conf}"
 [[ -r "$CONF" ]] && . "$CONF"
 
-REAL_CARGO="${SENTINELX_REAL_CARGO:-/opt/toolchains/cargo/bin/cargo}"
+REAL_CARGO="${SENTINELX_REAL_CARGO:-/usr/local/libexec/cargo-rustup-real}"
 TARGET_ROOT="${SENTINELX_CARGO_TARGET_ROOT:-/var/cache/sentinelx/cargo-target}"
+TARGET_LOCK_ROOT="${SENTINELX_CARGO_TARGET_LOCK_ROOT:-$TARGET_ROOT/../cargo-target-locks}"
 PRUNER="${SENTINELX_CARGO_TARGET_PRUNER:-/usr/local/libexec/sentinelx-bin/cargo-target-prune}"
+SOURCE_TMP_ROOT="${SENTINELX_CARGO_SOURCE_TMP_ROOT:-/var/cache/sentinelx/cargo-source-tmp}"
+INFRA_LOCK="${SENTINELX_CARGO_INFRA_LOCK:-/var/cache/sentinelx/.cargo-infra.lock}"
+MAINTENANCE_MARKER="${SENTINELX_CARGO_MAINTENANCE_MARKER:-/var/cache/sentinelx/.cargo-maintenance}"
+
+cargo_args=("$@")
+toolchain=""
+case "$0" in
+    */toolchains/*/bin/cargo)
+        if [[ -z "${RUSTUP_TOOLCHAIN:-}" ]]; then
+            toolchain_parent="${0%/bin/cargo}"
+            export RUSTUP_TOOLCHAIN="${toolchain_parent##*/}"
+        fi
+        ;;
+esac
+
+if (( ${#cargo_args[@]} )) && [[ "${cargo_args[0]}" == +* ]]; then
+    toolchain="${cargo_args[0]#+}"
+    cargo_args=("${cargo_args[@]:1}")
+    export RUSTUP_TOOLCHAIN="$toolchain"
+fi
+
+export EPHEMERAL_CARGO_WRAPPER="${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/libexec/sentinelx-bin/cargo}"
+export CARGO="$EPHEMERAL_CARGO_WRAPPER"
+
+nested_wrapper=0
+if [[ -n "${EPHEMERAL_CARGO_REGISTRY_SRC:-}" || "${EPHEMERAL_CARGO_WRAPPER_ACTIVE:-0}" == 1 ]]; then
+    nested_wrapper=1
+fi
+export EPHEMERAL_CARGO_WRAPPER_ACTIVE=1
+
+maintenance_active() {
+    [[ -f "$MAINTENANCE_MARKER" ]] || return 1
+    local pid=""
+    read -r pid <"$MAINTENANCE_MARKER" 2>/dev/null || true
+    if [[ "$pid" =~ ^[0-9]+$ && -d "/proc/$pid" ]]; then
+        return 0
+    fi
+    rm -f "$MAINTENANCE_MARKER" 2>/dev/null || return 0
+    return 1
+}
+
+mkdir -p "$(dirname "$INFRA_LOCK")"
+exec 7>"$INFRA_LOCK"
+if (( nested_wrapper )); then
+    flock -s 7
+else
+    while :; do
+        while maintenance_active; do
+            sleep 0.2
+        done
+        flock -s 7
+        if ! maintenance_active; then
+            break
+        fi
+        flock -u 7
+    done
+fi
+
+source_slot="$SOURCE_TMP_ROOT/uid-$(id -u)"
+source_tmp="$source_slot/src"
+source_last_used="$source_slot/.last-used"
+source_prune_checked="$source_slot/.prune-checked"
+mkdir -p "$source_slot"
+exec 8>"$source_slot/.active.lock"
+
+source_pool_bytes() {
+    [[ -d "$source_tmp" ]] || {
+        printf '0\n'
+        return
+    }
+    du -s -B1 "$source_tmp" 2>/dev/null | awk '{print $1+0}'
+}
+
+prune_source_pool() {
+    local max="${SENTINELX_CARGO_SOURCE_MAX_BYTES:-1073741824}"
+    local idle="${SENTINELX_CARGO_SOURCE_MAX_IDLE_SECONDS:-21600}"
+    local interval="${SENTINELX_CARGO_SOURCE_PRUNE_INTERVAL_SECONDS:-300}"
+    local bytes now last checked age
+    now="$(date +%s)"
+    checked=0
+    if [[ -e "$source_prune_checked" ]]; then
+        checked="$(stat -c %Y "$source_prune_checked" 2>/dev/null || echo 0)"
+    fi
+    if (( checked > 0 && interval > 0 && now - checked < interval )); then
+        return
+    fi
+
+    bytes="$(source_pool_bytes)"
+    last=0
+    if [[ -e "$source_last_used" ]]; then
+        last="$(stat -c %Y "$source_last_used" 2>/dev/null || echo 0)"
+    elif [[ -d "$source_tmp" ]]; then
+        last="$(stat -c %Y "$source_tmp" 2>/dev/null || echo 0)"
+    fi
+    age=$(( now - last ))
+
+    if (( bytes > max )) || (( last > 0 && idle > 0 && age > idle )); then
+        rm -rf -- "$source_tmp"
+    fi
+    mkdir -p "$source_tmp"
+    touch "$source_prune_checked" 2>/dev/null || true
+}
+
+# If the pool is idle, one entrant may cheaply reclaim an oversized/stale pool.
+# Active Cargo users retain shared access and are never disrupted.
+if flock -n -x 8; then
+    prune_source_pool
+    flock -u 8
+fi
+flock -s 8
+mkdir -p "$source_tmp"
+export EPHEMERAL_CARGO_REGISTRY_SRC="$source_tmp"
+
+finish_source_pool() {
+    touch "$source_last_used" 2>/dev/null || true
+    flock -u 8 2>/dev/null || true
+    if flock -n -x 8; then
+        # The just-touched pool cannot age out here, but the hard size cap still
+        # keeps registry extraction bounded on the NVMe tier.
+        prune_source_pool
+        touch "$source_last_used" 2>/dev/null || true
+        flock -u 8 2>/dev/null || true
+    fi
+}
 
 compile=0
-toolchain=""
-for arg in "$@"; do
-    if [[ -z "$toolchain" && "$arg" == +* ]]; then
-        toolchain="$arg"
-        continue
-    fi
+for arg in "${cargo_args[@]}"; do
     case "$arg" in
-        build|check|test|run|bench|rustc|doc|clippy|fix|clean)
+        build|check|test|run|bench|rustc|rustdoc|doc|clippy|fix|install|package|publish)
             compile=1
             break
             ;;
@@ -24,14 +144,15 @@ for arg in "$@"; do
 done
 
 if (( ! compile )); then
-    exec "$REAL_CARGO" "$@"
+    "$REAL_CARGO" "${cargo_args[@]}"
+    rc=$?
+    finish_source_pool
+    exit "$rc"
 fi
 
-mkdir -p "$TARGET_ROOT"
+mkdir -p "$TARGET_ROOT" "$TARGET_LOCK_ROOT"
 
-locate=( "$REAL_CARGO" )
-[[ -n "$toolchain" ]] && locate+=( "$toolchain" )
-locate+=( locate-project --workspace --message-format plain )
+locate=("$REAL_CARGO" locate-project --workspace --message-format plain)
 manifest="$("${locate[@]}" 2>/dev/null || true)"
 
 if [[ -n "$manifest" ]]; then
@@ -43,12 +164,14 @@ fi
 hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
 name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
 target="$TARGET_ROOT/${name}-${hash}"
+target_lock="$TARGET_LOCK_ROOT/${name}-${hash}.lock"
 mkdir -p "$target"
 touch "$target/.last-used"
 
-# Several Cargo processes may legitimately share one workspace target. Pruning
-# takes an exclusive lock and therefore never removes an active target tree.
-exec 9>"$target/.sentinelx-build.lock"
+# The lock lives outside the disposable target tree. This avoids the inode
+# recreation race that is possible when a pruner removes a lock file together
+# with the directory it protects.
+exec 9>"$target_lock"
 flock -s 9
 
 "$PRUNER" >/dev/null 2>&1 || true
@@ -58,12 +181,10 @@ avail="$(df -B1 --output=avail "$TARGET_ROOT" 2>/dev/null | tail -n1 | tr -d ' '
 if [[ "$avail" =~ ^[0-9]+$ ]] && (( avail < min_free )); then
     echo "cargo: NVMe scratch has only $avail bytes free; reserve is $min_free. Refusing to fill the root filesystem." >&2
     flock -u 9
+    finish_source_pool
     exit 75
 fi
 
-# Compiler/build-script temporary files are hot scratch too. Keep them beside
-# the NVMe target tree and remove them when this Cargo invocation exits instead
-# of sending them through the HDD-backed global /tmp.
 build_tmp="$target/.tmp-$$"
 mkdir -p "$build_tmp"
 export TMPDIR="$build_tmp"
@@ -71,17 +192,78 @@ export TMP="$build_tmp"
 export TEMP="$build_tmp"
 export CARGO_TARGET_DIR="$target"
 
+artifact_root="${SENTINELX_CARGO_ARTIFACT_ROOT:-$workspace/target}"
+
+mirror_final_artifacts() {
+    [[ "${SENTINELX_CARGO_ARTIFACT_MIRROR:-1}" == 1 ]] || return 0
+    [[ "$artifact_root" != "$target" ]] || return 0
+
+    local file rel base dest tmp
+    while IFS= read -r -d '' file; do
+        rel="${file#"$target"/}"
+        case "/$rel/" in
+            */.fingerprint/*|*/deps/*|*/build/*|*/incremental/*|*/doc/*|*/.tmp-*/*)
+                continue
+                ;;
+        esac
+
+        base="${file##*/}"
+        case "$base" in
+            *.d|*.rmeta|.cargo-lock|.rustc_info.json|.last-used|.sentinelx-build.lock)
+                continue
+                ;;
+        esac
+
+        if [[ ! -x "$file" && ! "$base" =~ \.(rlib|a|so|dylib|dll|lib|wasm|pdb)$ ]]; then
+            continue
+        fi
+
+        dest="$artifact_root/$rel"
+        mkdir -p "$(dirname "$dest")"
+        tmp="$dest.sentinelx-tmp-$$"
+        rm -f -- "$tmp"
+        if ! cp -a --reflink=auto -- "$file" "$tmp" 2>/dev/null; then
+            cp -a -- "$file" "$tmp"
+        fi
+        mv -f -- "$tmp" "$dest"
+    done < <(
+        find "$target" \
+            \( -type d \( -name .fingerprint -o -name deps -o -name build -o -name incremental -o -name doc -o -name '.tmp-*' \) -prune \) -o \
+            -type f -print0 2>/dev/null
+    )
+}
+
 cleanup() {
     rc=$?
+    trap - EXIT INT TERM HUP
+
     rm -rf -- "$build_tmp" 2>/dev/null || true
     touch "$target/.last-used" 2>/dev/null || true
 
-    # Keep the just-used target's shared lock held through pruning. This makes
-    # self-eviction impossible even if the LRU metadata is stale or malformed.
+    if (( rc == 0 )); then
+        mirror_final_artifacts || rc=$?
+    fi
+
+    # Prune other inactive scratch targets while this workspace remains
+    # protected by its shared external lock.
     "$PRUNER" >/dev/null 2>&1 || true
+
     flock -u 9 2>/dev/null || true
+
+    # Successful targets are scratch-only. The last Cargo using this workspace
+    # upgrades to the external exclusive lock and reclaims all intermediates.
+    # If another same-workspace Cargo is still active, it will perform cleanup
+    # when it becomes the last successful user.
+    if (( rc == 0 )) && [[ "${SENTINELX_CARGO_TARGET_EPHEMERAL:-1}" == 1 ]]; then
+        if flock -n -x 9; then
+            rm -rf -- "$target" 2>/dev/null || true
+            flock -u 9 2>/dev/null || true
+        fi
+    fi
+
+    finish_source_pool
     exit "$rc"
 }
 trap cleanup EXIT INT TERM HUP
 
-"$REAL_CARGO" "$@"
+"$REAL_CARGO" "${cargo_args[@]}"
