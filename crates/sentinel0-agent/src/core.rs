@@ -5,11 +5,13 @@ use crate::{
     policy::Policy,
     segment, shell,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use num_traits::ToPrimitive;
 use sentinel0_proto::{Message, Op};
 use serde_json::{Map, Value, json};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -19,6 +21,26 @@ use std::{
 const MAX_CONCURRENT_SCANS: usize = 4;
 static SCAN_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS)));
+
+fn decode_exec_command(command: &str) -> Result<Cow<'_, str>, HandlerError> {
+    let Some(encoded) = command.strip_prefix("b64,") else {
+        return Ok(Cow::Borrowed(command));
+    };
+
+    let bytes = STANDARD.decode(encoded).map_err(|error| {
+        HandlerError::new(
+            "invalid_payload",
+            format!("invalid b64 command payload: {error}"),
+        )
+    })?;
+    let decoded = String::from_utf8(bytes).map_err(|error| {
+        HandlerError::new(
+            "invalid_payload",
+            format!("b64 command payload is not valid UTF-8: {error}"),
+        )
+    })?;
+    Ok(Cow::Owned(decoded))
+}
 
 #[derive(Clone)]
 pub struct CoreDispatcher {
@@ -738,7 +760,8 @@ impl CoreDispatcher {
     }
 
     async fn exec(&self, payload: &Map<String, Value>) -> HandlerResult {
-        let command = require_str(payload, "command")?;
+        let command = decode_exec_command(require_str(payload, "command")?)?;
+        let command = command.as_ref();
         let timeout_secs = payload
             .get("timeout")
             .and_then(Value::as_f64)
@@ -1320,6 +1343,102 @@ mod tests {
                 .contains("enforcement is enabled")
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn exec_b64_command_decodes_utf8_and_leaves_plain_commands_unchanged() -> TestResult {
+        let plain = "printf 'hello\\n'";
+        assert_eq!(decode_exec_command(plain)?.as_ref(), plain);
+
+        let encoded = STANDARD.encode(plain);
+        let encoded_command = format!("b64,{encoded}");
+        let decoded = decode_exec_command(&encoded_command)?;
+        assert_eq!(decoded.as_ref(), plain);
+        Ok(())
+    }
+
+    #[test]
+    fn exec_b64_command_rejects_invalid_base64_and_utf8() -> TestResult {
+        let Err(invalid_base64) = decode_exec_command("b64,%%%") else {
+            return Err(std::io::Error::other("invalid base64 was accepted").into());
+        };
+        assert_eq!(invalid_base64.code, "invalid_payload");
+        assert!(
+            invalid_base64
+                .message
+                .contains("invalid b64 command payload")
+        );
+
+        let Err(invalid_utf8) = decode_exec_command("b64,/w==") else {
+            return Err(std::io::Error::other("invalid UTF-8 was accepted").into());
+        };
+        assert_eq!(invalid_utf8.code, "invalid_payload");
+        assert!(
+            invalid_utf8
+                .message
+                .contains("b64 command payload is not valid UTF-8")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exec_b64_command_is_checked_after_decoding() -> TestResult {
+        let policy = Policy {
+            allowed_commands: vec!["printf".into()],
+            exec_enforce_allowlist: true,
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
+
+        let allowed = format!("b64,{}", STANDARD.encode("printf b64-ok"));
+        let Message::Response { ok: true, .. } = dispatcher
+            .dispatch(
+                "exec-b64-allowed",
+                Op::Exec,
+                Map::from_iter([("command".into(), Value::String(allowed))]),
+            )
+            .await
+            .message
+        else {
+            return Err(std::io::Error::other("allowed b64 command failed").into());
+        };
+
+        let denied = format!("b64,{}", STANDARD.encode("echo should-not-run"));
+        let Message::Response {
+            ok: false,
+            error: Some(error),
+            ..
+        } = dispatcher
+            .dispatch(
+                "exec-b64-denied",
+                Op::Exec,
+                Map::from_iter([("command".into(), Value::String(denied))]),
+            )
+            .await
+            .message
+        else {
+            return Err(std::io::Error::other("disallowed b64 command was accepted").into());
+        };
+        assert_eq!(error.code, "command_not_allowed");
+
+        let python = format!("b64,{}", STANDARD.encode("python3 -c 'print(1)'"));
+        let Message::Response {
+            ok: false,
+            error: Some(error),
+            ..
+        } = dispatcher
+            .dispatch(
+                "exec-b64-python",
+                Op::Exec,
+                Map::from_iter([("command".into(), Value::String(python))]),
+            )
+            .await
+            .message
+        else {
+            return Err(std::io::Error::other("encoded direct Python was accepted").into());
+        };
+        assert_eq!(error.code, "use_uv");
         Ok(())
     }
 

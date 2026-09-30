@@ -23,6 +23,12 @@ tooling:
 
 Host-wide installation layout is intentionally outside this repository: SentinelO2 consumes configured/global tools but does not rearrange machine Rust, uv, sccache, or filesystem mounts.
 
+## Exec command encoding
+
+The `exec` operation accepts ordinary UTF-8 shell text in `command`. For multiline or escaping-heavy commands, callers may instead pass `b64,<payload>`, where `<payload>` is standard Base64 encoding of the UTF-8 command text.
+
+The agent decodes this prefix before direct-Python, strict-segmentation, and command-allowlist checks. Invalid Base64 or decoded non-UTF-8 is rejected as `invalid_payload`; encoded commands do not bypass normal exec policy.
+
 ## Exec allowlist
 
 `allowed_commands` remains accepted for compatibility with existing SentinelX configuration, but it is not enforced by default. Set `exec.enforce_allowlist: true` to opt in. Legacy `exec_strict: true` also implies enforcement and keeps the strict segmentation/substitution checks.
