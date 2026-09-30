@@ -226,6 +226,13 @@ if active_clients; then
     exit 0
 fi
 
+# The pre-managed daemon predates deterministic background-task draining.
+# Once no compiler clients remain, give any legacy detached Garage write a
+# final quiet window. Managed e5d3+ daemons drain background work on shutdown.
+if [[ ! -r "$STATE_DIR/source_sha" ]]; then
+    sleep 5
+fi
+
 systemctl stop "$LOCAL_SERVICE"
 install -o root -g root -m 0755 "$release_dir/sccache-linux-x86_64-v2" "$LIVE.new"
 mv -f "$LIVE.new" "$LIVE"
