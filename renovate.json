@@ -10,22 +10,13 @@
   "prHourlyLimit": 0,
   "rebaseWhen": "behind-base-branch",
   "lockFileMaintenance": {
-    "enabled": true,
-    "schedule": ["before 3am"],
-    "automerge": true,
-    "automergeType": "pr"
+    "enabled": false
   },
   "packageRules": [
     {
       "description": "Automerge ordinary compatible updates after CI",
       "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
       "matchCurrentVersion": "!/^0/",
-      "automerge": true,
-      "automergeType": "pr"
-    },
-    {
-      "description": "Cargo lockfile maintenance uses the global 3-day release age",
-      "matchUpdateTypes": ["lockFileMaintenance"],
       "automerge": true,
       "automergeType": "pr"
     },
