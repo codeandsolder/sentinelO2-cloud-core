@@ -6,15 +6,16 @@ use sentinel0_agent::{
     core::CoreDispatcher,
     host,
     identity::load_identity,
+    instance_lock::{self, EXIT_ALREADY_RUNNING, InstanceLockError},
     policy::Policy,
     rotation::{RotationConfig, load_effective_identity},
 };
 use sentinel0_proto::PreferredProfile;
 use std::{error::Error, path::PathBuf, time::Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-const AGENT_VERSION: &str = "0.22.0-rust.1";
+const AGENT_VERSION: &str = "0.23.1-rust.1";
 
 #[derive(Debug, Parser)]
 #[command(name = "sentinelx-core")]
@@ -140,6 +141,25 @@ async fn run_agent(args: Args) -> Result<(), Box<dyn Error>> {
         ))
         .into());
     }
+
+    let _instance_lock = match instance_lock::acquire(&args.identity, &identity.host_id) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            warn!("no writable state directory; running without the single-instance lock");
+            None
+        }
+        Err(InstanceLockError::AlreadyRunning { path, holder }) => {
+            let holder = holder.map_or_else(|| "?".to_owned(), |pid| pid.to_string());
+            error!(
+                host_id = %identity.host_id,
+                lock = %path.display(),
+                pid = %holder,
+                "another SentinelX agent is already running for this host; exiting so the two do not keep dropping each other"
+            );
+            std::process::exit(EXIT_ALREADY_RUNNING);
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let config = AgentConfig {
         hub_ws_base: ws_base(&hub),

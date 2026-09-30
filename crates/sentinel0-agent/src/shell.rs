@@ -87,16 +87,28 @@ fn kill_group(_pid: Option<u32>) -> Option<String> {
     None
 }
 
-fn kill_live_group(child: &mut tokio::process::Child, pid: Option<u32>) -> Option<String> {
-    match child.try_wait() {
-        Ok(Some(_)) => None,
-        Ok(None) => kill_group(pid),
-        Err(error) => {
-            let message = format!(
-                "failed checking child state before process-group cleanup: {error}; refusing PID-based group signal"
-            );
-            tracing::warn!(%message);
-            Some(message)
+#[derive(Debug)]
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    const fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(error) = kill_group(self.pid)
+        {
+            tracing::warn!(%error, "failed cleaning process group after command cancellation");
         }
     }
 }
@@ -141,11 +153,13 @@ pub async fn run_argv(
         )
     })?;
     let pid = child.id();
+    let mut process_group_guard = ProcessGroupGuard::new(pid);
     let wait_outcome =
         match wait_bounded(&mut child, timeout_duration, policy.exec_capture_max_bytes).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                let kill_error = kill_live_group(&mut child, pid);
+                let kill_error = kill_group(pid);
+                process_group_guard.disarm();
                 if let Err(wait_error) = child.wait().await {
                     tracing::warn!(%wait_error, "failed reaping child after output-capture error");
                 }
@@ -163,6 +177,7 @@ pub async fn run_argv(
 
     match wait_outcome {
         WaitOutcome::Completed(captured) => {
+            process_group_guard.disarm();
             let rc = captured.status.code().unwrap_or(-1);
             Ok(result(
                 merged_output(&captured),
@@ -174,7 +189,8 @@ pub async fn run_argv(
             ))
         }
         WaitOutcome::TimedOut => {
-            let kill_error = kill_live_group(&mut child, pid);
+            let kill_error = kill_group(pid);
+            process_group_guard.disarm();
             if let Err(error) = child.wait().await {
                 tracing::warn!(%error, "failed reaping timed-out child");
             }
@@ -281,6 +297,135 @@ mod tests {
         assert_eq!(result["stdout_bytes"], 1_000_000);
         assert!(result["output"].as_str().test_value()?.len() < 80_000);
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_alive(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
+            .is_some_and(|state| state != 'Z')
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_exit(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_is_alive(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        !process_is_alive(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn child_pid_from(path: &Path) -> TestResult<u32> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return Ok(pid);
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("child PID file was not written").into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timeout_kills_detached_descendants() -> TestResult {
+        let dir = tempfile::tempdir().test_value()?;
+        let pidfile = dir.path().join("child.pid");
+        let mut env = Map::new();
+        env.insert(
+            "PIDFILE".into(),
+            Value::String(pidfile.display().to_string()),
+        );
+        let result = run_shell(
+            &Policy::default(),
+            r#"sleep 60 >/dev/null 2>&1 & echo $! > "$PIDFILE"; wait"#,
+            Duration::from_millis(500),
+            None,
+            Some(&env),
+        )
+        .await
+        .test_value()?;
+
+        assert_eq!(result["returncode"], -1);
+        let pid = child_pid_from(&pidfile).await?;
+        assert!(
+            wait_for_process_exit(pid).await,
+            "descendant {pid} survived timeout"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timeout_is_not_held_open_by_descendant_pipes() -> TestResult {
+        let started = Instant::now();
+        let result = run_shell(
+            &Policy::default(),
+            "sleep 20 & sleep 20 & wait",
+            Duration::from_millis(100),
+            None,
+            None,
+        )
+        .await
+        .test_value()?;
+
+        assert_eq!(result["returncode"], -1);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout waited for descendant pipes: {:?}",
+            started.elapsed()
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancellation_kills_the_whole_process_group() -> TestResult {
+        let dir = tempfile::tempdir().test_value()?;
+        let pidfile = dir.path().join("child.pid");
+        let pidfile_for_task = pidfile.clone();
+        let task = tokio::spawn(async move {
+            let mut env = Map::new();
+            env.insert(
+                "PIDFILE".into(),
+                Value::String(pidfile_for_task.display().to_string()),
+            );
+            run_shell(
+                &Policy::default(),
+                r#"sleep 60 >/dev/null 2>&1 & echo $! > "$PIDFILE"; wait"#,
+                Duration::from_secs(30),
+                None,
+                Some(&env),
+            )
+            .await
+        });
+
+        let pid = child_pid_from(&pidfile).await?;
+        assert!(process_is_alive(pid), "fixture descendant was not alive");
+        task.abort();
+        let join_error = match task.await {
+            Err(error) => error,
+            Ok(result) => {
+                return Err(std::io::Error::other(format!(
+                    "cancelled exec unexpectedly completed: {result:?}"
+                ))
+                .into());
+            }
+        };
+        assert!(join_error.is_cancelled());
+        assert!(
+            wait_for_process_exit(pid).await,
+            "descendant {pid} survived cancellation"
+        );
         Ok(())
     }
 }

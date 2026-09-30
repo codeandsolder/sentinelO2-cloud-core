@@ -46,14 +46,18 @@ fn directory_is_writable(path: &Path) -> bool {
     path.is_dir() && access(path, AccessFlags::W_OK).is_ok()
 }
 
-fn rotated_path(identity_path: &Path) -> Option<PathBuf> {
+pub(crate) fn state_dir(identity_path: &Path) -> Option<PathBuf> {
     let system = Path::new(SYSTEM_STATE_DIR);
     if directory_is_writable(system) {
-        return Some(system.join(ROTATED_NAME));
+        return Some(system.to_owned());
     }
 
     let parent = identity_path.parent()?;
-    directory_is_writable(parent).then(|| parent.join(ROTATED_NAME))
+    directory_is_writable(parent).then(|| parent.to_owned())
+}
+
+fn rotated_path(identity_path: &Path) -> Option<PathBuf> {
+    state_dir(identity_path).map(|directory| directory.join(ROTATED_NAME))
 }
 
 fn claims(token: &str) -> Option<Value> {
