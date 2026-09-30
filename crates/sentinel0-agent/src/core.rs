@@ -543,9 +543,9 @@ impl CoreDispatcher {
         }
         if self.help_ops_live(&[Op::Exec]) && exec_policy_allows_any {
             let description = if self.policy.exec_enforce_allowlist {
-                "run a shell command covered by this host's configured command allowlist; prefix command with b64,<standard-base64-utf8> to avoid escaping issues"
+                "run a shell command covered by this host's configured command allowlist"
             } else {
-                "run a shell command; command allowlist enforcement is disabled on this host; prefix command with b64,<standard-base64-utf8> to avoid escaping issues"
+                "run a shell command; command allowlist enforcement is disabled on this host"
             };
             navigation.insert("exec".into(), Value::String(description.into()));
         }
@@ -1359,9 +1359,8 @@ mod tests {
 
     #[test]
     fn exec_b64_command_rejects_invalid_base64_and_utf8() -> TestResult {
-        let invalid_base64 = match decode_exec_command("b64,%%%") {
-            Ok(_) => return Err(std::io::Error::other("invalid base64 was accepted").into()),
-            Err(error) => error,
+        let Err(invalid_base64) = decode_exec_command("b64,%%%") else {
+            return Err(std::io::Error::other("invalid base64 was accepted").into());
         };
         assert_eq!(invalid_base64.code, "invalid_payload");
         assert!(
@@ -1370,9 +1369,8 @@ mod tests {
                 .contains("invalid b64 command payload")
         );
 
-        let invalid_utf8 = match decode_exec_command("b64,/w==") {
-            Ok(_) => return Err(std::io::Error::other("invalid UTF-8 was accepted").into()),
-            Err(error) => error,
+        let Err(invalid_utf8) = decode_exec_command("b64,/w==") else {
+            return Err(std::io::Error::other("invalid UTF-8 was accepted").into());
         };
         assert_eq!(invalid_utf8.code, "invalid_payload");
         assert!(
