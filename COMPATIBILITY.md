@@ -22,6 +22,10 @@ Reference surfaces:
 ### Transport and protocol
 
 - Bearer authorization on `/agent/connect`; token is never placed in the URL.
+- `--verify-enrollment` performs a one-shot authenticated WebSocket probe and
+  distinguishes hub rejection from network failure. A policy close (`1008`)
+  is classified as `enrollment_rejected`, matching the upstream close/frame
+  race as well as explicit JSON error frames.
 - SentinelX protocol 1.13.0 constants and all 31 official operation names.
 - Strict JSON message parsing equivalent to Pydantic `extra="forbid"`.
 - `opaque_ref` maximum length of 256 characters.

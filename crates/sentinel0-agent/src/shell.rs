@@ -301,35 +301,51 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn process_is_alive(pid: u32) -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    #[derive(Clone, Copy, Debug)]
+    struct ProcessStamp {
+        pid: u32,
+        start_time: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_process_stat(stat: &str) -> Option<(ProcessStamp, char)> {
+        let (pid_and_name, fields) = stat.rsplit_once(") ")?;
+        let pid = pid_and_name.split_once(' ')?.0.parse().ok()?;
+        let mut fields = fields.split_whitespace();
+        let state = fields.next()?.chars().next()?;
+        let start_time = fields.nth(18)?.parse().ok()?;
+        Some((ProcessStamp { pid, start_time }, state))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn same_process_is_alive(stamp: ProcessStamp) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", stamp.pid)) else {
             return false;
         };
-        stat.rsplit_once(") ")
-            .and_then(|(_, rest)| rest.chars().next())
-            .is_some_and(|state| state != 'Z')
+        parse_process_stat(&stat)
+            .is_some_and(|(current, state)| current.start_time == stamp.start_time && state != 'Z')
     }
 
     #[cfg(target_os = "linux")]
-    async fn wait_for_process_exit(pid: u32) -> bool {
+    async fn wait_for_process_exit(stamp: ProcessStamp) -> bool {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while process_is_alive(pid) && Instant::now() < deadline {
+        while same_process_is_alive(stamp) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        !process_is_alive(pid)
+        !same_process_is_alive(stamp)
     }
 
     #[cfg(target_os = "linux")]
-    async fn child_pid_from(path: &Path) -> TestResult<u32> {
+    async fn child_stamp_from(path: &Path) -> TestResult<ProcessStamp> {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if let Ok(text) = std::fs::read_to_string(path)
-                && let Ok(pid) = text.trim().parse::<u32>()
+            if let Ok(stat) = std::fs::read_to_string(path)
+                && let Some((stamp, _)) = parse_process_stat(&stat)
             {
-                return Ok(pid);
+                return Ok(stamp);
             }
             if Instant::now() >= deadline {
-                return Err(std::io::Error::other("child PID file was not written").into());
+                return Err(std::io::Error::other("child process stamp was not written").into());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -347,7 +363,7 @@ mod tests {
         );
         let result = run_shell(
             &Policy::default(),
-            r#"sleep 60 >/dev/null 2>&1 & echo $! > "$PIDFILE"; wait"#,
+            r#"sleep 60 >/dev/null 2>&1 & cat "/proc/$!/stat" > "$PIDFILE"; wait"#,
             Duration::from_millis(500),
             None,
             Some(&env),
@@ -356,10 +372,11 @@ mod tests {
         .test_value()?;
 
         assert_eq!(result["returncode"], -1);
-        let pid = child_pid_from(&pidfile).await?;
+        let stamp = child_stamp_from(&pidfile).await?;
         assert!(
-            wait_for_process_exit(pid).await,
-            "descendant {pid} survived timeout"
+            wait_for_process_exit(stamp).await,
+            "descendant {} survived timeout",
+            stamp.pid
         );
         Ok(())
     }
@@ -401,7 +418,7 @@ mod tests {
             );
             run_shell(
                 &Policy::default(),
-                r#"sleep 60 >/dev/null 2>&1 & echo $! > "$PIDFILE"; wait"#,
+                r#"sleep 60 >/dev/null 2>&1 & cat "/proc/$!/stat" > "$PIDFILE"; wait"#,
                 Duration::from_secs(30),
                 None,
                 Some(&env),
@@ -409,8 +426,11 @@ mod tests {
             .await
         });
 
-        let pid = child_pid_from(&pidfile).await?;
-        assert!(process_is_alive(pid), "fixture descendant was not alive");
+        let stamp = child_stamp_from(&pidfile).await?;
+        assert!(
+            same_process_is_alive(stamp),
+            "fixture descendant was not alive"
+        );
         task.abort();
         let join_error = match task.await {
             Err(error) => error,
@@ -423,8 +443,9 @@ mod tests {
         };
         assert!(join_error.is_cancelled());
         assert!(
-            wait_for_process_exit(pid).await,
-            "descendant {pid} survived cancellation"
+            wait_for_process_exit(stamp).await,
+            "descendant {} survived cancellation",
+            stamp.pid
         );
         Ok(())
     }
