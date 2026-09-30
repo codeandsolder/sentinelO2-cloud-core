@@ -1,0 +1,8 @@
+[Unit]
+Description=Update shared sccache from approved GitHub release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/sccache-release-update
