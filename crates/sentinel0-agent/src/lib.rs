@@ -66,6 +66,9 @@ use tracing::{debug, info, warn};
 
 const MAX_IN_FLIGHT_TASKS: usize = 64;
 
+type AgentWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 fn add_response_time(message: &mut Message) {
     if let Message::Response {
         result: Some(result),
@@ -393,11 +396,7 @@ impl<D: Dispatcher> Agent<D> {
         Ok(())
     }
 
-    async fn serve_one(
-        &self,
-        cancel: &CancellationToken,
-        tasks: &mut JoinSet<()>,
-    ) -> Result<SessionEnd, AgentError> {
+    async fn open_websocket(&self) -> Result<AgentWebSocket, AgentError> {
         let url = format!(
             "{}/agent/connect",
             self.config.hub_ws_base.trim_end_matches('/')
@@ -407,13 +406,20 @@ impl<D: Dispatcher> Agent<D> {
             .insert(AUTHORIZATION, self.config.token.bearer_header()?);
         let websocket_config = WebSocketConfig::default()
             .max_message_size(Some(sentinel0_proto::MAX_BINARY_FRAME_BYTES));
-        let (mut ws, _) = timeout(
+        let (ws, _) = timeout(
             self.config.connect_timeout,
             connect_async_with_config(req, Some(websocket_config), false),
         )
         .await
         .map_err(|_| AgentError::Timeout("connect"))??;
+        Ok(ws)
+    }
 
+    async fn exchange_welcome(
+        &self,
+        ws: &mut AgentWebSocket,
+        cancel: &CancellationToken,
+    ) -> Result<Option<SessionEnd>, AgentError> {
         let hello = Message::hello_with_profile(
             self.config.host.clone(),
             self.config.agent_version.clone(),
@@ -428,7 +434,7 @@ impl<D: Dispatcher> Agent<D> {
                 if let Err(error) = ws.close(None).await {
                     debug!(?error, "websocket close failed during cancellation");
                 }
-                return Ok(SessionEnd::Clean);
+                return Ok(Some(SessionEnd::Clean));
             }
             item = timeout(self.config.welcome_timeout, ws.next()) => {
                 item.map_err(|_| AgentError::Timeout("welcome"))?
@@ -442,16 +448,16 @@ impl<D: Dispatcher> Agent<D> {
             return Err(AgentError::ExpectedWelcome);
         };
         match serde_json::from_str::<Message>(&text)? {
-            Message::Welcome { .. } => {}
+            Message::Welcome { .. } => Ok(None),
             Message::Error { code, message, .. } if code == "enrollment_rejected" => {
-                return Err(AgentError::EnrollmentRejected(message));
+                Err(AgentError::EnrollmentRejected(message))
             }
-            Message::Error { code, message, .. } => {
-                return Err(AgentError::Rejected { code, message });
-            }
-            _ => return Err(AgentError::ExpectedWelcome),
+            Message::Error { code, message, .. } => Err(AgentError::Rejected { code, message }),
+            _ => Err(AgentError::ExpectedWelcome),
         }
+    }
 
+    async fn post_welcome(&self, ws: &mut AgentWebSocket) -> Result<(), AgentError> {
         if let Some(rotation_config) = self.rotation.as_ref() {
             match rotation::maybe_rotate(rotation_config, &self.config.token).await {
                 Ok(true) => {
@@ -460,12 +466,9 @@ impl<D: Dispatcher> Agent<D> {
                     );
                 }
                 Ok(false) => {}
-                Err(error) => {
-                    warn!(%error, "credential rotation skipped");
-                }
+                Err(error) => warn!(%error, "credential rotation skipped"),
             }
         }
-
         for (path, event) in drain_pending(self.config.upload_base.clone()).await {
             if let Err(error) = ws
                 .send(WsMessage::Text(serde_json::to_string(&event)?.into()))
@@ -476,7 +479,410 @@ impl<D: Dispatcher> Agent<D> {
             }
             clear_pending(Some(path)).await;
         }
+        Ok(())
+    }
 
+    async fn send_outbound(
+        ws: &mut AgentWebSocket,
+        outbound: Outbound,
+    ) -> Result<bool, AgentError> {
+        let mut message = outbound.message;
+        add_response_time(&mut message);
+        if let Some(frame) = outbound.binary_frame
+            && ws.send(WsMessage::Binary(frame.into())).await.is_err()
+        {
+            return Ok(false);
+        }
+        let is_response = matches!(message, Message::Response { .. });
+        let mut wire = serde_json::to_value(&message)?;
+        if is_response {
+            let _truncation = bound_response_default(&mut wire);
+        }
+        if ws
+            .send(WsMessage::Text(serde_json::to_string(&wire)?.into()))
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+        clear_pending(outbound.clear_after_send).await;
+        Ok(true)
+    }
+
+    fn spawn_foreground_request(
+        &self,
+        tasks: &mut JoinSet<()>,
+        response_tx: mpsc::Sender<Outbound>,
+        id: String,
+        op: Op,
+        payload: serde_json::Map<String, serde_json::Value>,
+        received_at: f64,
+    ) {
+        let dispatcher = Arc::clone(&self.dispatcher);
+        tasks.spawn(async move {
+            let mut dispatch_response = dispatch_safely(dispatcher, id.clone(), op, payload).await;
+            if let Message::Response {
+                result: Some(result),
+                ..
+            } = &mut dispatch_response.message
+            {
+                result.insert(
+                    "_sx_timing".into(),
+                    serde_json::json!({
+                        "received_at": received_at,
+                        "finished_at": unix_time_seconds(),
+                    }),
+                );
+            }
+            if let Err(error) = response_tx
+                .send(Outbound {
+                    message: dispatch_response.message,
+                    binary_frame: dispatch_response.binary_frame,
+                    clear_after_send: None,
+                })
+                .await
+            {
+                debug!(
+                    ?error,
+                    "session ended before foreground response could be queued"
+                );
+            }
+        });
+    }
+
+    async fn start_background_request(
+        &self,
+        ws: &mut AgentWebSocket,
+        tasks: &mut JoinSet<()>,
+        response_tx: mpsc::Sender<Outbound>,
+        id: String,
+        op: Op,
+        payload: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<bool, AgentError> {
+        let job_id = payload
+            .get("job_id")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(
+                || {
+                    format!(
+                        "job_{:012x}",
+                        rand::rng().random::<u64>() & 0xffff_ffff_ffff
+                    )
+                },
+                ToOwned::to_owned,
+            );
+        let mut ack = Message::Response {
+            id: id.clone(),
+            ok: true,
+            result: Some(BTreeMap::from([
+                ("status".into(), serde_json::Value::String("running".into())),
+                ("job_id".into(), serde_json::Value::String(job_id.clone())),
+                ("tool".into(), serde_json::Value::String(op.as_str().into())),
+                (
+                    "host".into(),
+                    serde_json::Value::String(self.config.host.id.clone()),
+                ),
+            ])),
+            error: None,
+        };
+        add_response_time(&mut ack);
+        if ws
+            .send(WsMessage::Text(serde_json::to_string(&ack)?.into()))
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let started_at = Utc::now();
+        let host_id = self.config.host.id.clone();
+        let upload_base = self.config.upload_base.clone();
+        tasks.spawn(async move {
+            let dispatch_response = dispatch_safely(dispatcher, id.clone(), op, payload).await;
+            let mut response = if dispatch_response.binary_frame.is_some() {
+                Message::Response {
+                    id: id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(sentinel0_proto::ResponseError {
+                        code: "background_not_supported".into(),
+                        message: "binary responses cannot be persisted as background jobs".into(),
+                        details: None,
+                    }),
+                }
+            } else {
+                dispatch_response.message
+            };
+            match serde_json::to_value(&response) {
+                Ok(mut bounded) => {
+                    let _truncation = bound_response_default(&mut bounded);
+                    match serde_json::from_value(bounded) {
+                        Ok(parsed) => response = parsed,
+                        Err(error) => warn!(
+                            ?error,
+                            %job_id,
+                            "failed to decode bounded background completion"
+                        ),
+                    }
+                }
+                Err(error) => warn!(
+                    ?error,
+                    %job_id,
+                    "failed to encode background completion for bounding"
+                ),
+            }
+            let finished_at = Utc::now();
+            let data = jobs::build_completed_event_data(
+                &job_id,
+                op.as_str(),
+                &host_id,
+                &response,
+                started_at,
+                finished_at,
+            );
+            let event = Message::Event {
+                kind: "job_completed".into(),
+                data,
+                timestamp: Utc::now(),
+            };
+            let pending_path = match serde_json::to_value(&event) {
+                Ok(value) => record_pending(upload_base, job_id.clone(), value).await,
+                Err(error) => {
+                    warn!(?error, %job_id, "failed to serialize background completion for persistence");
+                    None
+                }
+            };
+            if let Err(error) = response_tx
+                .send(Outbound {
+                    message: event,
+                    binary_frame: None,
+                    clear_after_send: pending_path,
+                })
+                .await
+            {
+                debug!(?error, %job_id, "session ended before background completion could be queued");
+            }
+        });
+        Ok(true)
+    }
+
+    async fn handle_request(
+        &self,
+        ws: &mut AgentWebSocket,
+        tasks: &mut JoinSet<()>,
+        response_tx: &mpsc::Sender<Outbound>,
+        id: String,
+        op: Op,
+        payload: BTreeMap<String, serde_json::Value>,
+    ) -> Result<bool, AgentError> {
+        if tasks.len() >= MAX_IN_FLIGHT_TASKS {
+            let response = overloaded_response(id, tasks.len());
+            warn!(
+                in_flight = tasks.len(),
+                limit = MAX_IN_FLIGHT_TASKS,
+                %op,
+                "rejecting request while agent is overloaded"
+            );
+            return Ok(ws
+                .send(WsMessage::Text(serde_json::to_string(&response)?.into()))
+                .await
+                .is_ok());
+        }
+        let received_at = unix_time_seconds();
+        let background = payload
+            .get("background")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let payload = payload.into_iter().collect();
+
+        if background && op == Op::FileExportChunk {
+            let response = Message::Response {
+                id,
+                ok: false,
+                result: None,
+                error: Some(sentinel0_proto::ResponseError {
+                    code: "background_not_supported".into(),
+                    message:
+                        "file_export_chunk returns a binary frame and cannot run as a background job"
+                            .into(),
+                    details: None,
+                }),
+            };
+            return Ok(ws
+                .send(WsMessage::Text(serde_json::to_string(&response)?.into()))
+                .await
+                .is_ok());
+        }
+        if background {
+            self.start_background_request(ws, tasks, response_tx.clone(), id, op, payload)
+                .await
+        } else {
+            self.spawn_foreground_request(tasks, response_tx.clone(), id, op, payload, received_at);
+            Ok(true)
+        }
+    }
+
+    async fn handle_binary_frame(
+        &self,
+        ws: &mut AgentWebSocket,
+        tasks: &mut JoinSet<()>,
+        response_tx: &mpsc::Sender<Outbound>,
+        raw: Vec<u8>,
+    ) -> Result<bool, AgentError> {
+        let Ok(frame) = sentinel0_proto::decode_binary_frame(&raw) else {
+            warn!("discarding malformed binary transfer frame");
+            return Ok(true);
+        };
+        let transfer_id = hex_lower(&frame.transfer_id);
+        let chunk_index = frame.chunk_index;
+        if tasks.len() >= MAX_IN_FLIGHT_TASKS {
+            let data = BTreeMap::from([
+                ("transfer_id".into(), serde_json::Value::String(transfer_id)),
+                ("chunk_index".into(), serde_json::Value::from(chunk_index)),
+                ("ok".into(), serde_json::Value::Bool(false)),
+                (
+                    "error".into(),
+                    serde_json::Value::String(format!(
+                        "busy: agent has {} in-flight operations (limit {MAX_IN_FLIGHT_TASKS})",
+                        tasks.len()
+                    )),
+                ),
+            ]);
+            warn!(
+                in_flight = tasks.len(),
+                limit = MAX_IN_FLIGHT_TASKS,
+                "rejecting transfer chunk while agent is overloaded"
+            );
+            let event = Message::Event {
+                kind: "transfer_chunk_ack".into(),
+                data,
+                timestamp: Utc::now(),
+            };
+            return Ok(ws
+                .send(WsMessage::Text(serde_json::to_string(&event)?.into()))
+                .await
+                .is_ok());
+        }
+
+        let payload = frame.payload.to_vec();
+        let upload_base = self.config.upload_base.clone();
+        let response_tx = response_tx.clone();
+        tasks.spawn(async move {
+            let transfer_for_write = transfer_id.clone();
+            let written = tokio::task::spawn_blocking(move || {
+                crate::upload::write_transfer_part_at(
+                    &upload_base,
+                    &transfer_for_write,
+                    chunk_index,
+                    &payload,
+                )
+            })
+            .await;
+            let mut data = BTreeMap::from([
+                ("transfer_id".into(), serde_json::Value::String(transfer_id)),
+                ("chunk_index".into(), serde_json::Value::from(chunk_index)),
+            ]);
+            match written {
+                Ok(Ok(bytes)) => {
+                    data.insert("ok".into(), serde_json::Value::Bool(true));
+                    data.insert(
+                        "bytes".into(),
+                        serde_json::Value::from(u64::try_from(bytes).unwrap_or(u64::MAX)),
+                    );
+                }
+                Ok(Err(error)) => {
+                    data.insert("ok".into(), serde_json::Value::Bool(false));
+                    data.insert(
+                        "error".into(),
+                        serde_json::Value::String(format!("{}: {}", error.code, error.message)),
+                    );
+                }
+                Err(error) => {
+                    data.insert("ok".into(), serde_json::Value::Bool(false));
+                    data.insert(
+                        "error".into(),
+                        serde_json::Value::String(format!("ingest_error: {error}")),
+                    );
+                }
+            }
+            if let Err(error) = response_tx
+                .send(Outbound {
+                    message: Message::Event {
+                        kind: "transfer_chunk_ack".into(),
+                        data,
+                        timestamp: Utc::now(),
+                    },
+                    binary_frame: None,
+                    clear_after_send: None,
+                })
+                .await
+            {
+                debug!(?error, "session ended before transfer ack could be queued");
+            }
+        });
+        Ok(true)
+    }
+
+    async fn handle_text_message(
+        &self,
+        ws: &mut AgentWebSocket,
+        tasks: &mut JoinSet<()>,
+        response_tx: &mpsc::Sender<Outbound>,
+        last_pong: &mut Instant,
+        text: &str,
+    ) -> Result<Option<SessionEnd>, AgentError> {
+        let msg = match serde_json::from_str::<Message>(text) {
+            Ok(msg) => msg,
+            Err(error) => {
+                warn!(
+                    %error,
+                    bytes = text.len(),
+                    "discarding malformed hub JSON message"
+                );
+                return Ok(None);
+            }
+        };
+        match msg {
+            Message::Ping { .. } => {
+                let pong = Message::Pong {
+                    timestamp: Utc::now(),
+                };
+                if ws
+                    .send(WsMessage::Text(serde_json::to_string(&pong)?.into()))
+                    .await
+                    .is_err()
+                {
+                    return Ok(Some(SessionEnd::Lost(None)));
+                }
+            }
+            Message::Request {
+                id, op, payload, ..
+            } => {
+                if !self
+                    .handle_request(ws, tasks, response_tx, id, op, payload)
+                    .await?
+                {
+                    return Ok(Some(SessionEnd::Lost(None)));
+                }
+            }
+            Message::Pong { .. } => *last_pong = Instant::now(),
+            Message::Error {
+                code,
+                message,
+                fatal: true,
+            } => return Err(AgentError::Rejected { code, message }),
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    async fn session_loop(
+        &self,
+        ws: &mut AgentWebSocket,
+        cancel: &CancellationToken,
+        tasks: &mut JoinSet<()>,
+    ) -> Result<SessionEnd, AgentError> {
         let mut heartbeat = interval(self.config.heartbeat_interval);
         heartbeat.tick().await;
         let mut last_pong = Instant::now();
@@ -507,34 +913,19 @@ impl<D: Dispatcher> Agent<D> {
                     }
                 }
                 outbound = response_rx.recv() => {
-                    if let Some(outbound) = outbound {
-                        let mut message = outbound.message;
-                        add_response_time(&mut message);
-
-                        if let Some(frame) = outbound.binary_frame
-                            && ws.send(WsMessage::Binary(frame.into())).await.is_err()
-                        {
-                            return Ok(SessionEnd::Lost(None));
-                        }
-
-                        let is_response = matches!(message, Message::Response { .. });
-                        let mut wire = serde_json::to_value(&message)?;
-                        if is_response {
-                            let _truncation = bound_response_default(&mut wire);
-                        }
-                        if ws.send(WsMessage::Text(
-                            serde_json::to_string(&wire)?.into()
-                        )).await.is_err() {
-                            return Ok(SessionEnd::Lost(None));
-                        }
-                        clear_pending(outbound.clear_after_send).await;
+                    if let Some(outbound) = outbound
+                        && !Self::send_outbound(ws, outbound).await?
+                    {
+                        return Ok(SessionEnd::Lost(None));
                     }
                 }
                 item = ws.next() => {
                     match item {
                         None | Some(Err(_)) => return Ok(SessionEnd::Lost(None)),
                         Some(Ok(WsMessage::Close(frame))) => {
-                            let hint = frame.as_ref().and_then(|frame| parse_retry_after(frame.reason.as_str()));
+                            let hint = frame
+                                .as_ref()
+                                .and_then(|frame| parse_retry_after(frame.reason.as_str()));
                             return Ok(if frame.as_ref().is_some_and(|frame| frame.code == CloseCode::Restart) {
                                 SessionEnd::Restart(hint)
                             } else {
@@ -542,341 +933,50 @@ impl<D: Dispatcher> Agent<D> {
                             });
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            let msg = match serde_json::from_str::<Message>(&text) {
-                                Ok(msg) => msg,
-                                Err(error) => {
-                                    warn!(
-                                        %error,
-                                        bytes = text.len(),
-                                        "discarding malformed hub JSON message"
-                                    );
-                                    continue;
-                                }
-                            };
-                            match msg {
-                                Message::Ping { .. } => {
-                                    if ws.send(WsMessage::Text(
-                                        serde_json::to_string(&Message::Pong { timestamp: Utc::now() })?.into()
-                                    )).await.is_err() {
-                                        return Ok(SessionEnd::Lost(None));
-                                    }
-                                }
-                                Message::Request { id, op, payload, .. } => {
-                                    if tasks.len() >= MAX_IN_FLIGHT_TASKS {
-                                        let response = overloaded_response(id, tasks.len());
-                                        warn!(
-                                            in_flight = tasks.len(),
-                                            limit = MAX_IN_FLIGHT_TASKS,
-                                            %op,
-                                            "rejecting request while agent is overloaded"
-                                        );
-                                        if ws
-                                            .send(WsMessage::Text(
-                                                serde_json::to_string(&response)?.into(),
-                                            ))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return Ok(SessionEnd::Lost(None));
-                                        }
-                                        continue;
-                                    }
-                                    let received_at = unix_time_seconds();
-                                    let background = payload
-                                        .get("background")
-                                        .and_then(serde_json::Value::as_bool)
-                                        .unwrap_or(false);
-                                    let dispatcher = Arc::clone(&self.dispatcher);
-                                    let response_tx = response_tx.clone();
-                                    let payload: serde_json::Map<String, serde_json::Value> =
-                                        payload.into_iter().collect();
-
-                                    if background && op == Op::FileExportChunk {
-                                        let response = Message::Response {
-                                            id,
-                                            ok: false,
-                                            result: None,
-                                            error: Some(sentinel0_proto::ResponseError {
-                                                code: "background_not_supported".into(),
-                                                message: "file_export_chunk returns a binary frame and cannot run as a background job".into(),
-                                                details: None,
-                                            }),
-                                        };
-                                        if ws
-                                            .send(WsMessage::Text(
-                                                serde_json::to_string(&response)?.into(),
-                                            ))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return Ok(SessionEnd::Lost(None));
-                                        }
-                                        continue;
-                                    }
-
-                                    if background {
-                                        let job_id = payload
-                                            .get("job_id")
-                                            .and_then(serde_json::Value::as_str).map_or_else(|| {
-                                                format!(
-                                                    "job_{:012x}",
-                                                    rand::rng().random::<u64>() & 0xffff_ffff_ffff
-                                                )
-                                            }, ToOwned::to_owned);
-                                        let mut ack = Message::Response {
-                                            id: id.clone(),
-                                            ok: true,
-                                            result: Some(BTreeMap::from([
-                                                ("status".into(), serde_json::Value::String("running".into())),
-                                                ("job_id".into(), serde_json::Value::String(job_id.clone())),
-                                                ("tool".into(), serde_json::Value::String(op.as_str().into())),
-                                                ("host".into(), serde_json::Value::String(self.config.host.id.clone())),
-                                            ])),
-                                            error: None,
-                                        };
-                                        add_response_time(&mut ack);
-                                        if ws
-                                            .send(WsMessage::Text(serde_json::to_string(&ack)?.into()))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return Ok(SessionEnd::Lost(None));
-                                        }
-
-                                        let started_at = Utc::now();
-                                        let host_id = self.config.host.id.clone();
-                                        let upload_base = self.config.upload_base.clone();
-                                        tasks.spawn(async move {
-                                            let dispatch_response =
-                                                dispatch_safely(dispatcher, id.clone(), op, payload).await;
-                                            let mut response = if dispatch_response.binary_frame.is_some() {
-                                                Message::Response {
-                                                    id: id.clone(),
-                                                    ok: false,
-                                                    result: None,
-                                                    error: Some(sentinel0_proto::ResponseError {
-                                                        code: "background_not_supported".into(),
-                                                        message: "binary responses cannot be persisted as background jobs".into(),
-                                                        details: None,
-                                                    }),
-                                                }
-                                            } else {
-                                                dispatch_response.message
-                                            };
-                                            match serde_json::to_value(&response) {
-                                                Ok(mut bounded) => {
-                                                    let _truncation = bound_response_default(&mut bounded);
-                                                    match serde_json::from_value(bounded) {
-                                                        Ok(parsed) => response = parsed,
-                                                        Err(error) => warn!(
-                                                            ?error,
-                                                            %job_id,
-                                                            "failed to decode bounded background completion"
-                                                        ),
-                                                    }
-                                                }
-                                                Err(error) => warn!(
-                                                    ?error,
-                                                    %job_id,
-                                                    "failed to encode background completion for bounding"
-                                                ),
-                                            }
-                                            let finished_at = Utc::now();
-                                            let data = jobs::build_completed_event_data(
-                                                &job_id,
-                                                op.as_str(),
-                                                &host_id,
-                                                &response,
-                                                started_at,
-                                                finished_at,
-                                            );
-                                            let event = Message::Event {
-                                                kind: "job_completed".into(),
-                                                data,
-                                                timestamp: Utc::now(),
-                                            };
-                                            let pending_path = match serde_json::to_value(&event) {
-                                                Ok(value) => {
-                                                    record_pending(upload_base, job_id.clone(), value).await
-                                                }
-                                                Err(error) => {
-                                                    warn!(?error, %job_id, "failed to serialize background completion for persistence");
-                                                    None
-                                                }
-                                            };
-                                            if let Err(error) = response_tx
-                                                .send(Outbound {
-                                                    message: event,
-                                                    binary_frame: None,
-                                                    clear_after_send: pending_path,
-                                                })
-                                                .await
-                                            {
-                                                debug!(?error, %job_id, "session ended before background completion could be queued");
-                                            }
-                                        });
-                                    } else {
-                                        tasks.spawn(async move {
-                                            let mut dispatch_response =
-                                                dispatch_safely(dispatcher, id.clone(), op, payload).await;
-                                            if let Message::Response {
-                                                result: Some(result),
-                                                ..
-                                            } = &mut dispatch_response.message
-                                            {
-                                                result.insert(
-                                                    "_sx_timing".into(),
-                                                    serde_json::json!({
-                                                        "received_at": received_at,
-                                                        "finished_at": unix_time_seconds(),
-                                                    }),
-                                                );
-                                            }
-                                            if let Err(error) = response_tx
-                                                .send(Outbound {
-                                                    message: dispatch_response.message,
-                                                    binary_frame: dispatch_response.binary_frame,
-                                                    clear_after_send: None,
-                                                })
-                                                .await
-                                            {
-                                                debug!(?error, "session ended before foreground response could be queued");
-                                            }
-                                        });
-                                    }
-                                }
-                                Message::Pong { .. } => {
-                                    last_pong = Instant::now();
-                                }
-                                Message::Error { code, message, fatal: true } => {
-                                    return Err(AgentError::Rejected { code, message });
-                                }
-                                _ => {}
+                            if let Some(end) = self
+                                .handle_text_message(
+                                    ws,
+                                    tasks,
+                                    &response_tx,
+                                    &mut last_pong,
+                                    &text,
+                                )
+                                .await?
+                            {
+                                return Ok(end);
                             }
                         }
                         Some(Ok(WsMessage::Binary(raw))) => {
-                            let Ok(frame) = sentinel0_proto::decode_binary_frame(&raw) else {
-                                warn!("discarding malformed binary transfer frame");
-                                continue;
-                            };
-                            let transfer_id = hex_lower(&frame.transfer_id);
-                            let chunk_index = frame.chunk_index;
-                            if tasks.len() >= MAX_IN_FLIGHT_TASKS {
-                                let data = BTreeMap::from([
-                                    (
-                                        "transfer_id".into(),
-                                        serde_json::Value::String(transfer_id),
-                                    ),
-                                    (
-                                        "chunk_index".into(),
-                                        serde_json::Value::from(chunk_index),
-                                    ),
-                                    ("ok".into(), serde_json::Value::Bool(false)),
-                                    (
-                                        "error".into(),
-                                        serde_json::Value::String(format!(
-                                            "busy: agent has {} in-flight operations (limit {MAX_IN_FLIGHT_TASKS})",
-                                            tasks.len()
-                                        )),
-                                    ),
-                                ]);
-                                warn!(
-                                    in_flight = tasks.len(),
-                                    limit = MAX_IN_FLIGHT_TASKS,
-                                    "rejecting transfer chunk while agent is overloaded"
-                                );
-                                if ws
-                                    .send(WsMessage::Text(
-                                        serde_json::to_string(&Message::Event {
-                                            kind: "transfer_chunk_ack".into(),
-                                            data,
-                                            timestamp: Utc::now(),
-                                        })?
-                                        .into(),
-                                    ))
-                                    .await
-                                    .is_err()
-                                {
-                                    return Ok(SessionEnd::Lost(None));
-                                }
-                                continue;
+                            if !self
+                                .handle_binary_frame(
+                                    ws,
+                                    tasks,
+                                    &response_tx,
+                                    raw.to_vec(),
+                                )
+                                .await?
+                            {
+                                return Ok(SessionEnd::Lost(None));
                             }
-                            let payload = frame.payload.to_vec();
-                            let upload_base = self.config.upload_base.clone();
-                            let response_tx = response_tx.clone();
-
-                            tasks.spawn(async move {
-                                let transfer_for_write = transfer_id.clone();
-                                let written = tokio::task::spawn_blocking(move || {
-                                    crate::upload::write_transfer_part_at(
-                                        &upload_base,
-                                        &transfer_for_write,
-                                        chunk_index,
-                                        &payload,
-                                    )
-                                })
-                                .await;
-
-                                let mut data = BTreeMap::from([
-                                    (
-                                        "transfer_id".into(),
-                                        serde_json::Value::String(transfer_id),
-                                    ),
-                                    (
-                                        "chunk_index".into(),
-                                        serde_json::Value::from(chunk_index),
-                                    ),
-                                ]);
-                                match written {
-                                    Ok(Ok(bytes)) => {
-                                        data.insert("ok".into(), serde_json::Value::Bool(true));
-                                        data.insert(
-                                            "bytes".into(),
-                                            serde_json::Value::from(bytes as u64),
-                                        );
-                                    }
-                                    Ok(Err(error)) => {
-                                        data.insert("ok".into(), serde_json::Value::Bool(false));
-                                        data.insert(
-                                            "error".into(),
-                                            serde_json::Value::String(format!(
-                                                "{}: {}",
-                                                error.code, error.message
-                                            )),
-                                        );
-                                    }
-                                    Err(error) => {
-                                        data.insert("ok".into(), serde_json::Value::Bool(false));
-                                        data.insert(
-                                            "error".into(),
-                                            serde_json::Value::String(format!(
-                                                "ingest_error: {error}"
-                                            )),
-                                        );
-                                    }
-                                }
-
-                                if let Err(error) = response_tx
-                                    .send(Outbound {
-                                        message: Message::Event {
-                                            kind: "transfer_chunk_ack".into(),
-                                            data,
-                                            timestamp: Utc::now(),
-                                        },
-                                        binary_frame: None,
-                                        clear_after_send: None,
-                                    })
-                                    .await
-                                {
-                                    debug!(?error, "session ended before transfer ack could be queued");
-                                }
-                            });
                         }
                         Some(Ok(_)) => {}
                     }
                 }
             }
         }
+    }
+
+    async fn serve_one(
+        &self,
+        cancel: &CancellationToken,
+        tasks: &mut JoinSet<()>,
+    ) -> Result<SessionEnd, AgentError> {
+        let mut ws = self.open_websocket().await?;
+        if let Some(end) = self.exchange_welcome(&mut ws, cancel).await? {
+            return Ok(end);
+        }
+        self.post_welcome(&mut ws).await?;
+        self.session_loop(&mut ws, cancel, tasks).await
     }
 }
 
