@@ -53,6 +53,7 @@ pub mod git_ops;
 pub mod handler_error;
 pub mod host;
 pub mod identity;
+pub mod instance_lock;
 pub mod jobs;
 pub mod local_api;
 pub mod local_audit;

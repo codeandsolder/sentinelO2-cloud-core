@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.22.1 behavior at reviewed upstream commit
-  `b55ea1d32d5b3c4959da37294e22cc0d28de59f4`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.23.0 behavior at reviewed upstream commit
+  `9b7421bd791ed9ddf4b7f2118998f6fe93dacf80`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -68,6 +68,13 @@ Reference surfaces:
   atomically to a separate mode-0600 `identity.rotated.json`, and are preferred
   only when they parse, are unexpired and match the enrolled host. The original
   enrollment identity is never overwritten, so rotation failure cannot strand a host.
+- Upstream 0.23.0 single-instance semantics are matched on the current POSIX
+  target: normal startup takes a nonblocking exclusive OS lock per host ID in
+  the same writable state directory used for rotated credentials, records the
+  holder PID, keeps different host IDs independent, and exits with status 3 on
+  contention so a supervisor can retry. `--verify-enrollment` returns before
+  lock acquisition, and absence of any writable state directory degrades with
+  a warning rather than preventing the agent from starting.
 - Linux host/OS/kernel/CPU/memory/uptime/load metadata used by hello/state.
 - Capabilities are derived from the dispatcher surface rather than maintained
   as a second drifting list. Full capabilities include upstream policy evidence
