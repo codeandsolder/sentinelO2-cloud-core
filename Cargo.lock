@@ -1623,7 +1623,9 @@ dependencies = [
  "grep-searcher",
  "http",
  "ignore",
+ "memchr",
  "nix",
+ "num-traits",
  "proptest",
  "rand 0.10.3",
  "regex",
@@ -1655,6 +1657,7 @@ name = "sentinel0-proto"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "num-traits",
  "proptest",
  "serde",
  "serde_json",

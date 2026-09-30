@@ -5,8 +5,8 @@ use crate::{
 use chrono::{DateTime, Utc};
 use glob::Pattern;
 use grep_matcher::Matcher;
-use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Bytes};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, sinks::Bytes};
 use ignore::WalkBuilder;
 use serde_json::{Map, Value};
 use std::{
@@ -63,7 +63,7 @@ fn resolve(policy: &Policy, raw: &str) -> Result<PathBuf, HandlerError> {
     })
 }
 
-fn access_error(raw: &str, error: std::io::Error) -> HandlerError {
+fn access_error(raw: &str, error: &std::io::Error) -> HandlerError {
     match error.kind() {
         std::io::ErrorKind::NotFound => {
             HandlerError::new("not_found", format!("path does not exist: {raw:?}"))
@@ -179,14 +179,14 @@ fn scan_utf8(
         for &byte in &buf[..n] {
             saw_any = true;
             last_was_newline = byte == b'\n';
-            let selected = line >= start && end.map(|last| line <= last).unwrap_or(true);
+            let selected = line >= start && end.is_none_or(|last| line <= last);
 
             if byte == b'\n' {
                 if selected {
                     last_selected = line;
                     let next_line = line.saturating_add(1);
                     let next_selected =
-                        next_line >= start && end.map(|last| next_line <= last).unwrap_or(true);
+                        next_line >= start && end.is_none_or(|last| next_line <= last);
                     if next_selected {
                         if out.len() >= cap {
                             truncated = true;
@@ -238,6 +238,123 @@ fn scan_utf8(
     ))
 }
 
+const UTF16_SAW_ANY: u8 = 1 << 0;
+const UTF16_LAST_NEWLINE: u8 = 1 << 1;
+const UTF16_TRUNCATED: u8 = 1 << 2;
+const UTF16_STOPPED_EARLY: u8 = 1 << 3;
+const UTF16_FIRST_UNIT: u8 = 1 << 4;
+
+struct Utf16ScanState {
+    units: Vec<u16>,
+    start: usize,
+    end: Option<usize>,
+    cap: usize,
+    line: usize,
+    last_selected: usize,
+    flags: u8,
+}
+
+impl Utf16ScanState {
+    fn new(start: usize, end: Option<usize>, cap: usize) -> Self {
+        Self {
+            units: Vec::with_capacity(cap.min(64 * 1024)),
+            start,
+            end,
+            cap,
+            line: 1,
+            last_selected: start.saturating_sub(1),
+            flags: UTF16_FIRST_UNIT,
+        }
+    }
+
+    const fn flag(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    const fn set_flag(&mut self, flag: u8, enabled: bool) {
+        if enabled {
+            self.flags |= flag;
+        } else {
+            self.flags &= !flag;
+        }
+    }
+
+    fn push_unit(&mut self, unit: u16) -> bool {
+        if self.flag(UTF16_FIRST_UNIT) && unit == 0xfeff {
+            self.set_flag(UTF16_FIRST_UNIT, false);
+            return false;
+        }
+        self.set_flag(UTF16_FIRST_UNIT, false);
+        self.set_flag(UTF16_SAW_ANY, true);
+        self.set_flag(UTF16_LAST_NEWLINE, unit == 0x000a);
+        let selected = self.line >= self.start && self.end.is_none_or(|last| self.line <= last);
+
+        if unit == 0x000a {
+            if selected {
+                self.last_selected = self.line;
+                let next = self.line.saturating_add(1);
+                let next_selected = next >= self.start && self.end.is_none_or(|last| next <= last);
+                if next_selected {
+                    if self.units.len() >= self.cap {
+                        self.set_flag(UTF16_TRUNCATED, true);
+                        self.set_flag(UTF16_STOPPED_EARLY, true);
+                        return true;
+                    }
+                    self.units.push(0x000a);
+                }
+            }
+            if self.end.is_some_and(|last| self.line >= last) {
+                self.set_flag(UTF16_STOPPED_EARLY, true);
+                return true;
+            }
+            self.line = self.line.saturating_add(1);
+        } else if selected {
+            self.last_selected = self.line;
+            if self.units.len() >= self.cap {
+                self.set_flag(UTF16_TRUNCATED, true);
+                self.set_flag(UTF16_STOPPED_EARLY, true);
+                return true;
+            }
+            self.units.push(unit);
+        }
+        false
+    }
+
+    fn finish(mut self) -> (String, usize, bool, bool, usize) {
+        let stopped_early = self.flag(UTF16_STOPPED_EARLY);
+        let total_lines = if !self.flag(UTF16_SAW_ANY) {
+            0
+        } else if stopped_early {
+            self.line
+        } else if self.flag(UTF16_LAST_NEWLINE) {
+            self.line.saturating_sub(1)
+        } else {
+            self.line
+        };
+        let mut content = String::from_utf16_lossy(&self.units);
+        let before = content.len();
+        content = clip(content, self.cap);
+        if content.len() < before {
+            self.set_flag(UTF16_TRUNCATED, true);
+        }
+        (
+            content,
+            total_lines,
+            !stopped_early,
+            self.flag(UTF16_TRUNCATED),
+            self.last_selected,
+        )
+    }
+}
+
+const fn utf16_unit(pair: [u8; 2], little_endian: bool) -> u16 {
+    if little_endian {
+        u16::from_le_bytes(pair)
+    } else {
+        u16::from_be_bytes(pair)
+    }
+}
+
 fn scan_utf16(
     path: &Path,
     start: usize,
@@ -249,14 +366,7 @@ fn scan_utf16(
         .map_err(|e| HandlerError::new("io_error", format!("failed to read file: {e}")))?;
     let mut buf = [0_u8; 16 * 1024];
     let mut carry: Option<u8> = None;
-    let mut units = Vec::<u16>::with_capacity(cap.min(64 * 1024));
-    let mut line = 1_usize;
-    let mut last_selected = start.saturating_sub(1);
-    let mut saw_any = false;
-    let mut last_was_newline = false;
-    let mut truncated = false;
-    let mut stopped_early = false;
-    let mut first_unit = true;
+    let mut state = Utf16ScanState::new(start, end, cap);
 
     'outer: loop {
         let n = file
@@ -265,137 +375,33 @@ fn scan_utf16(
         if n == 0 {
             break;
         }
-
         let mut index = 0;
         if let Some(first) = carry.take() {
-            if n == 0 {
-                carry = Some(first);
-                continue;
-            }
-            let pair = [first, buf[0]];
             index = 1;
-            let unit = if little_endian {
-                u16::from_le_bytes(pair)
-            } else {
-                u16::from_be_bytes(pair)
-            };
-            if first_unit && unit == 0xfeff {
-                first_unit = false;
-            } else {
-                first_unit = false;
-                saw_any = true;
-                last_was_newline = unit == 0x000a;
-                let selected = line >= start && end.map(|last| line <= last).unwrap_or(true);
-                if unit == 0x000a {
-                    if selected {
-                        last_selected = line;
-                        let next = line.saturating_add(1);
-                        let next_selected =
-                            next >= start && end.map(|last| next <= last).unwrap_or(true);
-                        if next_selected {
-                            if units.len() >= cap {
-                                truncated = true;
-                                stopped_early = true;
-                                break 'outer;
-                            }
-                            units.push(0x000a);
-                        }
-                    }
-                    if end.is_some_and(|last| line >= last) {
-                        stopped_early = true;
-                        break 'outer;
-                    }
-                    line = line.saturating_add(1);
-                } else if selected {
-                    last_selected = line;
-                    if units.len() >= cap {
-                        truncated = true;
-                        stopped_early = true;
-                        break 'outer;
-                    }
-                    units.push(unit);
-                }
+            if state.push_unit(utf16_unit([first, buf[0]], little_endian)) {
+                break 'outer;
             }
         }
-
         while index + 1 < n {
             let pair = [buf[index], buf[index + 1]];
             index += 2;
-            let unit = if little_endian {
-                u16::from_le_bytes(pair)
-            } else {
-                u16::from_be_bytes(pair)
-            };
-            if first_unit && unit == 0xfeff {
-                first_unit = false;
-                continue;
-            }
-            first_unit = false;
-            saw_any = true;
-            last_was_newline = unit == 0x000a;
-            let selected = line >= start && end.map(|last| line <= last).unwrap_or(true);
-
-            if unit == 0x000a {
-                if selected {
-                    last_selected = line;
-                    let next = line.saturating_add(1);
-                    let next_selected =
-                        next >= start && end.map(|last| next <= last).unwrap_or(true);
-                    if next_selected {
-                        if units.len() >= cap {
-                            truncated = true;
-                            stopped_early = true;
-                            break 'outer;
-                        }
-                        units.push(0x000a);
-                    }
-                }
-                if end.is_some_and(|last| line >= last) {
-                    stopped_early = true;
-                    break 'outer;
-                }
-                line = line.saturating_add(1);
-            } else if selected {
-                last_selected = line;
-                if units.len() >= cap {
-                    truncated = true;
-                    stopped_early = true;
-                    break 'outer;
-                }
-                units.push(unit);
+            if state.push_unit(utf16_unit(pair, little_endian)) {
+                break 'outer;
             }
         }
         if index < n {
             carry = Some(buf[index]);
         }
     }
-
-    let total_lines = if !saw_any {
-        0
-    } else if stopped_early {
-        line
-    } else if last_was_newline {
-        line.saturating_sub(1)
-    } else {
-        line
-    };
-    let mut content = String::from_utf16_lossy(&units);
-    let before = content.len();
-    content = clip(content, cap);
-    truncated |= content.len() < before;
-    Ok((
-        content,
-        total_lines,
-        !stopped_early,
-        truncated,
-        last_selected,
-    ))
+    Ok(state.finish())
 }
 
+/// # Errors
+/// Returns an error when the path is invalid, disallowed, unreadable, or the payload is malformed.
 pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let path = resolve(policy, raw)?;
-    let meta = fs::metadata(&path).map_err(|error| access_error(raw, error))?;
+    let meta = fs::metadata(&path).map_err(|error| access_error(raw, &error))?;
     if meta.is_dir() {
         return Err(HandlerError::new(
             "is_directory",
@@ -430,14 +436,10 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .map_err(|e| HandlerError::new("io_error", format!("cannot read {raw:?}: {e}")))?;
     probe.truncate(n);
 
-    let utf16_le = probe.starts_with(&[0xff, 0xfe]);
-    let utf16_be = probe.starts_with(&[0xfe, 0xff]);
-    if !utf16_le && !utf16_be && probe.contains(&0) {
-        let preview = probe
-            .iter()
-            .take(256)
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+    let utf16_little_endian = probe.starts_with(&[0xff, 0xfe]);
+    let has_utf16_bom = utf16_little_endian || probe.starts_with(&[0xfe, 0xff]);
+    if !has_utf16_bom && probe.contains(&0) {
+        let preview = crate::hex_lower(&probe[..probe.len().min(256)]);
         return Ok(BTreeMap::from([
             ("ok".into(), Value::Bool(true)),
             ("path".into(), Value::String(path.display().to_string())),
@@ -446,15 +448,15 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             ("preview_hex".into(), Value::String(preview)),
             (
                 "modified_at".into(),
-                mtime(&meta).map(Value::String).unwrap_or(Value::Null),
+                mtime(&meta).map_or(Value::Null, Value::String),
             ),
             ("truncated".into(), Value::Bool(true)),
         ]));
     }
 
     let (start, end) = range.unwrap_or((1, None));
-    let (content, total_lines, total_exact, truncated, last) = if utf16_le || utf16_be {
-        scan_utf16(&path, start, end, cap, utf16_le)?
+    let (content, total_lines, total_exact, truncated, last) = if has_utf16_bom {
+        scan_utf16(&path, start, end, cap, utf16_little_endian)?
     } else {
         scan_utf8(&path, start, end, cap)?
     };
@@ -464,14 +466,7 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("path".into(), Value::String(path.display().to_string())),
         (
             "encoding".into(),
-            Value::String(
-                if utf16_le || utf16_be {
-                    "utf-16"
-                } else {
-                    "utf-8"
-                }
-                .into(),
-            ),
+            Value::String(if has_utf16_bom { "utf-16" } else { "utf-8" }.into()),
         ),
         ("content".into(), Value::String(content.clone())),
         ("total_lines".into(), Value::from(total_lines as u64)),
@@ -484,7 +479,7 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("truncated".into(), Value::Bool(truncated)),
         (
             "modified_at".into(),
-            mtime(&meta).map(Value::String).unwrap_or(Value::Null),
+            mtime(&meta).map_or(Value::Null, Value::String),
         ),
     ]);
     if range.is_some() {
@@ -493,10 +488,12 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     Ok(result)
 }
 
+/// # Errors
+/// Returns an error when the directory request is invalid, disallowed, or cannot be read.
 pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let root = resolve(policy, raw)?;
-    let meta = fs::metadata(&root).map_err(|error| access_error(raw, error))?;
+    let meta = fs::metadata(&root).map_err(|error| access_error(raw, &error))?;
     if !meta.is_dir() {
         return Err(HandlerError::new(
             "is_file",
@@ -508,7 +505,8 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("depth")
         .and_then(Value::as_i64)
         .unwrap_or(1)
-        .clamp(1, 5) as usize;
+        .clamp(1, 5);
+    let depth = usize::try_from(depth).unwrap_or(5);
     let hidden = payload
         .get("show_hidden")
         .and_then(Value::as_bool)
@@ -548,7 +546,7 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         let rel = entry
             .path()
             .strip_prefix(&root)
-            .unwrap_or(entry.path())
+            .unwrap_or_else(|_| entry.path())
             .to_string_lossy()
             .into_owned();
         entries.push(serde_json::json!({
@@ -576,11 +574,162 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 fn skip_search_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .map(|ext| SKIP_EXTS.contains(&ext.as_str()))
-        .unwrap_or(false)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|ext| SKIP_EXTS.contains(&ext.as_str()))
 }
 
+struct SearchState {
+    matches: Vec<Value>,
+    files_searched: u64,
+    errors: Vec<Value>,
+    error_count: u64,
+    cap: usize,
+}
+
+fn build_search_matcher(
+    pattern: &str,
+    is_regex: bool,
+    case_sensitive: bool,
+) -> Result<RegexMatcher, HandlerError> {
+    let mut builder = RegexMatcherBuilder::new();
+    builder.case_insensitive(!case_sensitive);
+    if is_regex {
+        builder.build(pattern).map_err(|e| {
+            HandlerError::new(
+                "invalid_payload",
+                format!("pattern is not a valid regex: {e}"),
+            )
+        })
+    } else {
+        builder.build_literals(&[pattern]).map_err(|e| {
+            HandlerError::new(
+                "invalid_payload",
+                format!("pattern could not be compiled: {e}"),
+            )
+        })
+    }
+}
+
+fn search_candidate(
+    path: &Path,
+    rel: &str,
+    matcher: &RegexMatcher,
+    searcher: &mut Searcher,
+    state: &mut SearchState,
+) -> bool {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            record_search_error(
+                &mut state.errors,
+                &mut state.error_count,
+                Some(path),
+                format!("open failed: {error}"),
+            );
+            return false;
+        }
+    };
+    let mut probe = [0_u8; PROBE];
+    let n = match file.read(&mut probe) {
+        Ok(n) => n,
+        Err(error) => {
+            record_search_error(
+                &mut state.errors,
+                &mut state.error_count,
+                Some(path),
+                format!("probe read failed: {error}"),
+            );
+            return false;
+        }
+    };
+    if probe[..n].contains(&0) {
+        return false;
+    }
+    if let Err(error) = file.rewind() {
+        record_search_error(
+            &mut state.errors,
+            &mut state.error_count,
+            Some(path),
+            format!("rewind failed: {error}"),
+        );
+        return false;
+    }
+    state.files_searched += 1;
+    let result = searcher.search_file(
+        matcher,
+        &file,
+        Bytes(|line_number, line| {
+            let line = match std::str::from_utf8(line) {
+                Ok(line) => line,
+                Err(error) => {
+                    record_search_error(
+                        &mut state.errors,
+                        &mut state.error_count,
+                        Some(path),
+                        format!("line {line_number} is not UTF-8: {error}"),
+                    );
+                    return Ok(true);
+                }
+            };
+            let found = match matcher.find(line.as_bytes()) {
+                Ok(Some(found)) => found,
+                Ok(None) => return Ok(true),
+                Err(error) => {
+                    record_search_error(
+                        &mut state.errors,
+                        &mut state.error_count,
+                        Some(path),
+                        format!("matcher failed on line {line_number}: {error}"),
+                    );
+                    return Ok(true);
+                }
+            };
+            let mut preview = line.trim().to_owned();
+            if preview.chars().count() > PREVIEW_CHARS {
+                preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
+            }
+            let byte_column = found.start() + 1;
+            let column = line
+                .char_indices()
+                .take_while(|(index, _)| *index < found.start())
+                .count()
+                + 1;
+            state.matches.push(serde_json::json!({
+                "file": rel,
+                "line": line_number,
+                "column": column,
+                "byte_column": byte_column,
+                "text": preview,
+            }));
+            Ok(state.matches.len() < state.cap)
+        }),
+    );
+    if let Err(error) = result {
+        record_search_error(
+            &mut state.errors,
+            &mut state.error_count,
+            Some(path),
+            format!("search failed: {error}"),
+        );
+    }
+    state.matches.len() >= state.cap
+}
+
+fn search_file_glob(payload: &Map<String, Value>) -> Result<Option<Pattern>, HandlerError> {
+    match payload.get("file_glob") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Pattern::new(text)
+            .map(Some)
+            .map_err(|e| HandlerError::new("invalid_payload", format!("invalid file_glob: {e}"))),
+        _ => Err(HandlerError::new(
+            "invalid_payload",
+            "file_glob must be a string",
+        )),
+    }
+}
+
+/// # Errors
+/// Returns an error when the search request is invalid, disallowed, or cannot be executed.
 pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let needle = require_str(payload, "pattern")?;
@@ -593,47 +742,22 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("regex")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let file_glob = match payload.get("file_glob") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(text)) => Some(Pattern::new(text).map_err(|e| {
-            HandlerError::new("invalid_payload", format!("invalid file_glob: {e}"))
-        })?),
-        _ => {
-            return Err(HandlerError::new(
-                "invalid_payload",
-                "file_glob must be a string",
-            ));
-        }
-    };
+    let file_glob = search_file_glob(payload)?;
     let cap = payload
         .get("max_results")
         .and_then(Value::as_u64)
-        .and_then(|v| usize::try_from(v).ok())
-        .filter(|v| *v > 0)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
         .unwrap_or(policy.file_ops_max_search_results)
         .min(policy.file_ops_max_search_results);
-
-    let mut matcher_builder = RegexMatcherBuilder::new();
-    matcher_builder.case_insensitive(!case_sensitive);
-    let matcher = if is_regex {
-        matcher_builder.build(needle)
-    } else {
-        matcher_builder.build_literals(&[needle])
-    }
-    .map_err(|e| {
-        let message = if is_regex {
-            format!("pattern is not a valid regex: {e}")
-        } else {
-            format!("pattern could not be compiled: {e}")
-        };
-        HandlerError::new("invalid_payload", message)
-    })?;
-
-    let mut matches = Vec::new();
-    let mut files_searched = 0_u64;
-    let mut search_errors = Vec::new();
-    let mut search_error_count = 0_u64;
-    let mut truncated = false;
+    let matcher = build_search_matcher(needle, is_regex, case_sensitive)?;
+    let mut state = SearchState {
+        matches: Vec::new(),
+        files_searched: 0,
+        errors: Vec::new(),
+        error_count: 0,
+        cap,
+    };
     let mut walker = WalkBuilder::new(&root);
     walker
         .hidden(false)
@@ -657,8 +781,8 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             Ok(entry) => entry,
             Err(error) => {
                 record_search_error(
-                    &mut search_errors,
-                    &mut search_error_count,
+                    &mut state.errors,
+                    &mut state.error_count,
                     None,
                     format!("walk failed: {error}"),
                 );
@@ -670,134 +794,37 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         }
         if file_glob
             .as_ref()
-            .is_some_and(|p| !p.matches(&entry.file_name().to_string_lossy()))
+            .is_some_and(|pattern| !pattern.matches(&entry.file_name().to_string_lossy()))
         {
             continue;
         }
-        let mut file = match fs::File::open(entry.path()) {
-            Ok(file) => file,
-            Err(error) => {
-                record_search_error(
-                    &mut search_errors,
-                    &mut search_error_count,
-                    Some(entry.path()),
-                    format!("open failed: {error}"),
-                );
-                continue;
-            }
-        };
-        let mut probe = [0_u8; PROBE];
-        let n = match file.read(&mut probe) {
-            Ok(n) => n,
-            Err(error) => {
-                record_search_error(
-                    &mut search_errors,
-                    &mut search_error_count,
-                    Some(entry.path()),
-                    format!("probe read failed: {error}"),
-                );
-                continue;
-            }
-        };
-        if probe[..n].contains(&0) {
-            continue;
-        }
-        if let Err(error) = file.rewind() {
-            record_search_error(
-                &mut search_errors,
-                &mut search_error_count,
-                Some(entry.path()),
-                format!("rewind failed: {error}"),
-            );
-            continue;
-        };
-        files_searched += 1;
-
         let rel = if root.is_file() {
             root.file_name()
-                .and_then(|n| n.to_str())
+                .and_then(|name| name.to_str())
                 .unwrap_or(raw)
                 .to_owned()
         } else {
             entry
                 .path()
                 .strip_prefix(&root)
-                .unwrap_or(entry.path())
+                .unwrap_or_else(|_| entry.path())
                 .to_string_lossy()
                 .into_owned()
         };
-        let search_result = searcher.search_file(
-            &matcher,
-            &file,
-            Bytes(|line_number, line| {
-                let line = match std::str::from_utf8(line) {
-                    Ok(line) => line,
-                    Err(error) => {
-                        record_search_error(
-                            &mut search_errors,
-                            &mut search_error_count,
-                            Some(entry.path()),
-                            format!("line {line_number} is not UTF-8: {error}"),
-                        );
-                        return Ok(true);
-                    }
-                };
-                let found = match matcher.find(line.as_bytes()) {
-                    Ok(Some(found)) => found,
-                    Ok(None) => return Ok(true),
-                    Err(error) => {
-                        record_search_error(
-                            &mut search_errors,
-                            &mut search_error_count,
-                            Some(entry.path()),
-                            format!("matcher failed on line {line_number}: {error}"),
-                        );
-                        return Ok(true);
-                    }
-                };
-                let mut preview = line.trim().to_owned();
-                if preview.chars().count() > PREVIEW_CHARS {
-                    preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
-                }
-                let byte_column = found.start() + 1;
-                let column = line
-                    .char_indices()
-                    .take_while(|(index, _)| *index < found.start())
-                    .count()
-                    + 1;
-                matches.push(serde_json::json!({
-                    "file": rel.as_str(),
-                    "line": line_number,
-                    "column": column,
-                    "byte_column": byte_column,
-                    "text": preview,
-                }));
-                Ok(matches.len() < cap)
-            }),
-        );
-        if let Err(error) = search_result {
-            record_search_error(
-                &mut search_errors,
-                &mut search_error_count,
-                Some(entry.path()),
-                format!("search failed: {error}"),
-            );
-            continue;
-        }
-        if matches.len() >= cap {
-            truncated = true;
+        if search_candidate(entry.path(), &rel, &matcher, &mut searcher, &mut state) {
             break;
         }
     }
 
+    let truncated = state.matches.len() >= state.cap;
     Ok(BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
         ("path".into(), Value::String(root.display().to_string())),
         ("pattern".into(), Value::String(needle.into())),
-        ("matches".into(), Value::Array(matches)),
-        ("files_searched".into(), Value::from(files_searched)),
-        ("search_error_count".into(), Value::from(search_error_count)),
-        ("search_errors".into(), Value::Array(search_errors)),
+        ("matches".into(), Value::Array(state.matches)),
+        ("files_searched".into(), Value::from(state.files_searched)),
+        ("search_error_count".into(), Value::from(state.error_count)),
+        ("search_errors".into(), Value::Array(state.errors)),
         ("truncated".into(), Value::Bool(truncated)),
     ]))
 }
@@ -806,6 +833,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -822,17 +850,17 @@ mod tests {
     fn permission_denied_is_not_reported_as_internal_io_error() {
         let error = access_error(
             "/restricted/tree",
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         assert_eq!(error.code, "permission_denied");
         assert!(error.message.contains("/restricted/tree"));
     }
 
     #[test]
-    fn read_range_and_search_contracts() {
-        let dir = tempdir().unwrap();
+    fn read_range_and_search_contracts() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("a.txt");
-        fs::write(&file, "one\ntwo needle\nthree\n").unwrap();
+        fs::write(&file, "one\ntwo needle\nthree\n").test_value()?;
         let policy = policy(dir.path());
         let read_result = read(
             &policy,
@@ -841,7 +869,7 @@ mod tests {
                 ("view_range".into(), serde_json::json!([2, 3])),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(read_result["content"], "two needle\nthree");
 
         let search_result = search(
@@ -854,8 +882,10 @@ mod tests {
                 ("pattern".into(), Value::String("needle".into())),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(search_result["matches"][0]["line"], 2);
+
+        Ok(())
     }
 
     fn search_payload(root: &Path, pattern: &str) -> Map<String, Value> {
@@ -866,91 +896,109 @@ mod tests {
     }
 
     #[test]
-    fn search_is_case_insensitive_by_default_and_reports_byte_column() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "prefix NeEdLe suffix\n").unwrap();
-        let result = search(&policy(dir.path()), &search_payload(dir.path(), "needle")).unwrap();
+    fn search_is_case_insensitive_by_default_and_reports_byte_column() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "prefix NeEdLe suffix\n").test_value()?;
+        let result =
+            search(&policy(dir.path()), &search_payload(dir.path(), "needle")).test_value()?;
         assert_eq!(result["matches"][0]["line"], 1);
         assert_eq!(result["matches"][0]["column"], 8);
         assert_eq!(result["matches"][0]["text"], "prefix NeEdLe suffix");
+
+        Ok(())
     }
 
     #[test]
-    fn search_case_sensitive_mode_rejects_case_mismatch() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "NeEdLe\n").unwrap();
+    fn search_case_sensitive_mode_rejects_case_mismatch() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "NeEdLe\n").test_value()?;
         let mut payload = search_payload(dir.path(), "needle");
         payload.insert("case_sensitive".into(), Value::Bool(true));
-        let result = search(&policy(dir.path()), &payload).unwrap();
+        let result = search(&policy(dir.path()), &payload).test_value()?;
         assert_eq!(result["matches"], serde_json::json!([]));
+
+        Ok(())
     }
 
     #[test]
-    fn search_regex_mode_uses_ripgrep_matcher() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "abc 123 xyz\n").unwrap();
+    fn search_regex_mode_uses_ripgrep_matcher() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "abc 123 xyz\n").test_value()?;
         let mut payload = search_payload(dir.path(), r"\d{3}");
         payload.insert("regex".into(), Value::Bool(true));
-        let result = search(&policy(dir.path()), &payload).unwrap();
+        let result = search(&policy(dir.path()), &payload).test_value()?;
         assert_eq!(result["matches"][0]["column"], 5);
+
+        Ok(())
     }
 
     #[test]
-    fn search_skips_binary_noise_dirs_and_nonmatching_globs() {
-        let dir = tempdir().unwrap();
-        fs::create_dir(dir.path().join("target")).unwrap();
-        fs::write(dir.path().join("target").join("hidden.txt"), "needle\n").unwrap();
-        fs::write(dir.path().join("keep.rs"), "needle\n").unwrap();
-        fs::write(dir.path().join("wrong.txt"), "needle\n").unwrap();
-        fs::write(dir.path().join("binary.rs"), b"needle\0more\n").unwrap();
+    fn search_skips_binary_noise_dirs_and_nonmatching_globs() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::create_dir(dir.path().join("target")).test_value()?;
+        fs::write(dir.path().join("target").join("hidden.txt"), "needle\n").test_value()?;
+        fs::write(dir.path().join("keep.rs"), "needle\n").test_value()?;
+        fs::write(dir.path().join("wrong.txt"), "needle\n").test_value()?;
+        fs::write(dir.path().join("binary.rs"), b"needle\0more\n").test_value()?;
 
         let mut payload = search_payload(dir.path(), "needle");
         payload.insert("file_glob".into(), Value::String("*.rs".into()));
-        let result = search(&policy(dir.path()), &payload).unwrap();
-        let matches = result["matches"].as_array().unwrap();
+        let result = search(&policy(dir.path()), &payload).test_value()?;
+        let matches = result["matches"].as_array().test_value()?;
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["file"], "keep.rs");
         assert_eq!(result["files_searched"], 1);
+
+        Ok(())
     }
 
     #[test]
-    fn search_global_result_cap_sets_truncated() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "needle\nneedle\n").unwrap();
+    fn search_global_result_cap_sets_truncated() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "needle\nneedle\n").test_value()?;
         let mut payload = search_payload(dir.path(), "needle");
         payload.insert("max_results".into(), Value::from(1));
-        let result = search(&policy(dir.path()), &payload).unwrap();
-        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        let result = search(&policy(dir.path()), &payload).test_value()?;
+        assert_eq!(result["matches"].as_array().test_value()?.len(), 1);
         assert_eq!(result["truncated"], true);
+
+        Ok(())
     }
 
     #[test]
-    fn search_single_file_preserves_basename_contract() {
-        let dir = tempdir().unwrap();
+    fn search_single_file_preserves_basename_contract() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("a.txt");
-        fs::write(&file, "needle\n").unwrap();
-        let result = search(&policy(dir.path()), &search_payload(&file, "needle")).unwrap();
+        fs::write(&file, "needle\n").test_value()?;
+        let result = search(&policy(dir.path()), &search_payload(&file, "needle")).test_value()?;
         assert_eq!(result["matches"][0]["file"], "a.txt");
+
+        Ok(())
     }
 
     #[test]
-    fn invalid_regex_is_a_payload_error() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+    fn invalid_regex_is_a_payload_error() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "needle\n").test_value()?;
         let mut payload = search_payload(dir.path(), "(");
         payload.insert("regex".into(), Value::Bool(true));
-        let error = search(&policy(dir.path()), &payload).unwrap_err();
+        let error = search(&policy(dir.path()), &payload).test_error()?;
         assert_eq!(error.code, "invalid_payload");
         assert!(error.message.contains("valid regex"));
+
+        Ok(())
     }
 
     #[test]
-    fn search_column_is_character_based_and_byte_column_is_explicit() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("utf8.txt"), "żółw needle\n").unwrap();
-        let result = search(&policy(dir.path()), &search_payload(dir.path(), "needle")).unwrap();
-        let first = &result["matches"].as_array().unwrap()[0];
+    fn search_column_is_character_based_and_byte_column_is_explicit() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("utf8.txt"), "żółw needle\n").test_value()?;
+        let result =
+            search(&policy(dir.path()), &search_payload(dir.path(), "needle")).test_value()?;
+        let first = &result["matches"].as_array().test_value()?[0];
         assert_eq!(first["column"], 6);
         assert_eq!(first["byte_column"], 9);
+
+        Ok(())
     }
 }

@@ -1,8 +1,6 @@
-#![expect(
-    clippy::result_large_err,
-    reason = "tungstenite fixes the handshake callback Result error type"
-)]
+mod common;
 
+use common::{TestResult, TestValue as _};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{Agent, AgentConfig, AuthToken, ReconnectPolicy, UnsupportedDispatcher};
 use sentinel0_proto::{HostInfo, Message};
@@ -18,11 +16,23 @@ use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::{
         Message as WsMessage,
-        handshake::server::{Request, Response},
+        handshake::server::{Callback, ErrorResponse, Request, Response},
         protocol::{CloseFrame, frame::coding::CloseCode},
     },
 };
 use tokio_util::sync::CancellationToken;
+
+struct AssertHeaders<F>(F);
+
+impl<F> Callback for AssertHeaders<F>
+where
+    F: FnOnce(&Request),
+{
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        (self.0)(request);
+        Ok(response)
+    }
+}
 
 fn host() -> HostInfo {
     HostInfo {
@@ -42,9 +52,9 @@ fn host() -> HostInfo {
 }
 
 #[tokio::test]
-async fn real_socket_reconnects_after_1012_and_reauthenticates() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn real_socket_reconnects_after_1012_and_reauthenticates() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let handshakes = Arc::new(AtomicUsize::new(0));
     let seen = handshakes.clone();
     let cancel = CancellationToken::new();
@@ -52,23 +62,27 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
 
     let server = tokio::spawn(async move {
         for n in 0..2 {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_hdr_async(stream, |req: &Request, response: Response| {
-                assert_eq!(req.uri().path(), "/agent/connect");
-                assert_eq!(
-                    req.headers().get("authorization").unwrap(),
-                    "Bearer test-token"
-                );
-                seen.fetch_add(1, Ordering::SeqCst);
-                Ok(response)
-            })
+            let (stream, _) = listener.accept().await.test_value()?;
+            let mut ws = accept_hdr_async(
+                stream,
+                AssertHeaders(|req: &Request| {
+                    assert_eq!(req.uri().path(), "/agent/connect");
+                    assert_eq!(
+                        req.headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer test-token")
+                    );
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
             .await
-            .unwrap();
+            .test_value()?;
 
-            let WsMessage::Text(hello) = ws.next().await.unwrap().unwrap() else {
-                panic!("expected hello")
+            let WsMessage::Text(hello) = ws.next().await.test_value()?.test_value()? else {
+                return Err(std::io::Error::other("expected hello").into());
             };
-            match serde_json::from_str::<Message>(&hello).unwrap() {
+            match serde_json::from_str::<Message>(&hello).test_value()? {
                 Message::Hello {
                     protocol_version,
                     host,
@@ -77,7 +91,11 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
                     assert_eq!(protocol_version, "1.13.0");
                     assert_eq!(host.id, "host_test");
                 }
-                other => panic!("expected hello, got {other:?}"),
+                other => {
+                    return Err(
+                        std::io::Error::other(format!("expected hello, got {other:?}")).into(),
+                    );
+                }
             }
 
             let welcome = serde_json::json!({
@@ -88,7 +106,7 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
             });
             ws.send(WsMessage::Text(welcome.to_string().into()))
                 .await
-                .unwrap();
+                .test_value()?;
 
             if n == 0 {
                 ws.close(Some(CloseFrame {
@@ -96,12 +114,13 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
                     reason: "deploy".into(),
                 }))
                 .await
-                .unwrap();
+                .test_value()?;
             } else {
                 server_cancel.cancel();
                 let _ = ws.close(None).await;
             }
         }
+        Ok::<(), common::TestFailure>(())
     });
 
     let agent = Agent::new(
@@ -126,36 +145,41 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() {
         },
         UnsupportedDispatcher,
     )
-    .unwrap();
+    .test_value()?;
 
     tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
     assert_eq!(handshakes.load(Ordering::SeqCst), 2);
+    Ok(())
 }
 
 #[tokio::test]
-async fn established_session_loss_discards_old_handshake_backoff() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn established_session_loss_discards_old_handshake_backoff() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
         for n in 0..5 {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_hdr_async(stream, |req: &Request, response: Response| {
-                assert_eq!(
-                    req.headers().get("authorization").unwrap(),
-                    "Bearer test-token"
-                );
-                Ok(response)
-            })
+            let (stream, _) = listener.accept().await.test_value()?;
+            let mut ws = accept_hdr_async(
+                stream,
+                AssertHeaders(|req: &Request| {
+                    assert_eq!(
+                        req.headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer test-token")
+                    );
+                }),
+            )
             .await
-            .unwrap();
-            let _hello = ws.next().await.unwrap().unwrap();
+            .test_value()?;
+            let _hello = ws.next().await.test_value()?.test_value()?;
 
             if n < 3 {
                 drop(ws);
@@ -170,7 +194,7 @@ async fn established_session_loss_discards_old_handshake_backoff() {
             });
             ws.send(WsMessage::Text(welcome.to_string().into()))
                 .await
-                .unwrap();
+                .test_value()?;
 
             if n == 3 {
                 drop(ws);
@@ -179,6 +203,7 @@ async fn established_session_loss_discards_old_handshake_backoff() {
                 let _ = ws.close(None).await;
             }
         }
+        Ok::<(), common::TestFailure>(())
     });
 
     let agent = Agent::new(
@@ -210,36 +235,37 @@ async fn established_session_loss_discards_old_handshake_backoff() {
         },
         UnsupportedDispatcher,
     )
-    .unwrap();
+    .test_value()?;
 
     tokio::time::timeout(Duration::from_millis(150), agent.run(cancel.clone()))
         .await
-        .expect("established-session loss inherited stale 300ms handshake backoff")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn missing_welcome_times_out_and_next_real_connection_recovers() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn missing_welcome_times_out_and_next_real_connection_recovers() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut first = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let (stream, _) = listener.accept().await.test_value()?;
+        let mut first = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
-            .unwrap();
-        let _hello = first.next().await.unwrap().unwrap();
+            .test_value()?;
+        let _hello = first.next().await.test_value()?.test_value()?;
         tokio::time::sleep(Duration::from_millis(60)).await;
         drop(first);
 
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut second = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let (stream, _) = listener.accept().await.test_value()?;
+        let mut second = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
-            .unwrap();
-        let _hello = second.next().await.unwrap().unwrap();
+            .test_value()?;
+        let _hello = second.next().await.test_value()?.test_value()?;
         let welcome = serde_json::json!({
             "type": "welcome",
             "session_id": "sess_recovered",
@@ -249,9 +275,10 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() {
         second
             .send(WsMessage::Text(welcome.to_string().into()))
             .await
-            .unwrap();
+            .test_value()?;
         server_cancel.cancel();
         let _ = second.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
     let agent = Agent::new(
@@ -276,28 +303,29 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() {
         },
         UnsupportedDispatcher,
     )
-    .unwrap();
+    .test_value()?;
 
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
-        .expect("agent hung on a hub that accepted WebSocket but never welcomed")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut first = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let (stream, _) = listener.accept().await.test_value()?;
+        let mut first = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
-            .unwrap();
-        let _hello = first.next().await.unwrap().unwrap();
+            .test_value()?;
+        let _hello = first.next().await.test_value()?.test_value()?;
         let welcome = serde_json::json!({
             "type": "welcome",
             "session_id": "sess_silent",
@@ -307,17 +335,17 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() {
         first
             .send(WsMessage::Text(welcome.to_string().into()))
             .await
-            .unwrap();
+            .test_value()?;
 
         // Stay connected but deliberately ignore application-level pings.
         tokio::time::sleep(Duration::from_millis(60)).await;
         drop(first);
 
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut second = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let (stream, _) = listener.accept().await.test_value()?;
+        let mut second = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
-            .unwrap();
-        let _hello = second.next().await.unwrap().unwrap();
+            .test_value()?;
+        let _hello = second.next().await.test_value()?.test_value()?;
         let welcome = serde_json::json!({
             "type": "welcome",
             "session_id": "sess_after_heartbeat_timeout",
@@ -327,9 +355,10 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() {
         second
             .send(WsMessage::Text(welcome.to_string().into()))
             .await
-            .unwrap();
+            .test_value()?;
         server_cancel.cancel();
         let _ = second.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
     let agent = Agent::new(
@@ -354,17 +383,18 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() {
         },
         UnsupportedDispatcher,
     )
-    .unwrap();
+    .test_value()?;
 
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
-        .expect("silent established peer did not trigger heartbeat recovery")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn cancellation_interrupts_reconnect_sleep_immediately() {
+async fn cancellation_interrupts_reconnect_sleep_immediately() -> TestResult {
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
 
@@ -388,7 +418,7 @@ async fn cancellation_interrupts_reconnect_sleep_immediately() {
         },
         UnsupportedDispatcher,
     )
-    .unwrap();
+    .test_value()?;
 
     let task = tokio::spawn(async move { agent.run(cancel_for_task).await });
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -396,25 +426,27 @@ async fn cancellation_interrupts_reconnect_sleep_immediately() {
 
     tokio::time::timeout(Duration::from_millis(100), task)
         .await
-        .expect("cancellation waited for the full reconnect delay")
-        .unwrap()
-        .unwrap();
+        .test_value()?
+        .test_value()?
+        .test_value()?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn cancellation_interrupts_wait_for_welcome_immediately() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn cancellation_interrupts_wait_for_welcome_immediately() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let agent_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+        let (stream, _) = listener.accept().await.test_value()?;
+        let mut ws = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
-            .unwrap();
-        let _hello = ws.next().await.unwrap().unwrap();
+            .test_value()?;
+        let _hello = ws.next().await.test_value()?.test_value()?;
         tokio::time::sleep(Duration::from_millis(250)).await;
+        Ok::<(), common::TestFailure>(())
     });
 
     let agent = Agent::new(
@@ -437,7 +469,7 @@ async fn cancellation_interrupts_wait_for_welcome_immediately() {
         },
         UnsupportedDispatcher,
     )
-    .unwrap();
+    .test_value()?;
 
     let task = tokio::spawn(async move { agent.run(agent_cancel).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -445,8 +477,9 @@ async fn cancellation_interrupts_wait_for_welcome_immediately() {
 
     tokio::time::timeout(Duration::from_millis(100), task)
         .await
-        .expect("cancellation waited for the welcome timeout")
-        .unwrap()
-        .unwrap();
+        .test_value()?
+        .test_value()?
+        .test_value()?;
     server.abort();
+    Ok(())
 }

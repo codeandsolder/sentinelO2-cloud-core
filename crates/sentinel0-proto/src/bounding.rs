@@ -1,3 +1,4 @@
+use num_traits::ToPrimitive;
 use serde_json::{Map, Value, json};
 
 pub const RESPONSE_SOFT_LIMIT_BYTES: usize = 131_072;
@@ -11,8 +12,7 @@ const MIN_TRUNCATABLE: usize = 256;
 
 pub fn serialized_size(value: &Value) -> usize {
     match value {
-        Value::Null => 4,
-        Value::Bool(true) => 4,
+        Value::Null | Value::Bool(true) => 4,
         Value::Bool(false) => 5,
         Value::Number(number) => number.to_string().len(),
         Value::String(text) => python_json_string_size(text),
@@ -53,11 +53,10 @@ fn decode_utf8_ignoring_invalid(mut bytes: &[u8]) -> String {
             }
             Err(error) => {
                 let valid = error.valid_up_to();
-                if valid > 0 {
-                    // SAFETY: from_utf8 reported this prefix as valid.
-                    out.push_str(
-                        std::str::from_utf8(&bytes[..valid]).expect("validated UTF-8 prefix"),
-                    );
+                if valid > 0
+                    && let Ok(prefix) = std::str::from_utf8(&bytes[..valid])
+                {
+                    out.push_str(prefix);
                 }
                 let skip = error.error_len().unwrap_or(bytes.len() - valid);
                 bytes = &bytes[(valid + skip).min(bytes.len())..];
@@ -71,6 +70,14 @@ fn marker(omitted: usize) -> String {
     format!("\n…[sentinelx: truncated {omitted} bytes]…\n")
 }
 
+fn usize_to_f64(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
+}
+
+fn nonnegative_f64_to_usize(value: f64) -> usize {
+    value.to_usize().unwrap_or(usize::MAX)
+}
+
 fn truncate_text(text: &str, keep_bytes: usize) -> String {
     let raw = text.as_bytes();
     let original = raw.len();
@@ -78,7 +85,7 @@ fn truncate_text(text: &str, keep_bytes: usize) -> String {
         return text.to_owned();
     }
 
-    let head_budget = (keep_bytes as f64 * RESPONSE_HEAD_RATIO) as usize;
+    let head_budget = nonnegative_f64_to_usize(usize_to_f64(keep_bytes) * RESPONSE_HEAD_RATIO);
     let tail_budget = keep_bytes - head_budget;
     let head = decode_utf8_ignoring_invalid(&raw[..head_budget.min(original)]);
     let tail = if tail_budget > 0 {
@@ -168,8 +175,9 @@ fn shrink_largest(response: &mut Value, root_key: &str, budget: usize) -> bool {
             return false;
         };
 
-        let proportional =
-            (raw_len as f64 * (budget as f64 / current as f64) * SHRINK_SLACK) as usize;
+        let proportional = nonnegative_f64_to_usize(
+            usize_to_f64(raw_len) * (usize_to_f64(budget) / usize_to_f64(current)) * SHRINK_SLACK,
+        );
         let keep = proportional
             .max(MIN_TRUNCATABLE)
             .min(raw_len.saturating_sub(1));

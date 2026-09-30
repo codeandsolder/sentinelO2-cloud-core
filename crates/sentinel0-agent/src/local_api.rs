@@ -1,7 +1,7 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
-    process_output::capture_bounded,
+    process_output::{CapturedOutput, capture_bounded},
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -40,6 +40,7 @@ fn relay_command(
     ])
 }
 
+#[must_use]
 pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
     #[cfg(unix)]
     {
@@ -85,7 +86,7 @@ pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
         }
 
         let mut reply = Vec::new();
-        let mut chunk = [0_u8; 65_536];
+        let mut chunk = vec![0_u8; 65_536];
         loop {
             match stream.read(&mut chunk) {
                 Ok(0) => break,
@@ -221,6 +222,91 @@ fn valid_compatibility(value: Option<&Value>, protocol: &str) -> Result<Option<V
     Ok(Some(Value::Object(value.clone())))
 }
 
+fn parse_action(
+    endpoint_name: &str,
+    action_name: &str,
+    raw_action: &Value,
+    protocol: &str,
+) -> Result<Action, String> {
+    let action = raw_action.as_object().ok_or_else(|| {
+        format!("local_apis.{endpoint_name}.actions.{action_name} must be an object")
+    })?;
+    reject_unknown_keys(
+        action,
+        &["request", "method", "select", "description", "params"],
+        &format!("local_apis.{endpoint_name}.actions.{action_name}"),
+    )?;
+    let request = action
+        .get("request")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let method = action
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if protocol == "http"
+        && request
+            .as_deref()
+            .is_none_or(|request| request.trim().is_empty())
+    {
+        return Err(format!(
+            "local_apis.{endpoint_name}.actions.{action_name}.request is required for HTTP"
+        ));
+    }
+    if protocol == "jsonrpc"
+        && method
+            .as_deref()
+            .is_none_or(|method| method.trim().is_empty())
+    {
+        return Err(format!(
+            "local_apis.{endpoint_name}.actions.{action_name}.method is required for JSON-RPC"
+        ));
+    }
+    let select = match action.get("select") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_owned).ok_or_else(|| {
+                    format!(
+                        "local_apis.{endpoint_name}.actions.{action_name}.select must contain only strings"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "local_apis.{endpoint_name}.actions.{action_name}.select must be an array"
+            ));
+        }
+    };
+    let params_schema = match action.get("params") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(_)) => action.get("params").cloned(),
+        Some(_) => {
+            return Err(format!(
+                "local_apis.{endpoint_name}.actions.{action_name}.params must be an object"
+            ));
+        }
+    };
+    let description = match action.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err(format!(
+                "local_apis.{endpoint_name}.actions.{action_name}.description must be a string"
+            ));
+        }
+    };
+    Ok(Action {
+        request,
+        method,
+        select,
+        description,
+        params_schema,
+    })
+}
+
 fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, String> {
     let value = yaml_to_json(raw)?;
     let map = value
@@ -279,89 +365,13 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
         return Err(format!("local_apis.{name}.actions must not be empty"));
     }
 
-    let mut actions = BTreeMap::new();
-    for (action_name, raw_action) in raw_actions {
-        let action = raw_action
-            .as_object()
-            .ok_or_else(|| format!("local_apis.{name}.actions.{action_name} must be an object"))?;
-        reject_unknown_keys(
-            action,
-            &["request", "method", "select", "description", "params"],
-            &format!("local_apis.{name}.actions.{action_name}"),
-        )?;
-        let request = action
-            .get("request")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let method = action
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if protocol == "http"
-            && request
-                .as_deref()
-                .is_none_or(|request| request.trim().is_empty())
-        {
-            return Err(format!(
-                "local_apis.{name}.actions.{action_name}.request is required for HTTP"
-            ));
-        }
-        if protocol == "jsonrpc"
-            && method
-                .as_deref()
-                .is_none_or(|method| method.trim().is_empty())
-        {
-            return Err(format!(
-                "local_apis.{name}.actions.{action_name}.method is required for JSON-RPC"
-            ));
-        }
-
-        let select = match action.get("select") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(items)) => items
-                .iter()
-                .map(|item| {
-                    item.as_str().map(str::to_owned).ok_or_else(|| {
-                        format!(
-                            "local_apis.{name}.actions.{action_name}.select must contain only strings"
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            Some(_) => {
-                return Err(format!(
-                    "local_apis.{name}.actions.{action_name}.select must be an array"
-                ));
-            }
-        };
-        let params_schema = match action.get("params") {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(_)) => action.get("params").cloned(),
-            Some(_) => {
-                return Err(format!(
-                    "local_apis.{name}.actions.{action_name}.params must be an object"
-                ));
-            }
-        };
-        actions.insert(
-            action_name.clone(),
-            Action {
-                request,
-                method,
-                select,
-                description: match action.get("description") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(value)) => Some(value.clone()),
-                    Some(_) => {
-                        return Err(format!(
-                            "local_apis.{name}.actions.{action_name}.description must be a string"
-                        ));
-                    }
-                },
-                params_schema,
-            },
-        );
-    }
+    let actions = raw_actions
+        .iter()
+        .map(|(action_name, raw_action)| {
+            parse_action(name, action_name, raw_action, &protocol)
+                .map(|action| (action_name.clone(), action))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
 
     let timeout_seconds = match map.get("timeout_s") {
         None | Some(Value::Null) => 30.0,
@@ -382,8 +392,9 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
         timeout: Duration::from_secs_f64(timeout_seconds),
         run_as: match map.get("run_as") {
             None | Some(Value::Null) => None,
-            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_owned()),
-            Some(Value::String(_)) => None,
+            Some(Value::String(value)) => {
+                (!value.trim().is_empty()).then(|| value.trim().to_owned())
+            }
             Some(_) => {
                 return Err(format!("local_apis.{name}.run_as must be a string"));
             }
@@ -491,8 +502,7 @@ fn render(template: &str, params: &Map<String, Value>) -> Result<String, Handler
     for (key, value) in params {
         let value = value
             .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| value.to_string());
+            .map_or_else(|| value.to_string(), str::to_owned);
         output = output.replace(&format!("{{{key}}}"), &percent_encode(&value));
     }
     if let Some(start) = output.find('{')
@@ -601,11 +611,16 @@ where
     }
 }
 
-async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
+struct HttpHead {
+    status: u16,
+    content_length: Option<usize>,
+    chunked: bool,
+}
+
+async fn read_http_head(reader: &mut BufReader<UnixStream>) -> Result<HttpHead, HandlerError> {
     const MAX_HEADER_BYTES: usize = 128 * 1024;
     const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
 
-    let mut reader = BufReader::new(stream);
     let mut header = Vec::new();
     loop {
         let remaining = MAX_HEADER_BYTES.saturating_sub(header.len());
@@ -613,7 +628,7 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
             return Err(HandlerError::new("too_large", "HTTP headers exceeded cap"));
         }
         let line = read_until_bounded(
-            &mut reader,
+            reader,
             b'\n',
             remaining.min(MAX_HEADER_LINE_BYTES),
             "HTTP header line",
@@ -645,7 +660,6 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
                 format!("unparseable HTTP status: {status_line:?}"),
             )
         })?;
-
     let mut content_length = None;
     let mut chunked = false;
     for line in lines {
@@ -673,70 +687,88 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
             chunked = true;
         }
     }
+    Ok(HttpHead {
+        status,
+        content_length,
+        chunked,
+    })
+}
 
-    let body = if chunked {
-        let mut body = Vec::new();
-        loop {
-            let size_line =
-                read_until_bounded(&mut reader, b'\n', 8192, "HTTP chunk-size line").await?;
-            if size_line.is_empty() {
-                return Err(HandlerError::new(
-                    "bad_response",
-                    "endpoint closed before chunk size",
-                ));
-            }
-            let size_line = String::from_utf8_lossy(&size_line);
-            let size_text = size_line.trim().split(';').next().unwrap_or("0");
-            let size = usize::from_str_radix(size_text, 16)
-                .map_err(|_| HandlerError::new("bad_response", "invalid chunk size"))?;
-            if size == 0 {
-                let mut trailer_bytes = 0_usize;
-                loop {
-                    let trailer =
-                        read_until_bounded(&mut reader, b'\n', 16 * 1024, "HTTP trailer line")
-                            .await?;
-                    if trailer.is_empty() {
-                        return Err(HandlerError::new(
-                            "bad_response",
-                            "endpoint closed inside HTTP trailers",
-                        ));
-                    }
-                    trailer_bytes = trailer_bytes.saturating_add(trailer.len());
-                    if trailer_bytes > MAX_HEADER_BYTES {
-                        return Err(HandlerError::new("too_large", "HTTP trailers exceeded cap"));
-                    }
-                    if trailer == b"\r\n" || trailer == b"\n" {
-                        break;
-                    }
-                }
-                break;
-            }
-            if body.len().saturating_add(size) > MAX_RESPONSE_BYTES {
-                return Err(HandlerError::new(
-                    "too_large",
-                    "endpoint response exceeded the cap",
-                ));
-            }
-            let start = body.len();
-            body.resize(start + size, 0);
-            reader
-                .read_exact(&mut body[start..])
-                .await
-                .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-            let mut crlf = [0_u8; 2];
-            reader
-                .read_exact(&mut crlf)
-                .await
-                .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-            if crlf != *b"\r\n" {
-                return Err(HandlerError::new(
-                    "bad_response",
-                    "chunk payload was not followed by CRLF",
-                ));
-            }
+async fn read_http_trailers(reader: &mut BufReader<UnixStream>) -> Result<(), HandlerError> {
+    const MAX_HEADER_BYTES: usize = 128 * 1024;
+    let mut trailer_bytes = 0_usize;
+    loop {
+        let trailer = read_until_bounded(reader, b'\n', 16 * 1024, "HTTP trailer line").await?;
+        if trailer.is_empty() {
+            return Err(HandlerError::new(
+                "bad_response",
+                "endpoint closed inside HTTP trailers",
+            ));
         }
-        body
-    } else if let Some(length) = content_length {
+        trailer_bytes = trailer_bytes.saturating_add(trailer.len());
+        if trailer_bytes > MAX_HEADER_BYTES {
+            return Err(HandlerError::new("too_large", "HTTP trailers exceeded cap"));
+        }
+        if trailer == b"\r\n" || trailer == b"\n" {
+            return Ok(());
+        }
+    }
+}
+
+async fn read_chunked_http_body(
+    reader: &mut BufReader<UnixStream>,
+) -> Result<Vec<u8>, HandlerError> {
+    let mut body = Vec::new();
+    loop {
+        let size_line = read_until_bounded(reader, b'\n', 8192, "HTTP chunk-size line").await?;
+        if size_line.is_empty() {
+            return Err(HandlerError::new(
+                "bad_response",
+                "endpoint closed before chunk size",
+            ));
+        }
+        let size_line = String::from_utf8_lossy(&size_line);
+        let size_text = size_line.trim().split(';').next().unwrap_or("0");
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|_| HandlerError::new("bad_response", "invalid chunk size"))?;
+        if size == 0 {
+            read_http_trailers(reader).await?;
+            return Ok(body);
+        }
+        if body.len().saturating_add(size) > MAX_RESPONSE_BYTES {
+            return Err(HandlerError::new(
+                "too_large",
+                "endpoint response exceeded the cap",
+            ));
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader
+            .read_exact(&mut body[start..])
+            .await
+            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+        let mut crlf = [0_u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .await
+            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+        if crlf != *b"\r\n" {
+            return Err(HandlerError::new(
+                "bad_response",
+                "chunk payload was not followed by CRLF",
+            ));
+        }
+    }
+}
+
+async fn read_http_payload(
+    reader: &mut BufReader<UnixStream>,
+    head: &HttpHead,
+) -> Result<Vec<u8>, HandlerError> {
+    if head.chunked {
+        return read_chunked_http_body(reader).await;
+    }
+    if let Some(length) = head.content_length {
         if length > MAX_RESPONSE_BYTES {
             return Err(HandlerError::new(
                 "too_large",
@@ -750,29 +782,31 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
                 .await
                 .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
         }
-        body
-    } else {
-        let mut body = Vec::new();
-        let mut limited = reader.take((MAX_RESPONSE_BYTES + 1) as u64);
-        limited
-            .read_to_end(&mut body)
-            .await
-            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(HandlerError::new(
-                "too_large",
-                "endpoint response exceeded the cap",
-            ));
-        }
-        body
-    };
+        return Ok(body);
+    }
 
+    let mut body = Vec::new();
+    let mut limited = reader.take(u64::try_from(MAX_RESPONSE_BYTES + 1).unwrap_or(u64::MAX));
+    limited
+        .read_to_end(&mut body)
+        .await
+        .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(HandlerError::new(
+            "too_large",
+            "endpoint response exceeded the cap",
+        ));
+    }
+    Ok(body)
+}
+
+fn decode_http_payload(status: u16, body: &[u8]) -> Result<Value, HandlerError> {
     if status >= 400 {
         return Err(HandlerError::new(
             "endpoint_error",
             format!(
                 "endpoint answered HTTP {status}: {}",
-                String::from_utf8_lossy(&body)
+                String::from_utf8_lossy(body)
                     .chars()
                     .take(200)
                     .collect::<String>()
@@ -782,9 +816,16 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
     if body.is_empty() {
         Ok(Value::Null)
     } else {
-        serde_json::from_slice(&body)
+        serde_json::from_slice(body)
             .map_err(|_| HandlerError::new("bad_response", "endpoint did not return JSON"))
     }
+}
+
+async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
+    let mut reader = BufReader::new(stream);
+    let head = read_http_head(&mut reader).await?;
+    let body = read_http_payload(&mut reader, &head).await?;
+    decode_http_payload(head.status, &body)
 }
 
 async fn call_http(
@@ -802,9 +843,8 @@ async fn call_http(
     let target = render(target.trim(), params)?;
     let mut stream = connect(endpoint).await?;
     let wire = format!(
-        "{} {} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        method.to_ascii_uppercase(),
-        target
+        "{} {target} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        method.to_ascii_uppercase()
     );
     timeout(endpoint.timeout, stream.write_all(wire.as_bytes()))
         .await
@@ -837,8 +877,9 @@ async fn kill_and_reap_relay(
     #[cfg(unix)]
     if should_kill {
         if let Some(pid) = pid {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+            let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+            if let Err(error) =
+                nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
                 && error != nix::errno::Errno::ESRCH
             {
                 let message = format!("failed killing local-api relay process group: {error}");
@@ -865,6 +906,59 @@ async fn kill_and_reap_relay(
         cleanup_error.get_or_insert(message);
     }
     cleanup_error
+}
+
+fn interpret_relay_output(
+    endpoint: &Endpoint,
+    executable: &Path,
+    captured: &CapturedOutput,
+) -> Result<Vec<u8>, HandlerError> {
+    if captured.stdout.truncated() {
+        return Err(HandlerError::new(
+            "too_large",
+            "local-api relay response exceeded the cap",
+        ));
+    }
+    let stdout = captured.stdout.rendered();
+    if captured.status.success() && !stdout.is_empty() {
+        return Ok(stdout);
+    }
+
+    let detail = captured.stderr.rendered_trimmed_lossy();
+    let rc = captured.status.code().unwrap_or(-1);
+    if detail.contains("a password is required")
+        || detail.contains("not allowed to execute")
+        || (rc == 1 && detail.to_ascii_lowercase().contains("sudo"))
+    {
+        let user = endpoint.run_as.as_deref().unwrap_or("<unknown>");
+        return Err(HandlerError::new(
+            "run_as_not_permitted",
+            format!(
+                "{:?} declares run_as={user:?}, but this agent may not become that user. The host owner can allow only this relay with a sudoers rule such as: sentinelx ALL=({user}) NOPASSWD: {} --local-api-relay * ({})",
+                endpoint.name,
+                executable.display(),
+                detail.chars().take(120).collect::<String>()
+            ),
+        ));
+    }
+    if rc == 3 {
+        return Err(HandlerError::new(
+            "endpoint_unreachable",
+            format!(
+                "cannot open {} as {}: {}",
+                endpoint.path,
+                endpoint.run_as.as_deref().unwrap_or("<unknown>"),
+                detail.chars().take(160).collect::<String>()
+            ),
+        ));
+    }
+    Err(HandlerError::new(
+        "bad_response",
+        format!(
+            "relay failed (rc={rc}): {}",
+            detail.chars().take(160).collect::<String>()
+        ),
+    ))
 }
 
 async fn call_via_run_as(
@@ -910,7 +1004,7 @@ async fn call_via_run_as(
     };
     let work = async {
         let capture = capture_bounded(&mut child, MAX_RESPONSE_BYTES, RELAY_STDERR_BYTES);
-        let (_, captured) = tokio::try_join!(write, capture)?;
+        let ((), captured) = tokio::try_join!(write, capture)?;
         Ok::<_, std::io::Error>(captured)
     };
     let captured = match timeout(endpoint.timeout + Duration::from_secs(5), work).await {
@@ -937,54 +1031,7 @@ async fn call_via_run_as(
         }
     };
 
-    if captured.stdout.truncated() {
-        return Err(HandlerError::new(
-            "too_large",
-            "local-api relay response exceeded the cap",
-        ));
-    }
-
-    let stdout = captured.stdout.rendered();
-    if captured.status.success() && !stdout.is_empty() {
-        return Ok(stdout);
-    }
-
-    let detail = captured.stderr.rendered_trimmed_lossy();
-    let rc = captured.status.code().unwrap_or(-1);
-    if detail.contains("a password is required")
-        || detail.contains("not allowed to execute")
-        || (rc == 1 && detail.to_ascii_lowercase().contains("sudo"))
-    {
-        let user = endpoint.run_as.as_deref().unwrap_or("<unknown>");
-        return Err(HandlerError::new(
-            "run_as_not_permitted",
-            format!(
-                "{:?} declares run_as={user:?}, but this agent may not become that user. The host owner can allow only this relay with a sudoers rule such as: sentinelx ALL=({user}) NOPASSWD: {} --local-api-relay * ({})",
-                endpoint.name,
-                executable.display(),
-                detail.chars().take(120).collect::<String>()
-            ),
-        ));
-    }
-    if rc == 3 {
-        return Err(HandlerError::new(
-            "endpoint_unreachable",
-            format!(
-                "cannot open {} as {}: {}",
-                endpoint.path,
-                endpoint.run_as.as_deref().unwrap_or("<unknown>"),
-                detail.chars().take(160).collect::<String>()
-            ),
-        ));
-    }
-
-    Err(HandlerError::new(
-        "bad_response",
-        format!(
-            "relay failed (rc={rc}): {}",
-            detail.chars().take(160).collect::<String>()
-        ),
-    ))
+    interpret_relay_output(endpoint, &executable, &captured)
 }
 
 async fn call_jsonrpc(
@@ -1119,13 +1166,15 @@ async fn ensure_compatible(policy: &Policy, endpoint: &Endpoint) -> Result<(), H
         ));
     };
 
-    let accepted = if let Some(exact) = accept.get("exact") {
-        found == exact
-    } else if let Some(allowed) = accept.get("allowed").and_then(Value::as_array) {
-        allowed.iter().any(|value| value == found)
-    } else {
-        false
-    };
+    let accepted = accept.get("exact").map_or_else(
+        || {
+            accept
+                .get("allowed")
+                .and_then(Value::as_array)
+                .is_some_and(|allowed| allowed.iter().any(|value| value == found))
+        },
+        |exact| found == exact,
+    );
 
     if accepted {
         Ok(())
@@ -1167,6 +1216,107 @@ async fn call_action(
     Ok(project(raw, &action.select))
 }
 
+fn list_endpoints(endpoints: &BTreeMap<String, Endpoint>) -> BTreeMap<String, Value> {
+    let listed = endpoints
+        .values()
+        .filter(|endpoint| endpoint.transport == "unix")
+        .map(|endpoint| {
+            json!({
+                "name": endpoint.name,
+                "protocol": endpoint.protocol,
+                "transport": endpoint.transport,
+                "action_count": endpoint.actions.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("operation".into(), Value::String("list".into())),
+        ("endpoints".into(), Value::Array(listed)),
+    ])
+}
+
+fn describe_endpoint(endpoint: &Endpoint) -> BTreeMap<String, Value> {
+    let actions = endpoint
+        .actions
+        .iter()
+        .map(|(name, action)| {
+            let mut value = Map::from_iter([
+                (
+                    "request".into(),
+                    action.request.clone().map_or(Value::Null, Value::String),
+                ),
+                (
+                    "method".into(),
+                    action.method.clone().map_or(Value::Null, Value::String),
+                ),
+                (
+                    "returns".into(),
+                    if action.select.is_empty() {
+                        Value::String("the endpoint's own shape".into())
+                    } else {
+                        Value::Array(action.select.iter().cloned().map(Value::String).collect())
+                    },
+                ),
+                (
+                    "description".into(),
+                    action
+                        .description
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                ),
+                (
+                    "params".into(),
+                    Value::Array(param_names(action).into_iter().map(Value::String).collect()),
+                ),
+            ]);
+            if let Some(schema) = action.params_schema.clone() {
+                value.insert("params_schema".into(), schema);
+            }
+            (name.clone(), Value::Object(value))
+        })
+        .collect::<Map<_, _>>();
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("operation".into(), Value::String("describe".into())),
+        ("endpoint".into(), Value::String(endpoint.name.clone())),
+        ("protocol".into(), Value::String(endpoint.protocol.clone())),
+        ("actions".into(), Value::Object(actions)),
+    ])
+}
+
+async fn call_endpoint(
+    policy: &Policy,
+    endpoint: &Endpoint,
+    payload: &Map<String, Value>,
+) -> HandlerResult {
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let params = match payload.get("params") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(params)) => params.clone(),
+        _ => {
+            return Err(HandlerError::new(
+                "invalid_payload",
+                "params must be an object",
+            ));
+        }
+    };
+    let result = call_action(policy, endpoint, action, &params).await?;
+    Ok(BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("operation".into(), Value::String("call".into())),
+        ("endpoint".into(), Value::String(endpoint.name.clone())),
+        ("action".into(), Value::String(action.into())),
+        ("result".into(), result),
+    ]))
+}
+
+/// # Errors
+/// Returns an error when the local API request is invalid, disallowed, times out, or fails.
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let endpoints = endpoints(policy)?;
     let operation = payload
@@ -1174,25 +1324,8 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-
     if operation == "list" {
-        let listed = endpoints
-            .values()
-            .filter(|endpoint| endpoint.transport == "unix")
-            .map(|endpoint| {
-                json!({
-                    "name": endpoint.name,
-                    "protocol": endpoint.protocol,
-                    "transport": endpoint.transport,
-                    "action_count": endpoint.actions.len(),
-                })
-            })
-            .collect::<Vec<_>>();
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("operation".into(), Value::String("list".into())),
-            ("endpoints".into(), Value::Array(listed)),
-        ]));
+        return Ok(list_endpoints(&endpoints));
     }
 
     let name = payload
@@ -1210,102 +1343,23 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         )
     })?;
 
-    if operation == "describe" {
-        let actions = endpoint
-            .actions
-            .iter()
-            .map(|(name, action)| {
-                let mut value = Map::from_iter([
-                    (
-                        "request".into(),
-                        action
-                            .request
-                            .clone()
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
-                    ),
-                    (
-                        "method".into(),
-                        action
-                            .method
-                            .clone()
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
-                    ),
-                    (
-                        "returns".into(),
-                        if action.select.is_empty() {
-                            Value::String("the endpoint's own shape".into())
-                        } else {
-                            Value::Array(action.select.iter().cloned().map(Value::String).collect())
-                        },
-                    ),
-                    (
-                        "description".into(),
-                        action
-                            .description
-                            .clone()
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
-                    ),
-                    (
-                        "params".into(),
-                        Value::Array(param_names(action).into_iter().map(Value::String).collect()),
-                    ),
-                ]);
-                if let Some(schema) = action.params_schema.clone() {
-                    value.insert("params_schema".into(), schema);
-                }
-                (name.clone(), Value::Object(value))
-            })
-            .collect::<Map<_, _>>();
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("operation".into(), Value::String("describe".into())),
-            ("endpoint".into(), Value::String(endpoint.name.clone())),
-            ("protocol".into(), Value::String(endpoint.protocol.clone())),
-            ("actions".into(), Value::Object(actions)),
-        ]));
+    match operation {
+        "describe" => Ok(describe_endpoint(endpoint)),
+        "call" => call_endpoint(policy, endpoint, payload).await,
+        _ => Err(HandlerError::new(
+            "invalid_payload",
+            format!("unknown operation {operation:?}; expected list, describe or call"),
+        )),
     }
-
-    if operation == "call" {
-        let action = payload
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        let params = match payload.get("params") {
-            None | Some(Value::Null) => Map::new(),
-            Some(Value::Object(params)) => params.clone(),
-            _ => {
-                return Err(HandlerError::new(
-                    "invalid_payload",
-                    "params must be an object",
-                ));
-            }
-        };
-        let result = call_action(policy, endpoint, action, &params).await?;
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("operation".into(), Value::String("call".into())),
-            ("endpoint".into(), Value::String(endpoint.name.clone())),
-            ("action".into(), Value::String(action.into())),
-            ("result".into(), result),
-        ]));
-    }
-
-    Err(HandlerError::new(
-        "invalid_payload",
-        format!("unknown operation {operation:?}; expected list, describe or call"),
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
 
     #[test]
-    fn unknown_local_api_keys_fail_at_config_boundary() {
+    fn unknown_local_api_keys_fail_at_config_boundary() -> TestResult {
         for text in [
             "transport: unix
 protocol: jsonrpc
@@ -1341,31 +1395,35 @@ actions:
   a: { method: a }
 ",
         ] {
-            let raw: yaml_serde::Value = yaml_serde::from_str(text).unwrap();
+            let raw: yaml_serde::Value = yaml_serde::from_str(text).test_value()?;
             assert!(
                 endpoint_from_raw("x", &raw).is_err(),
                 "unknown local_api key unexpectedly parsed: {text:?}"
             );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn half_written_compatibility_constraint_is_rejected() {
+    fn half_written_compatibility_constraint_is_rejected() -> TestResult {
         let raw: yaml_serde::Value = yaml_serde::from_str(
             "transport: unix\nprotocol: jsonrpc\npath: /tmp/x.sock\ncompatibility:\n  accept: { exact: 20 }\nactions:\n  a: { method: a }\n",
         )
-        .unwrap();
-        let error = endpoint_from_raw("x", &raw).unwrap_err();
+        .test_value()?;
+        let error = endpoint_from_raw("x", &raw).test_error()?;
         assert!(error.contains("compatibility.probe"));
+
+        Ok(())
     }
 
     #[test]
-    fn run_as_endpoint_remains_usable_and_relay_has_no_shell() {
+    fn run_as_endpoint_remains_usable_and_relay_has_no_shell() -> TestResult {
         let raw: yaml_serde::Value = yaml_serde::from_str(
             "transport: unix\nprotocol: jsonrpc\npath: /run/user/1002/x.sock\nrun_as: userx\nactions:\n  a: { method: a }\n",
         )
-        .unwrap();
-        let endpoint = endpoint_from_raw("ep", &raw).unwrap();
+        .test_value()?;
+        let endpoint = endpoint_from_raw("ep", &raw).test_value()?;
         let policy = Policy::default();
         let sudo = policy.tooling.command("sudo").display().to_string();
         let argv = relay_command(
@@ -1373,7 +1431,7 @@ actions:
             &endpoint,
             Path::new("/usr/local/bin/sentinelx-core"),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(
             &argv[..5],
             &[
@@ -1398,6 +1456,8 @@ actions:
             ..Policy::default()
         };
         assert!(has_usable_endpoints(&policy));
+
+        Ok(())
     }
 
     #[test]
@@ -1412,8 +1472,10 @@ actions:
     }
 
     #[test]
-    fn missing_template_param_is_explicit() {
-        let error = render("/containers/{id}/json", &Map::new()).unwrap_err();
+    fn missing_template_param_is_explicit() -> TestResult {
+        let error = render("/containers/{id}/json", &Map::new()).test_error()?;
         assert_eq!(error.code, "missing_param");
+
+        Ok(())
     }
 }

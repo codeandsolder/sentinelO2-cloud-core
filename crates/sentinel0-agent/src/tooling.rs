@@ -46,6 +46,8 @@ impl Tooling {
             .unwrap_or_else(|| PathBuf::from(name))
     }
 
+    /// # Errors
+    /// Returns an error when the configured tool search path cannot be represented safely.
     pub fn path_env(&self) -> Result<OsString, HandlerError> {
         env::join_paths(&self.search_path).map_err(|error| {
             HandlerError::new(
@@ -55,6 +57,8 @@ impl Tooling {
         })
     }
 
+    /// # Errors
+    /// Returns an error when the command environment cannot be configured safely.
     pub fn configure_tokio(
         &self,
         command: &mut tokio::process::Command,
@@ -63,6 +67,8 @@ impl Tooling {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error when the command environment cannot be configured safely.
     pub fn configure_std(&self, command: &mut std::process::Command) -> Result<(), HandlerError> {
         command.env("PATH", self.path_env()?);
         Ok(())
@@ -96,9 +102,9 @@ impl Tooling {
             .map(|name| {
                 (
                     name.to_owned(),
-                    self.resolve(name)
-                        .map(|path| Value::String(path.display().to_string()))
-                        .unwrap_or(Value::Null),
+                    self.resolve(name).map_or(Value::Null, |path| {
+                        Value::String(path.display().to_string())
+                    }),
                 )
             })
             .collect::<Map<_, _>>();

@@ -38,42 +38,66 @@ struct Args {
 }
 
 fn ws_base(hub: &str) -> String {
-    if let Some(rest) = hub.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = hub.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        hub.to_owned()
-    }
+    hub.strip_prefix("https://").map_or_else(
+        || {
+            hub.strip_prefix("http://")
+                .map_or_else(|| hub.to_owned(), |rest| format!("ws://{rest}"))
+        },
+        |rest| format!("wss://{rest}"),
+    )
 }
 
 fn http_base(hub: &str) -> String {
-    if let Some(rest) = hub.strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else if let Some(rest) = hub.strip_prefix("ws://") {
-        format!("http://{rest}")
-    } else {
-        hub.to_owned()
-    }
+    hub.strip_prefix("wss://").map_or_else(
+        || {
+            hub.strip_prefix("ws://")
+                .map_or_else(|| hub.to_owned(), |rest| format!("http://{rest}"))
+        },
+        |rest| format!("https://{rest}"),
+    )
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    if let Some(path) = args.local_api_relay.as_deref() {
-        std::process::exit(sentinel0_agent::local_api::run_local_api_relay(
-            path,
-            args.relay_timeout,
-        ));
-    }
-
-    let filter = tracing_subscriber::EnvFilter::try_new(&args.log_level)
+fn init_tracing(log_level: &str) {
+    let filter = tracing_subscriber::EnvFilter::try_new(log_level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .init();
+}
 
+fn spawn_shutdown_signal(cancel: CancellationToken) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let term = signal(SignalKind::terminate());
+            match term {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                }
+                Err(error) => {
+                    error!(%error, "failed to install SIGTERM handler; CTRL-C remains active");
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        error!(%error, "failed waiting for CTRL-C");
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                error!(%error, "failed waiting for CTRL-C");
+            }
+        }
+        cancel.cancel();
+    });
+}
+
+async fn run_agent(args: Args) -> Result<(), Box<dyn Error>> {
     let policy = Policy::from_file(&args.config)?;
     let dispatcher = CoreDispatcher::new(policy.clone(), args.config.clone(), AGENT_VERSION);
 
@@ -136,37 +160,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         heartbeat_timeout: Duration::from_secs(90),
     };
     let agent = Agent::new(config, dispatcher)?.with_credential_rotation(rotation);
-
     let cancel = CancellationToken::new();
-    let signal_cancel = cancel.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let term = signal(SignalKind::terminate());
-            match term {
-                Ok(mut term) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = term.recv() => {}
-                    }
-                }
-                Err(error) => {
-                    error!(%error, "failed to install SIGTERM handler; CTRL-C remains active");
-                    if let Err(error) = tokio::signal::ctrl_c().await {
-                        error!(%error, "failed waiting for CTRL-C");
-                    }
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            if let Err(error) = tokio::signal::ctrl_c().await {
-                error!(%error, "failed waiting for CTRL-C");
-            }
-        }
-        signal_cancel.cancel();
-    });
+    spawn_shutdown_signal(cancel.clone());
 
     info!(
         host_id = %identity.host_id,
@@ -177,4 +172,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     agent.run(cancel).await?;
     info!("SentinelX Rust compatibility agent stopped");
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    if let Some(path) = args.local_api_relay.as_deref() {
+        std::process::exit(sentinel0_agent::local_api::run_local_api_relay(
+            path,
+            args.relay_timeout,
+        ));
+    }
+    init_tracing(&args.log_level);
+    run_agent(args).await
 }

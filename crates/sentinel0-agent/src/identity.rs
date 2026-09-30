@@ -59,7 +59,7 @@ fn scalar_string(value: serde_json::Value) -> String {
     }
 }
 
-fn validate_token(token: String, path: &Path) -> Result<String, IdentityError> {
+fn validate_token(token: &str, path: &Path) -> Result<String, IdentityError> {
     let token = token.trim().to_owned();
     if token.is_empty() {
         return Err(IdentityError::EmptyToken { path: path.into() });
@@ -81,6 +81,8 @@ fn validate_token(token: String, path: &Path) -> Result<String, IdentityError> {
     Ok(token)
 }
 
+/// # Errors
+/// Returns an error when the identity file cannot be read, parsed, or validated.
 pub fn load_identity(path: &Path) -> Result<Identity, IdentityError> {
     if !path.exists() {
         return Err(IdentityError::Missing(path.into()));
@@ -110,7 +112,7 @@ pub fn load_identity(path: &Path) -> Result<Identity, IdentityError> {
         .map(scalar_string)?
         .trim()
         .to_owned();
-    let token = validate_token(token, path)?;
+    let token = validate_token(&token, path)?;
 
     Ok(Identity {
         host_id,
@@ -122,42 +124,49 @@ pub fn load_identity(path: &Path) -> Result<Identity, IdentityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
-    fn write(text: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempdir().unwrap();
+    fn write(text: &str) -> TestResult<(tempfile::TempDir, PathBuf)> {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("identity.json");
-        fs::write(&path, text).unwrap();
-        (dir, path)
+        fs::write(&path, text).test_value()?;
+        Ok((dir, path))
     }
 
     #[test]
-    fn valid_identity_trims_scalar_fields() {
+    fn valid_identity_trims_scalar_fields() -> TestResult {
         let (_dir, path) = write(
             r#"{"host_id":" host_1 ","token":" aaa.bbb.ccc \n","hub":" https://hub.example "}"#,
-        );
-        let identity = load_identity(&path).unwrap();
+        )?;
+        let identity = load_identity(&path).test_value()?;
         assert_eq!(identity.host_id, "host_1");
         assert_eq!(identity.hub, "https://hub.example");
         assert_eq!(format!("{:?}", identity.token), "[redacted]");
+
+        Ok(())
     }
 
     #[test]
-    fn malformed_tokens_fail_before_network_use() {
+    fn malformed_tokens_fail_before_network_use() -> TestResult {
         for token in ["", "one.two", "one..three", "one two.three.four", "ą.b.c"] {
             let (_dir, path) = write(&format!(
                 r#"{{"host_id":"h","token":"{token}","hub":"https://hub"}}"#
-            ));
+            ))?;
             assert!(load_identity(&path).is_err(), "{token:?}");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn missing_required_field_is_explicit() {
-        let (_dir, path) = write(r#"{"host_id":"h","token":"a.b.c"}"#);
+    fn missing_required_field_is_explicit() -> TestResult {
+        let (_dir, path) = write(r#"{"host_id":"h","token":"a.b.c"}"#)?;
         assert!(matches!(
             load_identity(&path),
             Err(IdentityError::MissingField("hub"))
         ));
+
+        Ok(())
     }
 }

@@ -41,6 +41,7 @@ const READ_ONLY_FILTERS: &[&str] = &[
     "date",
 ];
 
+#[must_use]
 pub fn split_top_level(command: &str) -> Vec<String> {
     let chars: Vec<char> = command.chars().collect();
     let mut out = Vec::new();
@@ -111,6 +112,7 @@ pub fn split_top_level(command: &str) -> Vec<String> {
     out
 }
 
+#[must_use]
 pub fn has_substitution(command: &str) -> Option<&'static str> {
     let chars: Vec<char> = command.chars().collect();
     let mut i = 0;
@@ -163,6 +165,7 @@ fn first_word(segment: &str) -> &str {
     segment.split_whitespace().next().unwrap_or("")
 }
 
+#[must_use]
 pub fn unauthorised_segment(policy: &Policy, command: &str) -> Option<String> {
     for (index, segment) in split_top_level(command).into_iter().enumerate() {
         if policy.is_command_allowed(&segment) {

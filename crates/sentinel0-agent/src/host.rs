@@ -54,7 +54,7 @@ pub fn mem_total_bytes() -> Option<u64> {
 }
 
 #[must_use]
-pub fn machine_type() -> Option<String> {
+pub fn machine_type() -> String {
     let osrelease = read_trimmed("/proc/sys/kernel/osrelease")
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -63,10 +63,10 @@ pub fn machine_type() -> Option<String> {
         .to_ascii_lowercase();
     if osrelease.contains("microsoft") || osrelease.contains("wsl") || version.contains("microsoft")
     {
-        return Some("wsl".into());
+        return "wsl".into();
     }
     if Path::new("/.dockerenv").exists() {
-        return Some("container".into());
+        return "container".into();
     }
     let cgroup = read_trimmed("/proc/1/cgroup")
         .unwrap_or_default()
@@ -75,7 +75,7 @@ pub fn machine_type() -> Option<String> {
         .iter()
         .any(|needle| cgroup.contains(needle))
     {
-        return Some("container".into());
+        return "container".into();
     }
 
     let dmi = [
@@ -104,16 +104,16 @@ pub fn machine_type() -> Option<String> {
     .iter()
     .any(|needle| dmi.contains(needle))
     {
-        return Some("vm".into());
+        return "vm".into();
     }
 
     let cpuinfo = read_trimmed("/proc/cpuinfo")
         .unwrap_or_default()
         .to_ascii_lowercase();
     if cpuinfo.contains("hypervisor") {
-        return Some("vm".into());
+        return "vm".into();
     }
-    Some("physical".into())
+    "physical".into()
 }
 
 #[must_use]
@@ -135,7 +135,7 @@ pub fn gather_host_info(
         // Optional on the wire. Avoid libc/unsafe just to report a cosmetic
         // handshake field; capabilities/state remain fully functional.
         disk_total_bytes: None,
-        machine_type: machine_type(),
+        machine_type: Some(machine_type()),
         distro: distro(),
         config_summary,
     }
@@ -166,8 +166,8 @@ mod tests {
     fn host_info_has_required_identity_fields() {
         let host = gather_host_info("fixture".into(), None);
         assert_eq!(host.id, "fixture");
-        assert!(!host.hostname.is_empty());
-        assert!(!host.os.is_empty());
+        assert_ne!(host.hostname, "");
+        assert_ne!(host.os, "");
     }
 
     #[test]

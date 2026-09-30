@@ -69,12 +69,12 @@ impl CapturedStream {
     }
 
     #[must_use]
-    pub fn total_bytes(&self) -> u64 {
+    pub const fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
 
     #[must_use]
-    pub fn truncated(&self) -> bool {
+    pub const fn truncated(&self) -> bool {
         self.total_bytes > self.limit as u64
     }
 
@@ -145,17 +145,18 @@ pub(crate) async fn wait_bounded_with_limits(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> io::Result<WaitOutcome> {
-    match timeout(
+    timeout(
         timeout_duration,
         capture_bounded(child, stdout_limit, stderr_limit),
     )
     .await
-    {
-        Ok(result) => result.map(WaitOutcome::Completed),
-        Err(_) => Ok(WaitOutcome::TimedOut),
-    }
+    .map_or(Ok(WaitOutcome::TimedOut), |result| {
+        result.map(WaitOutcome::Completed)
+    })
 }
 
+/// # Errors
+/// Returns an I/O error when waiting for the child or capturing its output fails.
 pub async fn wait_bounded(
     child: &mut Child,
     timeout_duration: Duration,
@@ -180,6 +181,8 @@ where
     }
 }
 
+/// # Errors
+/// Returns an I/O error when reading from the supplied stream fails.
 pub fn read_bounded_sync<R: Read>(mut reader: R, limit: usize) -> io::Result<CapturedStream> {
     let mut capture = CapturedStream::new(limit);
     let mut buffer = vec![0_u8; READ_CHUNK];
@@ -195,18 +198,21 @@ pub fn read_bounded_sync<R: Read>(mut reader: R, limit: usize) -> io::Result<Cap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, TestValue as _};
 
     #[test]
-    fn bounded_capture_keeps_head_and_tail_and_counts_every_byte() {
+    fn bounded_capture_keeps_head_and_tail_and_counts_every_byte() -> TestResult {
         let mut capture = CapturedStream::new(10);
         capture.push(b"01234");
         capture.push(b"56789");
         capture.push(b"abcdef");
         assert_eq!(capture.total_bytes(), 16);
         assert!(capture.truncated());
-        let rendered = String::from_utf8(capture.rendered()).unwrap();
+        let rendered = String::from_utf8(capture.rendered()).test_value()?;
         assert!(rendered.starts_with("01234"));
         assert!(rendered.ends_with("bcdef"));
         assert!(rendered.contains("6 bytes omitted"));
+
+        Ok(())
     }
 }

@@ -98,12 +98,12 @@ fn backup_file(path: &Path) -> Result<PathBuf, HandlerError> {
         };
         return Err(HandlerError::new(
             "backup_failed",
-            match cleanup {
-                Some(cleanup) => {
+            cleanup.map_or_else(
+                || format!("backup failed: {error}"),
+                |cleanup| {
                     format!("backup failed: {error}; partial backup cleanup also failed: {cleanup}")
-                }
-                None => format!("backup failed: {error}"),
-            },
+                },
+            ),
         ));
     }
     Ok(backup)
@@ -149,7 +149,8 @@ fn backup_dir(path: &Path) -> Result<PathBuf, HandlerError> {
         {
             error
                 .message
-                .push_str(&format!("; partial archive cleanup also failed: {cleanup}"));
+                .push_str("; partial archive cleanup also failed: ");
+            error.message.push_str(&cleanup.to_string());
         }
         return Err(error);
     }
@@ -326,19 +327,19 @@ fn staged_copy(src: &Path, dst: &Path, overwrite: bool) -> io::Result<Option<Str
     let copy_result = copy_entry(src, &staged);
     if let Err(error) = copy_result {
         let cleanup = cleanup_entry(&staged, "copy failed");
-        return Err(io::Error::other(match cleanup {
-            Some(cleanup) => format!("{error}; {cleanup}"),
-            None => error.to_string(),
-        }));
+        return Err(io::Error::other(cleanup.map_or_else(
+            || error.to_string(),
+            |cleanup| format!("{error}; {cleanup}"),
+        )));
     }
     match commit_staged(dst, &staged, overwrite) {
         Ok(warning) => Ok(warning),
         Err(error) => {
             let cleanup = cleanup_entry(&staged, "commit failed");
-            Err(io::Error::other(match cleanup {
-                Some(cleanup) => format!("{error}; {cleanup}"),
-                None => error.to_string(),
-            }))
+            Err(io::Error::other(cleanup.map_or_else(
+                || error.to_string(),
+                |cleanup| format!("{error}; {cleanup}"),
+            )))
         }
     }
 }
@@ -351,6 +352,105 @@ fn sync_move_parents(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn move_response(src: &Path, dst: &Path, warning: Option<String>) -> BTreeMap<String, Value> {
+    let mut result = BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("op".into(), Value::String("move".into())),
+        ("src".into(), Value::String(src.display().to_string())),
+        ("dst".into(), Value::String(dst.display().to_string())),
+    ]);
+    if let Some(warning) = warning {
+        result.insert("cleanup_warning".into(), Value::String(warning));
+    }
+    result
+}
+
+fn try_direct_move(src: &Path, dst: &Path, overwrite: bool) -> Result<bool, HandlerError> {
+    let rename_result = if overwrite {
+        fs::rename(src, dst)
+    } else {
+        rename_no_replace(src, dst)
+    };
+    match rename_result {
+        Ok(()) => {
+            sync_move_parents(src, dst).map_err(|error| {
+                HandlerError::new("move_failed", format!("move sync failed: {error}"))
+            })?;
+            Ok(true)
+        }
+        Err(error) => {
+            let destination_exists = overwrite
+                && checked_entry_exists(
+                    dst,
+                    "move_failed",
+                    "cannot inspect destination after rename failure",
+                )?;
+            if error.kind() != io::ErrorKind::CrossesDevices && !destination_exists {
+                return Err(HandlerError::new(
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        "permission_denied"
+                    } else {
+                        "move_failed"
+                    },
+                    format!("move failed: {error}"),
+                ));
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn try_move_over_existing(
+    src: &Path,
+    dst: &Path,
+) -> Result<Option<BTreeMap<String, Value>>, HandlerError> {
+    let old = sibling_temp(dst, "old");
+    rename_no_replace(dst, &old).map_err(|error| {
+        HandlerError::new(
+            "move_failed",
+            format!("could not stage old destination: {error}"),
+        )
+    })?;
+    match fs::rename(src, dst) {
+        Ok(()) => {
+            sync_move_parents(src, dst).map_err(|error| {
+                HandlerError::new("move_failed", format!("move sync failed: {error}"))
+            })?;
+            let warning = cleanup_entry(&old, "move committed but old destination cleanup failed");
+            Ok(Some(move_response(src, dst, warning)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            if let Err(rollback) = rename_no_replace(&old, dst) {
+                return Err(HandlerError::new(
+                    "move_failed",
+                    format!(
+                        "cross-filesystem move detected after staging destination, and rollback failed: {rollback}; old destination remains at {}",
+                        old.display()
+                    ),
+                ));
+            }
+            Ok(None)
+        }
+        Err(error) => {
+            let rollback = rename_no_replace(&old, dst);
+            Err(HandlerError::new(
+                "move_failed",
+                rollback.map_or_else(
+                    |rollback| {
+                        format!(
+                            "move failed: {error}; rollback failed: {rollback}; old destination remains at {}",
+                            old.display()
+                        )
+                    },
+                    |()| format!("move failed: {error}"),
+                ),
+            ))
+        }
+    }
+}
+
+/// # Errors
+/// Returns an error when the move is invalid, disallowed, or cannot be completed safely.
 pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let src_raw = require_str(payload, "src")?;
     let dst_raw = require_str(payload, "dst")?;
@@ -368,14 +468,9 @@ pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
         ));
     }
     if src == dst {
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("op".into(), Value::String("move".into())),
-            ("src".into(), Value::String(src.display().to_string())),
-            ("dst".into(), Value::String(dst.display().to_string())),
-        ]));
+        return Ok(move_response(&src, &dst, None));
     }
-    let mut dst_exists = checked_entry_exists(&dst, "move_failed", "cannot inspect destination")?;
+    let dst_exists = checked_entry_exists(&dst, "move_failed", "cannot inspect destination")?;
     if dst_exists && !overwrite {
         return Err(HandlerError::new(
             "exists",
@@ -383,104 +478,15 @@ pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
         ));
     }
 
-    // Same-filesystem rename is the ideal move: atomic and no data copy.
-    // With overwrite=false, RENAME_NOREPLACE closes the exists->rename race.
-    let rename_result = if overwrite {
-        fs::rename(&src, &dst)
-    } else {
-        rename_no_replace(&src, &dst)
-    };
-    match rename_result {
-        Ok(()) => {
-            sync_move_parents(&src, &dst).map_err(|error| {
-                HandlerError::new("move_failed", format!("move sync failed: {error}"))
-            })?;
-            return Ok(BTreeMap::from([
-                ("ok".into(), Value::Bool(true)),
-                ("op".into(), Value::String("move".into())),
-                ("src".into(), Value::String(src.display().to_string())),
-                ("dst".into(), Value::String(dst.display().to_string())),
-            ]));
-        }
-        Err(error)
-            if error.kind() != io::ErrorKind::CrossesDevices
-                && !(overwrite
-                    && checked_entry_exists(
-                        &dst,
-                        "move_failed",
-                        "cannot inspect destination after rename failure",
-                    )?) =>
-        {
-            return Err(HandlerError::new(
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    "permission_denied"
-                } else {
-                    "move_failed"
-                },
-                format!("move failed: {error}"),
-            ));
-        }
-        Err(_) => {}
+    if try_direct_move(&src, &dst, overwrite)? {
+        return Ok(move_response(&src, &dst, None));
     }
 
-    // If overwrite involves incompatible/non-empty directory types, move the
-    // old destination aside first, then either commit or roll back.
-    dst_exists = checked_entry_exists(&dst, "move_failed", "cannot inspect destination")?;
-    if dst_exists {
-        let old = sibling_temp(&dst, "old");
-        rename_no_replace(&dst, &old).map_err(|error| {
-            HandlerError::new(
-                "move_failed",
-                format!("could not stage old destination: {error}"),
-            )
-        })?;
-        match fs::rename(&src, &dst) {
-            Ok(()) => {
-                sync_move_parents(&src, &dst).map_err(|error| {
-                    HandlerError::new("move_failed", format!("move sync failed: {error}"))
-                })?;
-                let mut result = BTreeMap::from([
-                    ("ok".into(), Value::Bool(true)),
-                    ("op".into(), Value::String("move".into())),
-                    ("src".into(), Value::String(src.display().to_string())),
-                    ("dst".into(), Value::String(dst.display().to_string())),
-                ]);
-                if let Some(warning) =
-                    cleanup_entry(&old, "move committed but old destination cleanup failed")
-                {
-                    result.insert("cleanup_warning".into(), Value::String(warning));
-                }
-                return Ok(result);
-            }
-            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-                if let Err(rollback) = rename_no_replace(&old, &dst) {
-                    return Err(HandlerError::new(
-                        "move_failed",
-                        format!(
-                            "cross-filesystem move detected after staging destination, and rollback failed: {rollback}; old destination remains at {}",
-                            old.display()
-                        ),
-                    ));
-                }
-            }
-            Err(error) => {
-                let rollback = rename_no_replace(&old, &dst);
-                return Err(HandlerError::new(
-                    "move_failed",
-                    match rollback {
-                        Ok(()) => format!("move failed: {error}"),
-                        Err(rollback) => format!(
-                            "move failed: {error}; rollback failed: {rollback}; old destination remains at {}",
-                            old.display()
-                        ),
-                    },
-                ));
-            }
-        }
+    let dst_exists = checked_entry_exists(&dst, "move_failed", "cannot inspect destination")?;
+    if dst_exists && let Some(result) = try_move_over_existing(&src, &dst)? {
+        return Ok(result);
     }
 
-    // Cross-filesystem move: fully copy and fsync a sibling temp at the
-    // destination, commit it, only then remove the source.
     let warning = staged_copy(&src, &dst, overwrite).map_err(|error| {
         HandlerError::new(
             "move_failed",
@@ -500,19 +506,11 @@ pub fn move_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
     }
     sync_move_parents(&src, &dst)
         .map_err(|error| HandlerError::new("move_failed", format!("move sync failed: {error}")))?;
-
-    let mut result = BTreeMap::from([
-        ("ok".into(), Value::Bool(true)),
-        ("op".into(), Value::String("move".into())),
-        ("src".into(), Value::String(src.display().to_string())),
-        ("dst".into(), Value::String(dst.display().to_string())),
-    ]);
-    if let Some(warning) = warning {
-        result.insert("cleanup_warning".into(), Value::String(warning));
-    }
-    Ok(result)
+    Ok(move_response(&src, &dst, warning))
 }
 
+/// # Errors
+/// Returns an error when the copy is invalid, disallowed, or cannot be completed safely.
 pub fn copy_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let src_raw = require_str(payload, "src")?;
     let dst_raw = require_str(payload, "dst")?;
@@ -575,6 +573,8 @@ pub fn copy_path(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult
     Ok(result)
 }
 
+/// # Errors
+/// Returns an error when deletion is invalid, disallowed, or cannot be completed safely.
 pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let target = resolve_leaf_rw(policy, raw, "path")?;
@@ -618,10 +618,9 @@ pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ),
         (
             "backup".into(),
-            backup
-                .as_ref()
-                .map(|path| Value::String(path.display().to_string()))
-                .unwrap_or(Value::Null),
+            backup.as_ref().map_or(Value::Null, |path| {
+                Value::String(path.display().to_string())
+            }),
         ),
     ]);
 
@@ -639,6 +638,8 @@ pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     Ok(result)
 }
 
+/// # Errors
+/// Returns an error when the mode change is invalid, disallowed, or fails.
 pub fn chmod(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let mode_raw = require_str(payload, "mode")?;
@@ -665,6 +666,8 @@ pub fn chmod(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the ownership change is invalid, disallowed, or fails.
 pub fn chown(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     use nix::unistd::{Gid, Group, Uid, User};
 
@@ -735,17 +738,13 @@ pub fn chown(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ("ok".into(), Value::Bool(true)),
         ("op".into(), Value::String("chown".into())),
         ("path".into(), Value::String(target.display().to_string())),
-        (
-            "owner".into(),
-            owner.map(Value::from).unwrap_or(Value::Null),
-        ),
-        (
-            "group".into(),
-            group.map(Value::from).unwrap_or(Value::Null),
-        ),
+        ("owner".into(), owner.map_or(Value::Null, Value::from)),
+        ("group".into(), group.map_or(Value::Null, Value::from)),
     ]))
 }
 
+/// # Errors
+/// Returns an error when the requested filesystem mutation is invalid, disallowed, or fails.
 pub fn handle(
     policy: &Policy,
     op: sentinel0_proto::Op,
@@ -768,6 +767,7 @@ pub fn handle(
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -781,17 +781,17 @@ mod tests {
     }
 
     #[test]
-    fn delete_requires_explicit_recursive_and_creates_backup() {
-        let dir = tempdir().unwrap();
+    fn delete_requires_explicit_recursive_and_creates_backup() -> TestResult {
+        let dir = tempdir().test_value()?;
         let victim = dir.path().join("victim");
-        fs::create_dir_all(&victim).unwrap();
-        fs::write(victim.join("x"), "x").unwrap();
+        fs::create_dir_all(&victim).test_value()?;
+        fs::write(victim.join("x"), "x").test_value()?;
 
         let err = delete(
             &policy(dir.path()),
             &Map::from_iter([("path".into(), Value::String(victim.display().to_string()))]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(err.code, "is_directory");
 
         let result = delete(
@@ -801,9 +801,11 @@ mod tests {
                 ("recursive".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert!(!victim.exists());
-        assert!(Path::new(result["backup"].as_str().unwrap()).exists());
+        assert!(Path::new(result["backup"].as_str().test_value()?).exists());
+
+        Ok(())
     }
 
     #[test]
@@ -832,61 +834,67 @@ mod tests {
     }
 
     #[test]
-    fn generated_backups_are_recognized_as_ours() {
-        let dir = tempdir().unwrap();
+    fn generated_backups_are_recognized_as_ours() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("important.txt");
-        fs::write(&file, "precious").unwrap();
-        let backup = backup_file(&file).unwrap();
+        fs::write(&file, "precious").test_value()?;
+        let backup = backup_file(&file).test_value()?;
         assert!(is_own_backup(&backup));
+
+        Ok(())
     }
 
     #[test]
-    fn deleting_our_backup_is_terminal() {
-        let dir = tempdir().unwrap();
+    fn deleting_our_backup_is_terminal() -> TestResult {
+        let dir = tempdir().test_value()?;
         let backup = dir.path().join("model.gguf.bak.20260924-142530.123456");
-        fs::write(&backup, "backup bytes").unwrap();
+        fs::write(&backup, "backup bytes").test_value()?;
 
         let result = delete(
             &policy(dir.path()),
             &Map::from_iter([("path".into(), Value::String(backup.display().to_string()))]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert!(!backup.exists());
         assert!(result["backup"].is_null());
         assert_eq!(result["terminal"], Value::Bool(true));
         assert_eq!(
             fs::read_dir(dir.path())
-                .unwrap()
+                .test_value()?
                 .filter_map(Result::ok)
                 .count(),
             0
         );
+
+        Ok(())
     }
 
     #[test]
-    fn deleting_user_bak_file_still_creates_backup() {
-        let dir = tempdir().unwrap();
+    fn deleting_user_bak_file_still_creates_backup() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("config.bak");
-        fs::write(&file, "user data").unwrap();
+        fs::write(&file, "user data").test_value()?;
 
         let result = delete(
             &policy(dir.path()),
             &Map::from_iter([("path".into(), Value::String(file.display().to_string()))]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert!(!file.exists());
-        let backup = Path::new(result["backup"].as_str().unwrap());
+        let backup = Path::new(result["backup"].as_str().test_value()?);
         assert!(backup.exists());
         assert!(!result.contains_key("terminal"));
+
+        Ok(())
     }
 
     #[test]
-    fn both_move_endpoints_require_rw() {
-        let dir = tempdir().unwrap();
+    fn both_move_endpoints_require_rw() -> TestResult {
+        let dir = tempdir().test_value()?;
         let source = dir.path().join("a");
-        fs::write(&source, "x").unwrap();
+        fs::write(&source, "x").test_value()?;
         let err = move_path(
             &policy(dir.path()),
             &Map::from_iter([
@@ -894,46 +902,50 @@ mod tests {
                 ("dst".into(), Value::String("/tmp/outside".into())),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(err.code, "path_not_allowed");
+
+        Ok(())
     }
 
     #[test]
-    fn directory_backup_preserves_nested_symlinks_without_reading_targets() {
+    fn directory_backup_preserves_nested_symlinks_without_reading_targets() -> TestResult {
         use flate2::read::GzDecoder;
         use std::os::unix::fs::symlink;
 
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+        let root = tempdir().test_value()?;
+        let outside = tempdir().test_value()?;
         let victim = root.path().join("victim");
-        fs::create_dir(&victim).unwrap();
+        fs::create_dir(&victim).test_value()?;
         let secret = outside.path().join("secret.txt");
-        fs::write(&secret, "outside secret").unwrap();
-        symlink(&secret, victim.join("link")).unwrap();
+        fs::write(&secret, "outside secret").test_value()?;
+        symlink(&secret, victim.join("link")).test_value()?;
 
-        let archive_path = backup_dir(&victim).unwrap();
-        let decoder = GzDecoder::new(fs::File::open(archive_path).unwrap());
+        let archive_path = backup_dir(&victim).test_value()?;
+        let decoder = GzDecoder::new(fs::File::open(archive_path).test_value()?);
         let mut archive = tar::Archive::new(decoder);
         let mut saw_link = false;
-        for entry in archive.entries().unwrap() {
-            let entry = entry.unwrap();
-            if entry.path().unwrap().ends_with("link") {
+        for entry in archive.entries().test_value()? {
+            let entry = entry.test_value()?;
+            if entry.path().test_value()?.ends_with("link") {
                 assert!(entry.header().entry_type().is_symlink());
                 saw_link = true;
             }
         }
         assert!(saw_link);
+
+        Ok(())
     }
 
     #[test]
-    fn copy_preserves_top_level_symlink_without_reading_its_target() {
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+    fn copy_preserves_top_level_symlink_without_reading_its_target() -> TestResult {
+        let root = tempdir().test_value()?;
+        let outside = tempdir().test_value()?;
         let secret = outside.path().join("secret");
-        fs::write(&secret, "do not read me").unwrap();
+        fs::write(&secret, "do not read me").test_value()?;
         let source = root.path().join("source-link");
         let destination = root.path().join("copied-link");
-        symlink(&secret, &source).unwrap();
+        symlink(&secret, &source).test_value()?;
 
         let result = copy_path(
             &policy(root.path()),
@@ -945,22 +957,24 @@ mod tests {
                 ),
             ]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(result["kind"], "symlink");
-        assert_eq!(fs::read_link(&destination).unwrap(), secret);
-        assert_eq!(fs::read_to_string(&secret).unwrap(), "do not read me");
+        assert_eq!(fs::read_link(&destination).test_value()?, secret);
+        assert_eq!(fs::read_to_string(&secret).test_value()?, "do not read me");
+
+        Ok(())
     }
 
     #[test]
-    fn failed_staged_copy_does_not_destroy_existing_destination() {
+    fn failed_staged_copy_does_not_destroy_existing_destination() -> TestResult {
         use std::os::unix::net::UnixListener;
 
-        let root = tempdir().unwrap();
+        let root = tempdir().test_value()?;
         let source = root.path().join("socket");
-        let _listener = UnixListener::bind(&source).unwrap();
+        let _listener = UnixListener::bind(&source).test_value()?;
         let destination = root.path().join("destination");
-        fs::write(&destination, "keep me").unwrap();
+        fs::write(&destination, "keep me").test_value()?;
 
         let error = copy_path(
             &policy(root.path()),
@@ -973,44 +987,48 @@ mod tests {
                 ("overwrite".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
 
         assert_eq!(error.code, "copy_failed");
-        assert_eq!(fs::read_to_string(destination).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(destination).test_value()?, "keep me");
+
+        Ok(())
     }
 
     #[test]
-    fn deleting_symlink_backs_up_link_not_target() {
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+    fn deleting_symlink_backs_up_link_not_target() -> TestResult {
+        let root = tempdir().test_value()?;
+        let outside = tempdir().test_value()?;
         let target = outside.path().join("target");
-        fs::write(&target, "still here").unwrap();
+        fs::write(&target, "still here").test_value()?;
         let link = root.path().join("link");
-        symlink(&target, &link).unwrap();
+        symlink(&target, &link).test_value()?;
 
         let result = delete(
             &policy(root.path()),
             &Map::from_iter([("path".into(), Value::String(link.display().to_string()))]),
         )
-        .unwrap();
+        .test_value()?;
 
-        assert!(!entry_exists(&link).unwrap());
-        assert_eq!(fs::read_to_string(&target).unwrap(), "still here");
-        let backup = PathBuf::from(result["backup"].as_str().unwrap());
+        assert!(!entry_exists(&link).test_value()?);
+        assert_eq!(fs::read_to_string(&target).test_value()?, "still here");
+        let backup = PathBuf::from(result["backup"].as_str().test_value()?);
         assert!(
             fs::symlink_metadata(&backup)
-                .unwrap()
+                .test_value()?
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(fs::read_link(backup).unwrap(), target);
+        assert_eq!(fs::read_link(backup).test_value()?, target);
+
+        Ok(())
     }
 
     #[test]
-    fn copy_to_same_entry_is_rejected_without_touching_source() {
-        let root = tempdir().unwrap();
+    fn copy_to_same_entry_is_rejected_without_touching_source() -> TestResult {
+        let root = tempdir().test_value()?;
         let source = root.path().join("same");
-        fs::write(&source, "keep me").unwrap();
+        fs::write(&source, "keep me").test_value()?;
 
         let error = copy_path(
             &policy(root.path()),
@@ -1020,21 +1038,23 @@ mod tests {
                 ("overwrite".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
 
         assert_eq!(error.code, "invalid_payload");
-        assert_eq!(fs::read_to_string(source).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(source).test_value()?, "keep me");
+
+        Ok(())
     }
     #[test]
-    fn directory_copy_preserves_nested_symlink_without_reading_target() {
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+    fn directory_copy_preserves_nested_symlink_without_reading_target() -> TestResult {
+        let root = tempdir().test_value()?;
+        let outside = tempdir().test_value()?;
         let source = root.path().join("source");
         let destination = root.path().join("destination");
-        fs::create_dir(&source).unwrap();
+        fs::create_dir(&source).test_value()?;
         let secret = outside.path().join("secret");
-        fs::write(&secret, "outside").unwrap();
-        symlink(&secret, source.join("nested-link")).unwrap();
+        fs::write(&secret, "outside").test_value()?;
+        symlink(&secret, source.join("nested-link")).test_value()?;
 
         let result = copy_path(
             &policy(root.path()),
@@ -1046,16 +1066,17 @@ mod tests {
                 ),
             ]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(result["kind"], "dir");
         let copied_link = destination.join("nested-link");
         assert!(
             fs::symlink_metadata(&copied_link)
-                .unwrap()
+                .test_value()?
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(fs::read_link(copied_link).unwrap(), secret);
+        assert_eq!(fs::read_link(copied_link).test_value()?, secret);
+        Ok(())
     }
 }

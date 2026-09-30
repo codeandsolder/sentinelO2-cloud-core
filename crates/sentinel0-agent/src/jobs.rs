@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use num_traits::ToPrimitive;
 use sentinel0_proto::Message;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -32,21 +33,13 @@ pub fn build_completed_event_data(
         _ => (false, None, None),
     };
 
-    let duration_s = ((finished_at - started_at).num_milliseconds() as f64 / 10.0).round() / 100.0;
+    let elapsed_millis = (finished_at - started_at)
+        .num_milliseconds()
+        .to_f64()
+        .unwrap_or(f64::MAX);
+    let duration_seconds = (elapsed_millis / 10.0).round() / 100.0;
 
-    let (status, exit_code, output, error_message) = if !ok {
-        (
-            "failed",
-            None,
-            String::new(),
-            Some(
-                error
-                    .map(|error| error.message.clone())
-                    .filter(|message| !message.is_empty())
-                    .unwrap_or_else(|| "operation failed".into()),
-            ),
-        )
-    } else {
+    let (status, exit_code, output, error_message) = if ok {
         let timed_out = result
             .and_then(|result| result.get("timed_out"))
             .and_then(Value::as_bool)
@@ -67,6 +60,18 @@ pub fn build_completed_event_data(
             .unwrap_or("")
             .to_owned();
         (status, returncode, output, None)
+    } else {
+        (
+            "failed",
+            None,
+            String::new(),
+            Some(
+                error
+                    .map(|error| error.message.clone())
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| "operation failed".into()),
+            ),
+        )
     };
 
     let (output, output_truncated) = truncate_output(&output);
@@ -78,7 +83,7 @@ pub fn build_completed_event_data(
         ("status".into(), Value::String(status.into())),
         (
             "exit_code".into(),
-            exit_code.map(Value::from).unwrap_or(Value::Null),
+            exit_code.map_or(Value::Null, Value::from),
         ),
         (
             "started_at".into(),
@@ -88,12 +93,12 @@ pub fn build_completed_event_data(
             "finished_at".into(),
             Value::String(finished_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false)),
         ),
-        ("duration_s".into(), Value::from(duration_s)),
+        ("duration_s".into(), Value::from(duration_seconds)),
         ("output".into(), Value::String(output)),
         ("output_truncated".into(), Value::Bool(output_truncated)),
         (
             "error".into(),
-            error_message.map(Value::String).unwrap_or(Value::Null),
+            error_message.map_or(Value::Null, Value::String),
         ),
     ])
 }
@@ -101,15 +106,21 @@ pub fn build_completed_event_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, TestValue as _};
     use chrono::TimeZone;
     use sentinel0_proto::ResponseError;
 
-    fn times() -> (DateTime<Utc>, DateTime<Utc>) {
-        (
-            Utc.with_ymd_and_hms(2026, 9, 21, 21, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 9, 21, 21, 0, 1).unwrap()
-                + chrono::Duration::milliseconds(234),
-        )
+    fn times() -> TestResult<(DateTime<Utc>, DateTime<Utc>)> {
+        let start = Utc
+            .with_ymd_and_hms(2026, 9, 21, 21, 0, 0)
+            .single()
+            .test_value()?;
+        let finish = Utc
+            .with_ymd_and_hms(2026, 9, 21, 21, 0, 1)
+            .single()
+            .test_value()?
+            + chrono::Duration::milliseconds(234);
+        Ok((start, finish))
     }
 
     fn response(ok: bool, result: Option<BTreeMap<String, Value>>) -> Message {
@@ -122,8 +133,8 @@ mod tests {
     }
 
     #[test]
-    fn returncode_zero_maps_to_succeeded() {
-        let (start, finish) = times();
+    fn returncode_zero_maps_to_succeeded() -> TestResult {
+        let (start, finish) = times()?;
         let data = build_completed_event_data(
             "job",
             "exec",
@@ -142,11 +153,13 @@ mod tests {
         assert_eq!(data["exit_code"], 0);
         assert_eq!(data["output"], "ok");
         assert_eq!(data["duration_s"], 1.23);
+
+        Ok(())
     }
 
     #[test]
-    fn nonzero_and_missing_returncode_map_to_failed() {
-        let (start, finish) = times();
+    fn nonzero_and_missing_returncode_map_to_failed() -> TestResult {
+        let (start, finish) = times()?;
         for result in [
             BTreeMap::from([("returncode".into(), Value::from(7))]),
             BTreeMap::new(),
@@ -161,11 +174,13 @@ mod tests {
             );
             assert_eq!(data["status"], "failed");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn timed_out_overrides_returncode() {
-        let (start, finish) = times();
+    fn timed_out_overrides_returncode() -> TestResult {
+        let (start, finish) = times()?;
         let data = build_completed_event_data(
             "job",
             "exec",
@@ -181,11 +196,13 @@ mod tests {
             finish,
         );
         assert_eq!(data["status"], "timeout");
+
+        Ok(())
     }
 
     #[test]
-    fn handler_error_maps_to_failed_with_message() {
-        let (start, finish) = times();
+    fn handler_error_maps_to_failed_with_message() -> TestResult {
+        let (start, finish) = times()?;
         let response = Message::Response {
             id: "req".into(),
             ok: false,
@@ -200,11 +217,13 @@ mod tests {
         assert_eq!(data["status"], "failed");
         assert_eq!(data["exit_code"], Value::Null);
         assert_eq!(data["error"], "fixture failed");
+
+        Ok(())
     }
 
     #[test]
-    fn oversized_output_is_byte_bounded_and_flagged() {
-        let (start, finish) = times();
+    fn oversized_output_is_byte_bounded_and_flagged() -> TestResult {
+        let (start, finish) = times()?;
         let output = "x".repeat(MAX_EVENT_OUTPUT_BYTES + 100);
         let data = build_completed_event_data(
             "job",
@@ -221,9 +240,11 @@ mod tests {
             finish,
         );
         assert_eq!(
-            data["output"].as_str().unwrap().len(),
+            data["output"].as_str().test_value()?.len(),
             MAX_EVENT_OUTPUT_BYTES
         );
         assert_eq!(data["output_truncated"], true);
+
+        Ok(())
     }
 }

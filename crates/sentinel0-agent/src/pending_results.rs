@@ -29,6 +29,7 @@ fn store_lock(dir: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
+#[must_use]
 pub fn pending_dir(upload_base: &Path) -> PathBuf {
     upload_base
         .parent()
@@ -66,10 +67,7 @@ fn safe_name(job_id: &str) -> String {
     }
 
     let digest = Sha256::digest(job_id.as_bytes());
-    let suffix = digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let suffix = crate::hex_lower(&digest[..16]);
     format!("~{prefix}-{suffix}")
 }
 
@@ -173,7 +171,7 @@ fn record_at_result_with_limit(
                 }
                 break candidate;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     };
@@ -348,13 +346,14 @@ fn drain_at(upload_base: &Path, now: f64) -> std::io::Result<Vec<(PathBuf, Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
-    fn base() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempdir().unwrap();
+    fn base() -> TestResult<(tempfile::TempDir, PathBuf)> {
+        let dir = tempdir().test_value()?;
         let upload = dir.path().join("uploads");
-        fs::create_dir(&upload).unwrap();
-        (dir, upload)
+        fs::create_dir(&upload).test_value()?;
+        Ok((dir, upload))
     }
 
     fn event(job: &str) -> Value {
@@ -362,62 +361,70 @@ mod tests {
     }
 
     #[test]
-    fn recorded_result_is_returned_and_clear_removes_it() {
-        let (_tmp, upload) = base();
-        let path = record(&upload, "job_abc", &event("job_abc")).unwrap();
+    fn recorded_result_is_returned_and_clear_removes_it() -> TestResult {
+        let (_tmp, upload) = base()?;
+        let path = record(&upload, "job_abc", &event("job_abc")).test_value()?;
         let waiting = drain(&upload);
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].1, event("job_abc"));
         clear(Some(&path));
-        assert!(drain(&upload).is_empty());
+        assert_eq!(drain(&upload), []);
+
+        Ok(())
     }
 
     #[test]
-    fn pending_store_is_sibling_of_user_uploads() {
-        let (_tmp, upload) = base();
-        record(&upload, "job_abc", &event("job_abc")).unwrap();
-        assert!(fs::read_dir(&upload).unwrap().next().is_none());
+    fn pending_store_is_sibling_of_user_uploads() -> TestResult {
+        let (_tmp, upload) = base()?;
+        record(&upload, "job_abc", &event("job_abc")).test_value()?;
+        assert!(fs::read_dir(&upload).test_value()?.next().is_none());
         assert!(pending_dir(&upload).is_dir());
+
+        Ok(())
     }
 
     #[test]
-    fn expired_and_corrupt_entries_are_removed() {
-        let (_tmp, upload) = base();
+    fn expired_and_corrupt_entries_are_removed() -> TestResult {
+        let (_tmp, upload) = base()?;
         let expired = record_at_result(
             &upload,
             "job_old",
             &event("job_old"),
             unix_seconds_now() - PENDING_TTL.as_secs_f64() - 10.0,
         )
-        .unwrap();
+        .test_value()?;
 
         let bad = pending_dir(&upload).join("job_bad.json");
-        fs::write(&bad, "{ not json").unwrap();
+        fs::write(&bad, "{ not json").test_value()?;
 
-        assert!(drain(&upload).is_empty());
+        assert_eq!(drain(&upload), []);
         assert!(!expired.exists());
         assert!(!bad.exists());
+
+        Ok(())
     }
 
     #[test]
-    fn job_id_cannot_escape_pending_directory() {
-        let (_tmp, upload) = base();
-        record(&upload, "../../etc/passwd", &event("job")).unwrap();
-        let files = json_files(&pending_dir(&upload)).unwrap();
+    fn job_id_cannot_escape_pending_directory() -> TestResult {
+        let (_tmp, upload) = base()?;
+        record(&upload, "../../etc/passwd", &event("job")).test_value()?;
+        let files = json_files(&pending_dir(&upload)).test_value()?;
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].parent(), Some(pending_dir(&upload).as_path()));
         assert!(
             !files[0]
                 .file_name()
-                .unwrap()
+                .test_value()?
                 .to_string_lossy()
                 .contains("..")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn backlog_is_capped_and_newest_name_survives() {
-        let (_tmp, upload) = base();
+    fn backlog_is_capped_and_newest_name_survives() -> TestResult {
+        let (_tmp, upload) = base()?;
         let max = 5;
         for i in 0..(max + 5) {
             record_at_result_with_limit(
@@ -428,25 +435,29 @@ mod tests {
                 max,
                 false,
             )
-            .unwrap_or_else(|error| panic!("record {i} failed: {error}"));
+            .test_value()?;
         }
-        let files = json_files(&pending_dir(&upload)).unwrap();
+        let files = json_files(&pending_dir(&upload)).test_value()?;
         assert!(files.len() <= max);
-        assert!(
-            files
-                .iter()
-                .any(|path| path.file_stem().unwrap() == "job_0009")
-        );
+        let newest_survives = files
+            .iter()
+            .filter_map(|path| path.file_stem())
+            .any(|stem| stem == "job_0009");
+        assert!(newest_survives);
+
+        Ok(())
     }
 
     #[test]
-    fn recording_same_job_twice_replaces_instead_of_duplicates() {
-        let (_tmp, upload) = base();
-        record(&upload, "job_abc", &event("first")).unwrap();
-        record(&upload, "job_abc", &event("second")).unwrap();
+    fn recording_same_job_twice_replaces_instead_of_duplicates() -> TestResult {
+        let (_tmp, upload) = base()?;
+        record(&upload, "job_abc", &event("first")).test_value()?;
+        record(&upload, "job_abc", &event("second")).test_value()?;
         let waiting = drain(&upload);
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].1["data"]["job_id"], "second");
+
+        Ok(())
     }
 
     #[test]
@@ -463,8 +474,8 @@ mod tests {
     }
 
     #[test]
-    fn backlog_evicts_oldest_file_not_lexicographically_first_job_id() {
-        let (_tmp, upload) = base();
+    fn backlog_evicts_oldest_file_not_lexicographically_first_job_id() -> TestResult {
+        let (_tmp, upload) = base()?;
         let max = 5;
         record_at_result_with_limit(
             &upload,
@@ -474,7 +485,7 @@ mod tests {
             max,
             false,
         )
-        .unwrap();
+        .test_value()?;
         std::thread::sleep(Duration::from_millis(20));
 
         for i in 0..max {
@@ -486,11 +497,11 @@ mod tests {
                 max,
                 false,
             )
-            .unwrap_or_else(|error| panic!("record {i} failed: {error}"));
+            .test_value()?;
         }
 
         let names: Vec<_> = json_files(&pending_dir(&upload))
-            .unwrap()
+            .test_value()?
             .into_iter()
             .filter_map(|path| {
                 path.file_stem()
@@ -500,15 +511,17 @@ mod tests {
         assert_eq!(names.len(), max);
         assert!(!names.iter().any(|name| name == "zzz_oldest"));
         assert!(names.iter().any(|name| name == "aaa_new_0000"));
+
+        Ok(())
     }
 
     #[test]
-    fn replacing_existing_job_at_capacity_does_not_evict_another_job() {
-        let (_tmp, upload) = base();
+    fn replacing_existing_job_at_capacity_does_not_evict_another_job() -> TestResult {
+        let (_tmp, upload) = base()?;
         let max = 3;
         for job in ["job_a", "job_b", "job_c"] {
             record_at_result_with_limit(&upload, job, &event(job), unix_seconds_now(), max, false)
-                .unwrap();
+                .test_value()?;
         }
 
         record_at_result_with_limit(
@@ -519,10 +532,10 @@ mod tests {
             max,
             false,
         )
-        .unwrap();
+        .test_value()?;
 
         let names = json_files(&pending_dir(&upload))
-            .unwrap()
+            .test_value()?
             .into_iter()
             .filter_map(|path| {
                 path.file_stem()
@@ -533,19 +546,23 @@ mod tests {
         for job in ["job_a", "job_b", "job_c"] {
             assert!(names.iter().any(|name| name == job), "missing {job}");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn atomic_record_leaves_no_temp_files() {
-        let (_tmp, upload) = base();
-        record(&upload, "job_abc", &event("job_abc")).unwrap();
+    fn atomic_record_leaves_no_temp_files() -> TestResult {
+        let (_tmp, upload) = base()?;
+        record(&upload, "job_abc", &event("job_abc")).test_value()?;
         let temps: Vec<_> = fs::read_dir(pending_dir(&upload))
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
             .collect();
-        assert!(temps.is_empty());
+        assert_eq!(temps, Vec::<PathBuf>::new());
+
+        Ok(())
     }
 
     #[test]

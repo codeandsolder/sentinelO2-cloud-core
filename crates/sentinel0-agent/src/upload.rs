@@ -106,11 +106,7 @@ fn safe_dest(upload_base: &Path, target: &str) -> Result<PathBuf, HandlerError> 
 }
 
 fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::hex_lower(bytes.as_ref())
 }
 
 fn hash_bytes(data: &[u8]) -> String {
@@ -147,7 +143,7 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
-fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
+const fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
     let segments = ip.segments();
     segments[0] == 0x2001 && segments[1] == 0x0db8
 }
@@ -261,31 +257,19 @@ async fn fetch_to(
     Ok((size, hex_bytes(hasher.finalize())))
 }
 
-pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    let target = require_str(payload, "target_path")?;
-    let overwrite = payload
-        .get("overwrite")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let content = payload.get("content_base64").and_then(Value::as_str);
-    let file_url = payload.get("file_url").and_then(Value::as_str);
-    if content.is_some() == file_url.is_some() {
-        return Err(HandlerError::new(
-            "invalid_payload",
-            "provide exactly one of 'content_base64' or 'file_url'",
-        ));
-    }
-
+async fn prepare_single_destination(
+    policy: &Policy,
+    target: &str,
+    overwrite: bool,
+) -> Result<PathBuf, HandlerError> {
     async_fs::create_dir_all(&policy.upload_base)
         .await
         .map_err(|e| HandlerError::new("io_error", format!("cannot create upload_base: {e}")))?;
-
     let upload_base = policy.upload_base.clone();
     let target_owned = target.to_owned();
     let destination = tokio::task::spawn_blocking(move || safe_dest(&upload_base, &target_owned))
         .await
         .map_err(|e| HandlerError::new("internal_error", format!("path resolver failed: {e}")))??;
-
     if async_fs::try_exists(&destination)
         .await
         .map_err(|e| HandlerError::new("io_error", format!("cannot stat upload target: {e}")))?
@@ -301,35 +285,106 @@ pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> Handl
             HandlerError::new("io_error", format!("cannot create destination parent: {e}"))
         })?;
     }
+    Ok(destination)
+}
 
+async fn stage_single_upload(
+    policy: &Policy,
+    content: Option<&str>,
+    file_url: Option<&str>,
+    temp: &Path,
+) -> Result<(u64, String), HandlerError> {
+    if let Some(encoded) = content {
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|e| HandlerError::new("invalid_payload", format!("bad base64: {e}")))?;
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if size > MAX_UPLOAD_BYTES {
+            return Err(HandlerError::new(
+                "file_too_large",
+                "decoded file exceeds upload cap",
+            ));
+        }
+        async_fs::write(temp, &bytes).await.map_err(|error| {
+            HandlerError::new("io_error", format!("failed staging upload: {error}"))
+        })?;
+        Ok((size, hash_bytes(&bytes)))
+    } else {
+        fetch_to(policy, file_url.unwrap_or_default(), temp).await
+    }
+}
+
+async fn finalize_single_upload(
+    temp: &Path,
+    destination: &Path,
+    overwrite: bool,
+) -> Result<(), HandlerError> {
+    let finalize = if overwrite {
+        async_fs::rename(temp, destination).await
+    } else {
+        let temp = temp.to_owned();
+        let destination = destination.to_owned();
+        tokio::task::spawn_blocking(move || rename_no_replace(&temp, &destination))
+            .await
+            .map_err(|error| {
+                HandlerError::new(
+                    "internal_error",
+                    format!("upload finalization task failed: {error}"),
+                )
+            })?
+    };
+    if let Err(error) = finalize {
+        let cleanup = match async_fs::remove_file(temp).await {
+            Ok(()) => None,
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => None,
+            Err(cleanup) => Some(cleanup),
+        };
+        let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "conflict"
+        } else {
+            "io_error"
+        };
+        return Err(HandlerError::new(
+            code,
+            cleanup.map_or_else(
+                || format!("failed finalizing upload: {error}"),
+                |cleanup| {
+                    format!(
+                        "failed finalizing upload: {error}; staged-file cleanup also failed: {cleanup}"
+                    )
+                },
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns an error when the upload request is invalid, disallowed, cannot be fetched, or cannot be finalized safely.
+pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+    let target = require_str(payload, "target_path")?;
+    let overwrite = payload
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let content = payload.get("content_base64").and_then(Value::as_str);
+    let file_url = payload.get("file_url").and_then(Value::as_str);
+    if content.is_some() == file_url.is_some() {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            "provide exactly one of 'content_base64' or 'file_url'",
+        ));
+    }
+
+    let destination = prepare_single_destination(policy, target, overwrite).await?;
     let upload_base = policy.upload_base.clone();
     let staging = tokio::task::spawn_blocking(move || staging::staging_root(&upload_base))
         .await
         .map_err(|e| HandlerError::new("internal_error", format!("staging setup failed: {e}")))?
         .map_err(|e| HandlerError::new("io_error", e.to_string()))?;
     let temp = staging.join(format!("single-{:016x}.upload", rand::random::<u64>()));
-    let result = if let Some(encoded) = content {
-        let bytes = STANDARD
-            .decode(encoded)
-            .map_err(|e| HandlerError::new("invalid_payload", format!("bad base64: {e}")))?;
-        if bytes.len() as u64 > MAX_UPLOAD_BYTES {
-            return Err(HandlerError::new(
-                "file_too_large",
-                "decoded file exceeds upload cap",
-            ));
-        }
-        match async_fs::write(&temp, &bytes).await {
-            Ok(()) => Ok((bytes.len() as u64, hash_bytes(&bytes))),
-            Err(error) => Err(HandlerError::new(
-                "io_error",
-                format!("failed staging upload: {error}"),
-            )),
-        }
-    } else {
-        fetch_to(policy, file_url.unwrap_or_default(), &temp).await
-    };
-
-    let (size, sha256) = match result {
+    let staged = stage_single_upload(policy, content, file_url, &temp).await;
+    let (size, sha256) = match staged {
         Ok(value) => value,
         Err(mut error) => {
             if let Err(cleanup) = async_fs::remove_file(&temp).await
@@ -343,41 +398,7 @@ pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> Handl
             return Err(error);
         }
     };
-    let finalize = if overwrite {
-        async_fs::rename(&temp, &destination).await
-    } else {
-        let temp = temp.clone();
-        let destination = destination.clone();
-        tokio::task::spawn_blocking(move || rename_no_replace(&temp, &destination))
-            .await
-            .map_err(|error| {
-                HandlerError::new(
-                    "internal_error",
-                    format!("upload finalization task failed: {error}"),
-                )
-            })?
-    };
-    if let Err(error) = finalize {
-        let cleanup = match async_fs::remove_file(&temp).await {
-            Ok(()) => None,
-            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => None,
-            Err(cleanup) => Some(cleanup),
-        };
-        let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
-            "conflict"
-        } else {
-            "io_error"
-        };
-        return Err(HandlerError::new(
-            code,
-            match cleanup {
-                Some(cleanup) => format!(
-                    "failed finalizing upload: {error}; staged-file cleanup also failed: {cleanup}"
-                ),
-                None => format!("failed finalizing upload: {error}"),
-            },
-        ));
-    }
+    finalize_single_upload(&temp, &destination, overwrite).await?;
 
     Ok(BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
@@ -395,6 +416,8 @@ pub async fn upload_file(policy: &Policy, payload: &Map<String, Value>) -> Handl
     ]))
 }
 
+/// # Errors
+/// Returns an error when upload metadata is invalid or the staging area cannot be prepared.
 pub fn upload_init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let target = require_str(payload, "target_path")?;
     let overwrite = payload
@@ -462,6 +485,8 @@ pub fn upload_init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResu
     ]))
 }
 
+/// # Errors
+/// Returns an error when the transfer identifier or chunk is invalid, or the part cannot be written.
 pub fn write_transfer_part_at(
     upload_base: &Path,
     upload_id: &str,
@@ -487,6 +512,8 @@ pub fn write_transfer_part_at(
     Ok(data.len())
 }
 
+/// # Errors
+/// Returns an error when the transfer is invalid, disallowed, or the part cannot be written.
 pub fn write_transfer_part(
     policy: &Policy,
     upload_id: &str,
@@ -496,6 +523,8 @@ pub fn write_transfer_part(
     write_transfer_part_at(&policy.upload_base, upload_id, index, data)
 }
 
+/// # Errors
+/// Returns an error when the upload chunk payload is invalid or cannot be written.
 pub fn upload_chunk(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let id = require_str(payload, "upload_id")?;
     let index = payload
@@ -525,6 +554,77 @@ pub fn upload_chunk(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     ]))
 }
 
+fn assemble_upload_parts(
+    parts: Vec<PathBuf>,
+    assembled: &Path,
+) -> Result<(u64, String), HandlerError> {
+    let mut output = fs::File::create(assembled).map_err(|e| {
+        HandlerError::new("io_error", format!("cannot create assembled upload: {e}"))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for part in parts {
+        let mut input = fs::File::open(&part)
+            .map_err(|e| HandlerError::new("io_error", format!("cannot read part: {e}")))?;
+        loop {
+            let n = input
+                .read(&mut buffer)
+                .map_err(|e| HandlerError::new("io_error", format!("cannot read part: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            if total > MAX_UPLOAD_BYTES {
+                return Err(HandlerError::new(
+                    "file_too_large",
+                    "reassembled upload exceeds cap",
+                ));
+            }
+            hasher.update(&buffer[..n]);
+            output.write_all(&buffer[..n]).map_err(|e| {
+                HandlerError::new("io_error", format!("cannot assemble upload: {e}"))
+            })?;
+        }
+    }
+    Ok((total, hex_bytes(hasher.finalize())))
+}
+
+fn finalize_chunked_upload(
+    assembled: &Path,
+    destination: &Path,
+    overwrite: bool,
+) -> Result<(), HandlerError> {
+    if destination.exists() && !overwrite {
+        return Err(HandlerError::new(
+            "conflict",
+            format!("a file already exists at {}", destination.display()),
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            HandlerError::new("io_error", format!("cannot create destination parent: {e}"))
+        })?;
+    }
+    let finalize = if overwrite {
+        fs::rename(assembled, destination)
+    } else {
+        rename_no_replace(assembled, destination)
+    };
+    finalize.map_err(|error| {
+        HandlerError::new(
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "conflict"
+            } else {
+                "io_error"
+            },
+            format!("failed finalizing upload: {error}"),
+        )
+    })
+}
+
+/// # Errors
+/// Returns an error when the staged upload cannot be validated or finalized safely.
 pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let id = require_str(payload, "upload_id")?;
     let id = valid_upload_id(Some(&Value::String(id.into())))?;
@@ -546,36 +646,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
     }
 
     let assembled = dir.join("assembled.bin");
-    let mut output = fs::File::create(&assembled).map_err(|e| {
-        HandlerError::new("io_error", format!("cannot create assembled upload: {e}"))
-    })?;
-    let mut hasher = Sha256::new();
-    let mut total = 0_u64;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    for part in parts {
-        let mut input = fs::File::open(&part)
-            .map_err(|e| HandlerError::new("io_error", format!("cannot read part: {e}")))?;
-        loop {
-            let n = input
-                .read(&mut buffer)
-                .map_err(|e| HandlerError::new("io_error", format!("cannot read part: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            total = total.saturating_add(n as u64);
-            if total > MAX_UPLOAD_BYTES {
-                return Err(HandlerError::new(
-                    "file_too_large",
-                    "reassembled upload exceeds cap",
-                ));
-            }
-            hasher.update(&buffer[..n]);
-            output.write_all(&buffer[..n]).map_err(|e| {
-                HandlerError::new("io_error", format!("cannot assemble upload: {e}"))
-            })?;
-        }
-    }
-    let sha256 = hex_bytes(hasher.finalize());
+    let (total, sha256) = assemble_upload_parts(parts, &assembled)?;
 
     if meta.total_size != 0 && meta.total_size != total {
         return Err(HandlerError::new(
@@ -600,32 +671,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
     }
 
     let destination = PathBuf::from(&meta.target_path);
-    if destination.exists() && !meta.overwrite {
-        return Err(HandlerError::new(
-            "conflict",
-            format!("a file already exists at {}", destination.display()),
-        ));
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            HandlerError::new("io_error", format!("cannot create destination parent: {e}"))
-        })?;
-    }
-    let finalize = if meta.overwrite {
-        fs::rename(&assembled, &destination)
-    } else {
-        rename_no_replace(&assembled, &destination)
-    };
-    finalize.map_err(|error| {
-        HandlerError::new(
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                "conflict"
-            } else {
-                "io_error"
-            },
-            format!("failed finalizing upload: {error}"),
-        )
-    })?;
+    finalize_chunked_upload(&assembled, &destination, meta.overwrite)?;
     let cleanup_warning = match fs::remove_dir_all(&dir) {
         Ok(()) => None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -651,7 +697,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
         ("sha256".into(), Value::String(sha256)),
         (
             "filename".into(),
-            meta.filename.map(Value::String).unwrap_or(Value::Null),
+            meta.filename.map_or(Value::Null, Value::String),
         ),
     ]);
     if let Some(warning) = cleanup_warning {
@@ -663,6 +709,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -673,8 +720,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_chunk_index_must_fit_binary_protocol_width() {
-        let dir = tempdir().unwrap();
+    fn legacy_json_chunk_index_must_fit_binary_protocol_width() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = policy(dir.path());
         let init = upload_init(
             &policy,
@@ -683,8 +730,8 @@ mod tests {
                 ("total_size".into(), Value::from(1)),
             ]),
         )
-        .unwrap();
-        let id = init["upload_id"].as_str().unwrap();
+        .test_value()?;
+        let id = init["upload_id"].as_str().test_value()?;
         let error = upload_chunk(
             &policy,
             &Map::from_iter([
@@ -696,13 +743,15 @@ mod tests {
                 ),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "invalid_payload");
+
+        Ok(())
     }
 
     #[test]
-    fn chunked_upload_reassembles_and_verifies_case_insensitive_hash() {
-        let dir = tempdir().unwrap();
+    fn chunked_upload_reassembles_and_verifies_case_insensitive_hash() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = policy(dir.path());
         let init = upload_init(
             &policy,
@@ -711,8 +760,8 @@ mod tests {
                 ("total_size".into(), Value::from(6)),
             ]),
         )
-        .unwrap();
-        let id = init["upload_id"].as_str().unwrap();
+        .test_value()?;
+        let id = init["upload_id"].as_str().test_value()?;
         for (index, bytes) in [(0, b"abc".as_slice()), (1, b"def".as_slice())] {
             upload_chunk(
                 &policy,
@@ -725,7 +774,7 @@ mod tests {
                     ),
                 ]),
             )
-            .unwrap();
+            .test_value()?;
         }
         let expected = hash_bytes(b"abcdef").to_ascii_uppercase();
         let done = upload_complete(
@@ -735,12 +784,14 @@ mod tests {
                 ("sha256".into(), Value::String(expected)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(done["size"], 6);
         assert_eq!(
-            fs::read(dir.path().join("nested/x.bin")).unwrap(),
+            fs::read(dir.path().join("nested/x.bin")).test_value()?,
             b"abcdef"
         );
+
+        Ok(())
     }
 
     fn landing_policy(
@@ -757,16 +808,17 @@ mod tests {
         }
     }
 
-    fn upload_meta(policy: &Policy, init: &BTreeMap<String, Value>) -> UploadMeta {
-        let id = init["upload_id"].as_str().unwrap();
-        let bytes = fs::read(meta_path(&upload_dir(policy, id).unwrap())).unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+    fn upload_meta(policy: &Policy, init: &BTreeMap<String, Value>) -> TestResult<UploadMeta> {
+        let id = init["upload_id"].as_str().test_value()?;
+        let dir = upload_dir(policy, id).test_value()?;
+        let bytes = fs::read(meta_path(&dir)).test_value()?;
+        serde_json::from_slice(&bytes).test_value()
     }
 
     #[test]
-    fn land_in_place_under_rw_path() {
-        let uploads = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
+    fn land_in_place_under_rw_path() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let workspace = tempdir().test_value()?;
         let target = workspace.path().join("canary.txt");
         let policy = landing_policy(
             uploads.path(),
@@ -786,17 +838,19 @@ mod tests {
                 ("land_in_place".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
-        let meta = upload_meta(&policy, &init);
+        .test_value()?;
+        let meta = upload_meta(&policy, &init)?;
         assert!(meta.landed_in_place);
         assert_eq!(PathBuf::from(meta.target_path), target);
+
+        Ok(())
     }
 
     #[test]
-    fn land_in_place_outside_rw_falls_back_to_staging() {
-        let uploads = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
-        let elsewhere = tempdir().unwrap();
+    fn land_in_place_outside_rw_falls_back_to_staging() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let workspace = tempdir().test_value()?;
+        let elsewhere = tempdir().test_value()?;
         let target = elsewhere.path().join("x.txt");
         let policy = landing_policy(
             uploads.path(),
@@ -815,16 +869,18 @@ mod tests {
                 ("land_in_place".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
-        let meta = upload_meta(&policy, &init);
+        .test_value()?;
+        let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+
+        Ok(())
     }
 
     #[test]
-    fn land_in_place_is_opt_in_even_under_rw_path() {
-        let uploads = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
+    fn land_in_place_is_opt_in_even_under_rw_path() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let workspace = tempdir().test_value()?;
         let target = workspace.path().join("default-staged.txt");
         let policy = landing_policy(
             uploads.path(),
@@ -840,16 +896,18 @@ mod tests {
                 Value::String(target.display().to_string()),
             )]),
         )
-        .unwrap();
-        let meta = upload_meta(&policy, &init);
+        .test_value()?;
+        let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+
+        Ok(())
     }
 
     #[test]
-    fn read_only_path_does_not_land_in_place() {
-        let uploads = tempdir().unwrap();
-        let readonly = tempdir().unwrap();
+    fn read_only_path_does_not_land_in_place() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let readonly = tempdir().test_value()?;
         let target = readonly.path().join("z.txt");
         let policy = landing_policy(
             uploads.path(),
@@ -865,16 +923,18 @@ mod tests {
                 ("land_in_place".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
-        let meta = upload_meta(&policy, &init);
+        .test_value()?;
+        let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+
+        Ok(())
     }
 
     #[test]
-    fn land_in_place_traversal_outside_rw_is_still_refused() {
-        let uploads = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
+    fn land_in_place_traversal_outside_rw_is_still_refused() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let workspace = tempdir().test_value()?;
         let policy = landing_policy(
             uploads.path(),
             vec![(
@@ -892,13 +952,15 @@ mod tests {
                 ("land_in_place".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "path_traversal");
+
+        Ok(())
     }
 
     #[test]
-    fn absolute_staging_target_is_rooted_under_upload_base() {
-        let uploads = tempdir().unwrap();
+    fn absolute_staging_target_is_rooted_under_upload_base() -> TestResult {
+        let uploads = tempdir().test_value()?;
         let policy = policy(uploads.path());
         let init = upload_init(
             &policy,
@@ -907,31 +969,35 @@ mod tests {
                 Value::String("/srv/elsewhere/x.txt".into()),
             )]),
         )
-        .unwrap();
-        let meta = upload_meta(&policy, &init);
+        .test_value()?;
+        let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
         assert_eq!(
             PathBuf::from(meta.target_path),
             uploads.path().join("srv/elsewhere/x.txt")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn upload_target_cannot_escape_upload_base() {
-        let dir = tempdir().unwrap();
+    fn upload_target_cannot_escape_upload_base() -> TestResult {
+        let dir = tempdir().test_value()?;
         let error = upload_init(
             &policy(dir.path()),
             &Map::from_iter([("target_path".into(), Value::String("../escape".into()))]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "path_traversal");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn single_upload_finalize_failure_cleans_staged_file() {
-        let dir = tempdir().unwrap();
+    async fn single_upload_finalize_failure_cleans_staged_file() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = policy(dir.path());
-        fs::create_dir(dir.path().join("target-dir")).unwrap();
+        fs::create_dir(dir.path().join("target-dir")).test_value()?;
 
         let error = upload_file(
             &policy,
@@ -945,15 +1011,17 @@ mod tests {
             ]),
         )
         .await
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "io_error");
 
         let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
         let leaked = fs::read_dir(staging)
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".upload"))
             .collect::<Vec<_>>();
         assert!(leaked.is_empty(), "failed upload leaked staged file");
+
+        Ok(())
     }
 }

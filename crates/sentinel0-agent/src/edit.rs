@@ -94,8 +94,7 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
             if payload
                 .get("pattern")
                 .and_then(Value::as_str)
-                .filter(|v| !v.is_empty())
-                .is_none()
+                .is_none_or(str::is_empty)
             {
                 return Err(HandlerError::new(
                     "invalid_payload",
@@ -109,8 +108,7 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
                 if payload
                     .get(key)
                     .and_then(Value::as_str)
-                    .filter(|v| !v.is_empty())
-                    .is_none()
+                    .is_none_or(str::is_empty)
                 {
                     return Err(HandlerError::new(
                         "invalid_payload",
@@ -138,12 +136,11 @@ fn interpret_escapes(input: &str) -> String {
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
-            Some('\\') => out.push('\\'),
+            Some('\\') | None => out.push('\\'),
             Some(other) => {
                 out.push('\\');
                 out.push(other);
             }
-            None => out.push('\\'),
         }
     }
     out
@@ -276,50 +273,49 @@ fn transform(
     }
 }
 
-fn run_validator(
+fn internal_validator(
+    preset: Option<&str>,
+    path: &Path,
+) -> Result<Option<Vec<String>>, HandlerError> {
+    let Some(preset) = preset else {
+        return Ok(None);
+    };
+    let tag = match preset {
+        "json" => {
+            let text = fs::read_to_string(path)
+                .map_err(|e| HandlerError::new("validation_failed", e.to_string()))?;
+            serde_json::from_str::<Value>(&text).map_err(|e| {
+                HandlerError::new("validation_failed", format!("validation failed: {e}"))
+            })?;
+            "internal:json"
+        }
+        "yaml" => {
+            let text = fs::read_to_string(path)
+                .map_err(|e| HandlerError::new("validation_failed", e.to_string()))?;
+            yaml_serde::from_str::<yaml_serde::Value>(&text).map_err(|e| {
+                HandlerError::new("validation_failed", format!("validation failed: {e}"))
+            })?;
+            "internal:yaml"
+        }
+        "toml" => {
+            let text = fs::read_to_string(path)
+                .map_err(|e| HandlerError::new("validation_failed", e.to_string()))?;
+            toml::from_str::<toml::Value>(&text).map_err(|e| {
+                HandlerError::new("validation_failed", format!("validation failed: {e}"))
+            })?;
+            "internal:toml"
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(vec![tag.into(), path.display().to_string()]))
+}
+
+fn validator_argv(
     policy: &Policy,
     path: &Path,
-    payload: &Map<String, Value>,
+    preset: Option<&str>,
+    custom: Option<&str>,
 ) -> Result<Option<Vec<String>>, HandlerError> {
-    use wait_timeout::ChildExt as _;
-
-    let preset = payload.get("validator_preset").and_then(Value::as_str);
-    let custom = payload.get("validator").and_then(Value::as_str);
-
-    if preset == Some("json") {
-        let text = fs::read_to_string(path)
-            .map_err(|e| HandlerError::new("validation_failed", e.to_string()))?;
-        serde_json::from_str::<Value>(&text).map_err(|e| {
-            HandlerError::new("validation_failed", format!("validation failed: {e}"))
-        })?;
-        return Ok(Some(vec![
-            "internal:json".into(),
-            path.display().to_string(),
-        ]));
-    }
-    if preset == Some("yaml") {
-        let text = fs::read_to_string(path)
-            .map_err(|e| HandlerError::new("validation_failed", e.to_string()))?;
-        yaml_serde::from_str::<yaml_serde::Value>(&text).map_err(|e| {
-            HandlerError::new("validation_failed", format!("validation failed: {e}"))
-        })?;
-        return Ok(Some(vec![
-            "internal:yaml".into(),
-            path.display().to_string(),
-        ]));
-    }
-    if preset == Some("toml") {
-        let text = fs::read_to_string(path)
-            .map_err(|e| HandlerError::new("validation_failed", e.to_string()))?;
-        toml::from_str::<toml::Value>(&text).map_err(|e| {
-            HandlerError::new("validation_failed", format!("validation failed: {e}"))
-        })?;
-        return Ok(Some(vec![
-            "internal:toml".into(),
-            path.display().to_string(),
-        ]));
-    }
-
     let argv = if let Some(preset) = preset {
         match preset {
             "python" => vec![
@@ -380,10 +376,40 @@ fn run_validator(
     } else {
         return Ok(None);
     };
+    Ok((!argv.is_empty()).then_some(argv))
+}
 
-    if argv.is_empty() {
-        return Ok(None);
+fn timed_out_validator_error(child: &mut std::process::Child, pid: u32) -> HandlerError {
+    let mut cleanup_error = None;
+    #[cfg(unix)]
+    {
+        let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+        if let Err(error) =
+            nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
+            && error != nix::errno::Errno::ESRCH
+        {
+            let message = format!("failed killing validator process group: {error}");
+            tracing::warn!(%message);
+            cleanup_error = Some(message);
+        }
     }
+    if let Err(error) = child.wait() {
+        let message = format!("failed reaping timed-out validator: {error}");
+        tracing::warn!(%message);
+        cleanup_error.get_or_insert(message);
+    }
+    let details = cleanup_error
+        .map(|error| Map::from_iter([("cleanup_error".into(), Value::String(error))]))
+        .unwrap_or_default();
+    HandlerError::with_details(
+        "validation_timeout",
+        format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
+        details,
+    )
+}
+
+fn execute_validator(policy: &Policy, argv: &[String]) -> Result<(), HandlerError> {
+    use wait_timeout::ChildExt as _;
 
     let mut command = Command::new(&argv[0]);
     command
@@ -396,7 +422,6 @@ fn run_validator(
         command.process_group(0);
     }
     policy.tooling.configure_std(&mut command)?;
-
     let mut child = command.spawn().map_err(|e| {
         HandlerError::new(
             "validation_failed",
@@ -412,46 +437,15 @@ fn run_validator(
         .stderr
         .take()
         .ok_or_else(|| HandlerError::new("validation_failed", "validator stderr was not piped"))?;
-
     let per_stream = VALIDATOR_CAPTURE_BYTES / 2;
     let stdout_reader = std::thread::spawn(move || read_bounded_sync(stdout, per_stream));
     let stderr_reader = std::thread::spawn(move || read_bounded_sync(stderr, per_stream));
-
-    let status = match child.wait_timeout(VALIDATOR_TIMEOUT).map_err(|e| {
+    let Some(status) = child.wait_timeout(VALIDATOR_TIMEOUT).map_err(|e| {
         HandlerError::new("validation_failed", format!("validator wait failed: {e}"))
-    })? {
-        Some(status) => status,
-        None => {
-            let mut cleanup_error = None;
-            #[cfg(unix)]
-            {
-                let pgid = nix::unistd::Pid::from_raw(pid as i32);
-                if let Err(error) =
-                    nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                    && error != nix::errno::Errno::ESRCH
-                {
-                    let message = format!("failed killing validator process group: {error}");
-                    tracing::warn!(%message);
-                    cleanup_error = Some(message);
-                }
-            }
-            if let Err(error) = child.wait() {
-                let message = format!("failed reaping timed-out validator: {error}");
-                tracing::warn!(%message);
-                cleanup_error.get_or_insert(message);
-            }
-            let mut details = Map::new();
-            if let Some(error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(error));
-            }
-            return Err(HandlerError::with_details(
-                "validation_timeout",
-                format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
-                details,
-            ));
-        }
+    })?
+    else {
+        return Err(timed_out_validator_error(&mut child, pid));
     };
-
     let stdout = stdout_reader
         .join()
         .map_err(|_| HandlerError::new("validation_failed", "validator stdout reader panicked"))?
@@ -464,24 +458,41 @@ fn run_validator(
         .map_err(|e| {
             HandlerError::new("validation_failed", format!("validator stderr failed: {e}"))
         })?;
-
-    if !status.success() {
-        let stdout = stdout.rendered_trimmed_lossy();
-        let stderr = stderr.rendered_trimmed_lossy();
-        let tail = [stdout, stderr]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" / ");
-        return Err(HandlerError::new(
-            "validation_failed",
-            if tail.is_empty() {
-                "validation failed".into()
-            } else {
-                format!("validation failed: {tail}")
-            },
-        ));
+    if status.success() {
+        return Ok(());
     }
+    let tail = [
+        stdout.rendered_trimmed_lossy(),
+        stderr.rendered_trimmed_lossy(),
+    ]
+    .into_iter()
+    .filter(|text| !text.is_empty())
+    .collect::<Vec<_>>()
+    .join(" / ");
+    Err(HandlerError::new(
+        "validation_failed",
+        if tail.is_empty() {
+            "validation failed".into()
+        } else {
+            format!("validation failed: {tail}")
+        },
+    ))
+}
+
+fn run_validator(
+    policy: &Policy,
+    path: &Path,
+    payload: &Map<String, Value>,
+) -> Result<Option<Vec<String>>, HandlerError> {
+    let preset = payload.get("validator_preset").and_then(Value::as_str);
+    if let Some(result) = internal_validator(preset, path)? {
+        return Ok(Some(result));
+    }
+    let custom = payload.get("validator").and_then(Value::as_str);
+    let Some(argv) = validator_argv(policy, path, preset, custom)? else {
+        return Ok(None);
+    };
+    execute_validator(policy, &argv)?;
     Ok(Some(argv))
 }
 
@@ -520,9 +531,10 @@ impl Drop for RemoveFileOnDrop {
 }
 
 fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
-    let base = backup_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| target.parent().unwrap_or(Path::new(".")).to_owned());
+    let base = backup_dir.map_or_else(
+        || target.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
+        PathBuf::from,
+    );
     base.join(format!(
         "{}.bak.{}",
         target
@@ -559,7 +571,7 @@ fn atomic_replace(
             .open(&candidate)
         {
             Ok(file) => break (candidate, file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(HandlerError::new(
                     "write_failed",
@@ -677,13 +689,19 @@ fn sudo_replace(
     Ok(())
 }
 
-pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    let started = Instant::now();
-    let raw_path = require_str(payload, "path")?;
-    let mode = require_str(payload, "mode")?;
-    validate_payload(mode, payload)?;
+struct EditTarget {
+    path: PathBuf,
+    existed: bool,
+    original: String,
+    metadata: Option<fs::Metadata>,
+}
 
-    let Some(target) = policy.resolve_path(raw_path, true) else {
+fn load_edit_target(
+    policy: &Policy,
+    payload: &Map<String, Value>,
+    raw_path: &str,
+) -> Result<EditTarget, HandlerError> {
+    let Some(path) = policy.resolve_path(raw_path, true) else {
         let writable = policy
             .file_ops_paths
             .iter()
@@ -696,42 +714,33 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             Map::from_iter([("writable_paths".into(), Value::Array(writable))]),
         ));
     };
-
     let create = payload
         .get("create")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let exists = target.exists();
-    if !exists && !create {
+    let existed = path.exists();
+    if !existed && !create {
         return Err(HandlerError::new(
             "target_not_found",
             "file does not exist; pass create=true to create it",
         ));
     }
-    let original = if exists {
-        fs::read_to_string(&target)
+    let original = if existed {
+        fs::read_to_string(&path)
             .map_err(|e| HandlerError::new("read_failed", format!("failed reading target: {e}")))?
     } else {
         String::new()
     };
-    let original_meta = if exists {
-        fs::metadata(&target).ok()
-    } else {
-        None
-    };
+    let metadata = existed.then(|| fs::metadata(&path).ok()).flatten();
+    Ok(EditTarget {
+        path,
+        existed,
+        original,
+        metadata,
+    })
+}
 
-    let (updated, changed) = transform(mode, &original, payload)?;
-    let allow_no_change = payload
-        .get("allow_no_change")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if updated == original && !allow_no_change {
-        return Err(HandlerError::new(
-            "no_effective_change",
-            "the edit produced no changes",
-        ));
-    }
-
+fn stage_edit(policy: &Policy, target: &Path, updated: &str) -> Result<PathBuf, HandlerError> {
     let staging = crate::staging::staging_root(&policy.upload_base)
         .map_err(|e| HandlerError::new("write_failed", e.to_string()))?;
     let staged = staging.join(format!(
@@ -742,88 +751,157 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             .unwrap_or("file"),
         rand::rng().random::<u64>()
     ));
-    let _staged_cleanup = RemoveFileOnDrop(staged.clone());
-    fs::write(&staged, &updated)
+    fs::write(&staged, updated)
         .map_err(|e| HandlerError::new("write_failed", format!("failed staging edit: {e}")))?;
+    Ok(staged)
+}
 
-    let validator = run_validator(policy, &staged, payload)?;
-    let want_diff = payload
-        .get("diff")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let diff_text = want_diff.then(|| unified_diff(&original, &updated, &target));
-    let dry_run = payload
+fn apply_edit(
+    policy: &Policy,
+    target: &EditTarget,
+    staged: &Path,
+    updated: &str,
+    payload: &Map<String, Value>,
+) -> Result<Option<PathBuf>, HandlerError> {
+    if payload
         .get("dry_run")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let mut backup = None;
-    if !dry_run {
-        if exists {
-            let backup_path =
-                backup_path(&target, payload.get("backup_dir").and_then(Value::as_str));
-            if let Some(parent) = backup_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| HandlerError::new("backup_failed", e.to_string()))?;
-            }
-            fs::copy(&target, &backup_path).map_err(|e| {
-                HandlerError::new("backup_failed", format!("failed creating backup: {e}"))
-            })?;
-            backup = Some(backup_path);
-        }
-
-        let sudo = payload
-            .get("sudo")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if sudo {
-            sudo_replace(policy, &target, &staged, original_meta.as_ref())?;
-        } else {
-            atomic_replace(&target, &updated, original_meta.as_ref())?;
-        }
+        .unwrap_or(false)
+    {
+        return Ok(None);
     }
+    let backup = if target.existed {
+        let backup = backup_path(
+            &target.path,
+            payload.get("backup_dir").and_then(Value::as_str),
+        );
+        if let Some(parent) = backup.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| HandlerError::new("backup_failed", e.to_string()))?;
+        }
+        fs::copy(&target.path, &backup).map_err(|e| {
+            HandlerError::new("backup_failed", format!("failed creating backup: {e}"))
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+    let sudo = payload
+        .get("sudo")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if sudo {
+        sudo_replace(policy, &target.path, staged, target.metadata.as_ref())?;
+    } else {
+        atomic_replace(&target.path, updated, target.metadata.as_ref())?;
+    }
+    Ok(backup)
+}
 
-    let duration = (started.elapsed().as_secs_f64() * 100.0).round() / 100.0;
+struct EditOutcome<'a> {
+    target: &'a Path,
+    mode: &'a str,
+    changed: usize,
+    dry_run: bool,
+    backup: Option<PathBuf>,
+    diff: Option<String>,
+    validator: Option<Vec<String>>,
+    sudo: bool,
+    duration: f64,
+}
+
+fn edit_result(outcome: EditOutcome<'_>) -> BTreeMap<String, Value> {
     let mut result = BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
-        ("path".into(), Value::String(target.display().to_string())),
-        ("mode".into(), Value::String(mode.into())),
         (
-            "sudo".into(),
-            Value::Bool(
-                payload
-                    .get("sudo")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            ),
+            "path".into(),
+            Value::String(outcome.target.display().to_string()),
         ),
+        ("mode".into(), Value::String(outcome.mode.into())),
+        ("sudo".into(), Value::Bool(outcome.sudo)),
         ("output".into(), Value::String("OK".into())),
-        ("duration".into(), Value::from(duration)),
+        ("duration".into(), Value::from(outcome.duration)),
         ("returncode".into(), Value::from(0)),
-        ("changed".into(), Value::from(changed as u64)),
+        (
+            "changed".into(),
+            Value::from(u64::try_from(outcome.changed).unwrap_or(u64::MAX)),
+        ),
     ]);
-    if dry_run {
+    if outcome.dry_run {
         result.insert("dry_run".into(), Value::Bool(true));
     }
-    if let Some(path) = backup {
+    if let Some(path) = outcome.backup {
         result.insert("backup".into(), Value::String(path.display().to_string()));
     }
-    if let Some(diff) = diff_text {
+    if let Some(diff) = outcome.diff {
         result.insert("diff".into(), Value::String(diff));
     }
-    if let Some(validator) = validator {
+    if let Some(validator) = outcome.validator {
         result.insert(
             "validator".into(),
             Value::Array(validator.into_iter().map(Value::String).collect()),
         );
     }
-    Ok(result)
+    result
+}
+
+/// # Errors
+/// Returns an error when the edit request is invalid, disallowed, or cannot be applied safely.
+pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+    let started = Instant::now();
+    let raw_path = require_str(payload, "path")?;
+    let mode = require_str(payload, "mode")?;
+    validate_payload(mode, payload)?;
+    let target = load_edit_target(policy, payload, raw_path)?;
+
+    let (updated, changed) = transform(mode, &target.original, payload)?;
+    let allow_no_change = payload
+        .get("allow_no_change")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if updated == target.original && !allow_no_change {
+        return Err(HandlerError::new(
+            "no_effective_change",
+            "the edit produced no changes",
+        ));
+    }
+
+    let staged = stage_edit(policy, &target.path, &updated)?;
+    let _staged_cleanup = RemoveFileOnDrop(staged.clone());
+    let validator = run_validator(policy, &staged, payload)?;
+    let diff = payload
+        .get("diff")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        .then(|| unified_diff(&target.original, &updated, &target.path));
+    let dry_run = payload
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let backup = apply_edit(policy, &target, &staged, &updated, payload)?;
+    let sudo = payload
+        .get("sudo")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let duration = (started.elapsed().as_secs_f64() * 100.0).round() / 100.0;
+    Ok(edit_result(EditOutcome {
+        target: &target.path,
+        mode,
+        changed,
+        dry_run,
+        backup,
+        diff,
+        validator,
+        sudo,
+        duration,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -838,11 +916,11 @@ mod tests {
     }
 
     #[test]
-    fn edit_updates_mtime_instead_of_preserving_stale_source_timestamp() {
-        let dir = tempdir().unwrap();
+    fn edit_updates_mtime_instead_of_preserving_stale_source_timestamp() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("x.txt");
-        fs::write(&path, "old").unwrap();
-        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "old").test_value()?;
+        let before = fs::metadata(&path).test_value()?.modified().test_value()?;
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         let result = edit(
@@ -853,16 +931,18 @@ mod tests {
                 ("new_text".into(), Value::String("new".into())),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["ok"], true);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
-        let after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(fs::read_to_string(&path).test_value()?, "new");
+        let after = fs::metadata(&path).test_value()?.modified().test_value()?;
         assert!(after > before, "successful edit preserved stale mtime");
+
+        Ok(())
     }
 
     #[test]
-    fn dry_run_create_leaves_target_tree_absent() {
-        let dir = tempdir().unwrap();
+    fn dry_run_create_leaves_target_tree_absent() -> TestResult {
+        let dir = tempdir().test_value()?;
         let target = dir.path().join("share").join("nested").join("new.txt");
 
         let result = edit(
@@ -876,22 +956,24 @@ mod tests {
                 ("diff".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(result["dry_run"], true);
-        assert!(result["diff"].as_str().unwrap().contains("+hello"));
+        assert!(result["diff"].as_str().test_value()?.contains("+hello"));
         assert!(!target.exists());
-        assert!(!target.parent().unwrap().exists());
+        assert!(!target.parent().test_value()?.exists());
         assert!(!dir.path().join("share").exists());
+
+        Ok(())
     }
 
     #[test]
-    fn dry_run_existing_file_leaves_no_sibling_temp_or_content_change() {
-        let dir = tempdir().unwrap();
+    fn dry_run_existing_file_leaves_no_sibling_temp_or_content_change() -> TestResult {
+        let dir = tempdir().test_value()?;
         let target = dir.path().join("config.yaml");
-        fs::write(&target, "a: 1\n").unwrap();
+        fs::write(&target, "a: 1\n").test_value()?;
         let before = fs::read_dir(dir.path())
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
             .collect::<std::collections::BTreeSet<_>>();
@@ -906,23 +988,25 @@ mod tests {
                 ("diff".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(result["dry_run"], true);
-        assert_eq!(fs::read_to_string(&target).unwrap(), "a: 1\n");
+        assert_eq!(fs::read_to_string(&target).test_value()?, "a: 1\n");
 
         let after = fs::read_dir(dir.path())
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
             .filter(|name| name != crate::staging::STAGING_DIRNAME)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(after, before);
+
+        Ok(())
     }
 
     #[test]
-    fn missing_target_without_create_leaves_parents_absent() {
-        let dir = tempdir().unwrap();
+    fn missing_target_without_create_leaves_parents_absent() -> TestResult {
+        let dir = tempdir().test_value()?;
         let target = dir.path().join("missing").join("x.txt");
         let error = edit(
             &policy(dir.path()),
@@ -932,17 +1016,19 @@ mod tests {
                 ("new_text".into(), Value::String("x\n".into())),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
 
         assert_eq!(error.code, "target_not_found");
-        assert!(!target.parent().unwrap().exists());
+        assert!(!target.parent().test_value()?.exists());
+
+        Ok(())
     }
 
     #[test]
-    fn yaml_validation_rejects_bad_candidate_without_touching_target() {
-        let dir = tempdir().unwrap();
+    fn yaml_validation_rejects_bad_candidate_without_touching_target() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("x.yaml");
-        fs::write(&path, "ok: true\n").unwrap();
+        fs::write(&path, "ok: true\n").test_value()?;
         let error = edit(
             &policy(dir.path()),
             &Map::from_iter([
@@ -952,12 +1038,12 @@ mod tests {
                 ("validator_preset".into(), Value::String("yaml".into())),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "validation_failed");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "ok: true\n");
+        assert_eq!(fs::read_to_string(&path).test_value()?, "ok: true\n");
         let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
         let leftovers = fs::read_dir(staging)
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
             .collect::<Vec<_>>();
@@ -965,5 +1051,7 @@ mod tests {
             leftovers.is_empty(),
             "failed edit leaked staged files: {leftovers:?}"
         );
+
+        Ok(())
     }
 }

@@ -71,8 +71,8 @@ fn kill_group(pid: Option<u32>) -> Option<String> {
     let Some(pid) = pid else {
         return Some("child PID was unavailable; process group could not be killed".into());
     };
-    let pgid = nix::unistd::Pid::from_raw(pid as i32);
-    match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
+    let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+    match nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => None,
         Err(error) => {
             let message = format!("failed killing timed-out process group {pid}: {error}");
@@ -101,6 +101,8 @@ fn kill_live_group(child: &mut tokio::process::Child, pid: Option<u32>) -> Optio
     }
 }
 
+/// # Errors
+/// Returns an error when process setup, execution, timeout handling, or output capture fails.
 pub async fn run_argv(
     policy: &Policy,
     argv: &[String],
@@ -188,6 +190,8 @@ pub async fn run_argv(
     }
 }
 
+/// # Errors
+/// Returns an error when the shell command is invalid, disallowed, or execution fails.
 pub async fn run_shell(
     policy: &Policy,
     command: &str,
@@ -209,11 +213,12 @@ pub async fn run_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, TestValue as _};
 
     const SUCCESS_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test]
-    async fn shell_merges_stdout_and_stderr_like_python_core() {
+    async fn shell_merges_stdout_and_stderr_like_python_core() -> TestResult {
         let result = run_shell(
             &Policy::default(),
             "printf out; printf err >&2",
@@ -222,21 +227,25 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["returncode"], 0);
         assert_eq!(result["output"], "out\nerr");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn empty_output_uses_legacy_marker() {
+    async fn empty_output_uses_legacy_marker() -> TestResult {
         let result = run_shell(&Policy::default(), "true", SUCCESS_TEST_TIMEOUT, None, None)
             .await
-            .unwrap();
+            .test_value()?;
         assert_eq!(result["output"], "⚠️ Sin salida");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn timeout_is_structured() {
+    async fn timeout_is_structured() -> TestResult {
         let result = run_shell(
             &Policy::default(),
             "sleep 10",
@@ -245,13 +254,15 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["returncode"], -1);
         assert_eq!(result["timed_out"], true);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn huge_output_is_bounded_and_reported() {
+    async fn huge_output_is_bounded_and_reported() -> TestResult {
         let policy = Policy {
             exec_capture_max_bytes: 64 * 1024,
             ..Policy::default()
@@ -264,10 +275,12 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["returncode"], 0);
         assert_eq!(result["output_truncated"], true);
         assert_eq!(result["stdout_bytes"], 1_000_000);
-        assert!(result["output"].as_str().unwrap().len() < 80_000);
+        assert!(result["output"].as_str().test_value()?.len() < 80_000);
+
+        Ok(())
     }
 }

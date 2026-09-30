@@ -36,9 +36,11 @@ fn audit_value(value: &Value) -> Value {
     }
 }
 
-/// Preserve the request that was actually made. The only generic failsafe is
-/// deliberately cheap: long mixed alphanumeric chunks look more like opaque
-/// keys/tokens than prose, so strings containing one are replaced.
+/// Preserve the request that was actually made.
+///
+/// The only generic failsafe is deliberately cheap: long mixed alphanumeric
+/// chunks look more like opaque keys/tokens than prose, so strings containing
+/// one are replaced.
 #[must_use]
 pub fn summarize_payload(payload: &Map<String, Value>) -> Map<String, Value> {
     payload
@@ -65,9 +67,10 @@ fn audit_io_lock() -> &'static Mutex<()> {
 
 #[must_use]
 pub fn audit_path() -> PathBuf {
-    std::env::var_os("SENTINELX_AUDIT_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/audit.jsonl"))
+    std::env::var_os("SENTINELX_AUDIT_PATH").map_or_else(
+        || PathBuf::from("/var/lib/sentinelx/audit.jsonl"),
+        PathBuf::from,
+    )
 }
 
 fn should_check_retention() -> bool {
@@ -165,7 +168,7 @@ pub fn record(
         // the old inode and silently lose a row.
         let _io_guard = audit_io_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -205,19 +208,21 @@ fn tail_lines(path: &Path, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
     let mut buffer = Vec::new();
     let mut newline_count = 0;
     while position > 0 && newline_count <= limit {
-        let step = position.min(TAIL_BLOCK as u64) as usize;
-        position -= step as u64;
+        let tail_block = u64::try_from(TAIL_BLOCK).unwrap_or(u64::MAX);
+        let step_u64 = position.min(tail_block);
+        let step = usize::try_from(step_u64).unwrap_or(TAIL_BLOCK);
+        position -= step_u64;
         file.seek(SeekFrom::Start(position))?;
         let mut chunk = vec![0_u8; step];
         file.read_exact(&mut chunk)?;
-        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        newline_count += memchr::memchr_iter(b'\n', &chunk).count();
         chunk.extend(buffer);
         buffer = chunk;
     }
     let mut lines = buffer
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-        .map(|line| line.to_vec())
+        .map(<[u8]>::to_vec)
         .collect::<Vec<_>>();
     if lines.len() > limit {
         lines.drain(..lines.len() - limit);
@@ -261,24 +266,27 @@ fn read_recent_from(path: &Path, limit: usize) -> Vec<Value> {
 pub fn read_recent(limit: usize) -> Vec<Value> {
     let _io_guard = audit_io_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     read_recent_from(&audit_path(), limit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn read_recent_is_newest_first_and_malformed_rows_are_skipped() {
-        let dir = tempdir().unwrap();
+    fn read_recent_is_newest_first_and_malformed_rows_are_skipped() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("audit.jsonl");
-        fs::write(&path, b"{\"n\":1}\nnot-json\n{\"n\":2}\n").unwrap();
+        fs::write(&path, b"{\"n\":1}\nnot-json\n{\"n\":2}\n").test_value()?;
         let rows = read_recent_from(&path, 3);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["n"], 2);
         assert_eq!(rows[1]["n"], 1);
+
+        Ok(())
     }
 
     #[test]
@@ -328,29 +336,33 @@ mod tests {
     }
 
     #[test]
-    fn trim_keeps_exactly_the_newest_rows() {
-        let dir = tempdir().unwrap();
+    fn trim_keeps_exactly_the_newest_rows() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("audit.jsonl");
         let mut input = Vec::new();
         for n in 1..=(TRIM_TRIGGER + 1) {
-            writeln!(&mut input, "{{\"n\":{n}}}").unwrap();
+            writeln!(&mut input, "{{\"n\":{n}}}").test_value()?;
         }
-        fs::write(&path, input).unwrap();
+        fs::write(&path, input).test_value()?;
 
-        maybe_trim(&path).unwrap();
+        maybe_trim(&path).test_value()?;
 
         let rows = read_recent_from(&path, MAX_LINES);
         assert_eq!(rows.len(), MAX_LINES);
         assert_eq!(rows[0]["n"], TRIM_TRIGGER + 1);
         assert_eq!(rows[MAX_LINES - 1]["n"], TRIM_TRIGGER + 2 - MAX_LINES);
+
+        Ok(())
     }
 
     #[test]
-    fn retention_probe_stops_at_the_requested_line_limit() {
-        let dir = tempdir().unwrap();
+    fn retention_probe_stops_at_the_requested_line_limit() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("audit.jsonl");
-        fs::write(&path, b"one\ntwo\nthree\n").unwrap();
-        assert!(!has_more_than_lines(&path, 3).unwrap());
-        assert!(has_more_than_lines(&path, 2).unwrap());
+        fs::write(&path, b"one\ntwo\nthree\n").test_value()?;
+        assert!(!has_more_than_lines(&path, 3).test_value()?);
+        assert!(has_more_than_lines(&path, 2).test_value()?);
+
+        Ok(())
     }
 }

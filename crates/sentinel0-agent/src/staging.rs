@@ -29,6 +29,8 @@ pub fn fallback_root() -> PathBuf {
         .join(STAGING_DIRNAME)
 }
 
+/// # Errors
+/// Returns an I/O error when a usable staging directory cannot be created or resolved.
 pub fn staging_root(upload_base: &Path) -> std::io::Result<PathBuf> {
     let primary = upload_base.join(STAGING_DIRNAME);
     match writable_dir(&primary) {
@@ -56,13 +58,16 @@ pub fn staging_root(upload_base: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn configured_upload_base_gets_hidden_staging_child() {
-        let dir = tempdir().unwrap();
-        let root = staging_root(dir.path()).unwrap();
+    fn configured_upload_base_gets_hidden_staging_child() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let root = staging_root(dir.path()).test_value()?;
         assert_eq!(root, dir.path().join(STAGING_DIRNAME));
         assert!(root.is_dir());
+
+        Ok(())
     }
 }

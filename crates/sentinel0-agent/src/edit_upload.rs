@@ -30,6 +30,8 @@ fn upload_dir(policy: &Policy, upload_id: &str) -> Result<PathBuf, HandlerError>
     Ok(dir)
 }
 
+/// # Errors
+/// Returns an error when the staging area cannot be prepared.
 pub fn init(policy: &Policy) -> HandlerResult {
     let upload_id = format!(
         "{:016x}{:016x}",
@@ -46,6 +48,8 @@ pub fn init(policy: &Policy) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the upload payload is invalid or the staged file cannot be written.
 pub fn file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let upload_id = require_str(payload, "upload_id")?;
     let role = require_str(payload, "role")?;
@@ -99,6 +103,8 @@ pub fn file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the staged edit cannot be validated or finalized safely.
 pub fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let upload_id = require_str(payload, "upload_id")?;
     let mode = require_str(payload, "mode")?;
@@ -160,13 +166,14 @@ pub fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult 
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn chunked_write_flows_through_native_editor() {
-        let dir = tempdir().unwrap();
+    fn chunked_write_flows_through_native_editor() -> TestResult {
+        let dir = tempdir().test_value()?;
         let target = dir.path().join("x.txt");
-        fs::write(&target, "before").unwrap();
+        fs::write(&target, "before").test_value()?;
         let policy = Policy {
             upload_base: dir.path().join("uploads"),
             file_ops_paths: vec![FileOpsPath {
@@ -175,8 +182,8 @@ mod tests {
             }],
             ..Policy::default()
         };
-        let init = init(&policy).unwrap();
-        let id = init["upload_id"].as_str().unwrap();
+        let init = init(&policy).test_value()?;
+        let id = init["upload_id"].as_str().test_value()?;
         file(
             &policy,
             &Map::from_iter([
@@ -185,7 +192,7 @@ mod tests {
                 ("content".into(), Value::String("after".into())),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         let result = complete(
             &policy,
             &Map::from_iter([
@@ -194,8 +201,10 @@ mod tests {
                 ("mode".into(), Value::String("write".into())),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["ok"], true);
-        assert_eq!(fs::read_to_string(target).unwrap(), "after");
+        assert_eq!(fs::read_to_string(target).test_value()?, "after");
+
+        Ok(())
     }
 }

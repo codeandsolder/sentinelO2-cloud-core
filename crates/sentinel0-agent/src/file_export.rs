@@ -56,8 +56,7 @@ fn sweep(map: &mut SessionMap) {
     map.retain(|_, session| {
         session
             .lock()
-            .map(|session| session.created_at.elapsed() <= SESSION_TTL)
-            .unwrap_or(false)
+            .is_ok_and(|session| session.created_at.elapsed() <= SESSION_TTL)
     });
 }
 
@@ -75,6 +74,8 @@ fn ensure_session_capacity(map: &SessionMap, transfer_id: &str) -> Result<(), Ha
     ))
 }
 
+/// # Errors
+/// Returns an error when the requested export path is invalid, disallowed, or unreadable.
 pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let transfer_id = valid_transfer_id(payload)?;
     let source = require_str(payload, "source_path")?;
@@ -135,12 +136,14 @@ pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         hasher: Sha256::new(),
         next_index: 0,
     };
-    let mut map = sessions()
-        .lock()
-        .map_err(|_| HandlerError::new("internal_error", "export session lock poisoned"))?;
-    sweep(&mut map);
-    ensure_session_capacity(&map, &transfer_id)?;
-    map.insert(transfer_id.clone(), Arc::new(Mutex::new(session)));
+    {
+        let mut map = sessions()
+            .lock()
+            .map_err(|_| HandlerError::new("internal_error", "export session lock poisoned"))?;
+        sweep(&mut map);
+        ensure_session_capacity(&map, &transfer_id)?;
+        map.insert(transfer_id.clone(), Arc::new(Mutex::new(session)));
+    }
 
     Ok(BTreeMap::from([
         ("transfer_id".into(), Value::String(transfer_id)),
@@ -155,6 +158,8 @@ pub fn init(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+/// # Errors
+/// Returns an error when the export session is invalid or the requested chunk cannot be read.
 pub async fn chunk(payload: &Map<String, Value>) -> Result<ExportChunk, HandlerError> {
     let transfer_id = valid_transfer_id(payload)?;
     let index = payload
@@ -219,6 +224,7 @@ pub async fn chunk(payload: &Map<String, Value>) -> Result<ExportChunk, HandlerE
             session.next_index += 1;
         }
         let eof = index + 1 >= session.num_chunks;
+        drop(session);
         Ok::<_, HandlerError>((data, eof, count))
     })
     .await
@@ -232,13 +238,18 @@ pub async fn chunk(payload: &Map<String, Value>) -> Result<ExportChunk, HandlerE
         result: BTreeMap::from([
             ("transfer_id".into(), Value::String(transfer_id)),
             ("chunk_index".into(), Value::from(index)),
-            ("bytes".into(), Value::from(bytes as u64)),
+            (
+                "bytes".into(),
+                Value::from(u64::try_from(bytes).unwrap_or(u64::MAX)),
+            ),
             ("eof".into(), Value::Bool(eof)),
         ]),
         binary_frame,
     })
 }
 
+/// # Errors
+/// Returns an error when the export session is invalid or cannot be finalized.
 pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
     let transfer_id = valid_transfer_id(payload)?;
     let session = {
@@ -259,13 +270,8 @@ pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
         .map_err(|_| HandlerError::new("internal_error", "export session lock poisoned"))?;
     let complete = session.next_index == session.num_chunks;
     let digest = complete.then(|| {
-        session
-            .hasher
-            .clone()
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+        let digest = session.hasher.clone().finalize();
+        crate::hex_lower(digest.as_ref())
     });
 
     Ok(BTreeMap::from([
@@ -273,10 +279,7 @@ pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
         ("size".into(), Value::from(session.size)),
         ("chunks_read".into(), Value::from(session.next_index)),
         ("num_chunks".into(), Value::from(session.num_chunks)),
-        (
-            "sha256".into(),
-            digest.map(Value::String).unwrap_or(Value::Null),
-        ),
+        ("sha256".into(), digest.map_or(Value::Null, Value::String)),
         ("sha256_complete".into(), Value::Bool(complete)),
         ("filename".into(), Value::String(session.filename.clone())),
     ]))
@@ -286,10 +289,11 @@ pub fn complete(payload: &Map<String, Value>) -> HandlerResult {
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn export_session_store_is_bounded_but_replacement_is_allowed() {
+    fn export_session_store_is_bounded_but_replacement_is_allowed() -> TestResult {
         let session = Arc::new(Mutex::new(ExportSession {
             path: PathBuf::from("/tmp/x"),
             size: 0,
@@ -304,16 +308,19 @@ mod tests {
         for index in 0..MAX_EXPORT_SESSIONS {
             map.insert(format!("{index:032x}"), Arc::clone(&session));
         }
-        let error = ensure_session_capacity(&map, "ffffffffffffffffffffffffffffffff").unwrap_err();
+        let error =
+            ensure_session_capacity(&map, "ffffffffffffffffffffffffffffffff").test_error()?;
         assert_eq!(error.code, "busy");
         assert!(ensure_session_capacity(&map, &format!("{:032x}", 0)).is_ok());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn export_hashes_only_in_order_and_returns_binary_payload() {
-        let dir = tempdir().unwrap();
+    async fn export_hashes_only_in_order_and_returns_binary_payload() -> TestResult {
+        let dir = tempdir().test_value()?;
         let source = dir.path().join("x.bin");
-        fs::write(&source, b"abcdef").unwrap();
+        fs::write(&source, b"abcdef").test_value()?;
         let policy = Policy {
             file_ops_paths: vec![FileOpsPath {
                 path: dir.path().to_owned(),
@@ -333,7 +340,7 @@ mod tests {
                 ("chunk_size".into(), Value::from(3)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(start["num_chunks"], 2);
 
         let first = chunk(&Map::from_iter([
@@ -341,8 +348,8 @@ mod tests {
             ("chunk_index".into(), Value::from(0)),
         ]))
         .await
-        .unwrap();
-        let frame = sentinel0_proto::decode_binary_frame(&first.binary_frame).unwrap();
+        .test_value()?;
+        let frame = sentinel0_proto::decode_binary_frame(&first.binary_frame).test_value()?;
         assert_eq!(frame.payload, b"abc");
         assert_eq!(first.result["chunk_index"], 0);
 
@@ -351,13 +358,15 @@ mod tests {
             ("chunk_index".into(), Value::from(1)),
         ]))
         .await
-        .unwrap();
+        .test_value()?;
         let done = complete(&Map::from_iter([(
             "transfer_id".into(),
             Value::String(transfer_id.into()),
         )]))
-        .unwrap();
+        .test_value()?;
         assert_eq!(done["sha256_complete"], true);
         assert_eq!(done["chunks_read"], 2);
+
+        Ok(())
     }
 }

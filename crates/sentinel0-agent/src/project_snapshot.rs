@@ -42,8 +42,9 @@ async fn cleanup_git_child(
     #[cfg(unix)]
     if should_kill {
         if let Some(pid) = pid {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            if let Err(error) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+            let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
+            if let Err(error) =
+                nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
                 && error != nix::errno::Errno::ESRCH
             {
                 let message = format!("failed killing project-snapshot git process group: {error}");
@@ -298,6 +299,24 @@ fn sum_numstat(raw: &[u8]) -> (u64, u64, u64) {
     (files, ins, dels)
 }
 
+fn parse_recent_commits(raw: &[u8]) -> Vec<Value> {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('\x1f').collect::<Vec<_>>();
+            (fields.len() == 4).then(|| {
+                json!({
+                    "hash": fields[0],
+                    "subject": fields[1].chars().take(120).collect::<String>(),
+                    "author": fields[2],
+                    "date": fields[3],
+                })
+            })
+        })
+        .take(MAX_RECENT_COMMITS)
+        .collect()
+}
+
 async fn git_snapshot(
     policy: &Policy,
     root: &Path,
@@ -345,24 +364,10 @@ async fn git_snapshot(
         ],
     )
     .await?;
-    if log_rc != 0 && !status.get("head").is_some_and(|head| head.is_null()) {
+    if log_rc != 0 && !status.get("head").is_some_and(serde_json::Value::is_null) {
         require_git_success("log", log_rc, &log_err)?;
     }
-    let commits = String::from_utf8_lossy(&log_raw)
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split('\x1f').collect::<Vec<_>>();
-            (fields.len() == 4).then(|| {
-                json!({
-                    "hash": fields[0],
-                    "subject": fields[1].chars().take(120).collect::<String>(),
-                    "author": fields[2],
-                    "date": fields[3],
-                })
-            })
-        })
-        .take(MAX_RECENT_COMMITS)
-        .collect::<Vec<_>>();
+    let commits = parse_recent_commits(&log_raw);
 
     Ok(BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
@@ -491,6 +496,8 @@ async fn directory_snapshot_async(root: std::path::PathBuf) -> HandlerResult {
         })?
 }
 
+/// # Errors
+/// Returns an error when the snapshot request is invalid, disallowed, times out, or fails.
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let requested = require_str(payload, "path")?;
     let root = policy.resolve_path(requested, false).ok_or_else(|| {
@@ -532,13 +539,14 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn plain_directory_gets_bounded_summary() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.rs"), "fn main(){}").unwrap();
-        fs::create_dir(dir.path().join("src")).unwrap();
+    async fn plain_directory_gets_bounded_summary() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.rs"), "fn main(){}").test_value()?;
+        fs::create_dir(dir.path().join("src")).test_value()?;
         let policy = Policy {
             file_ops_paths: vec![FileOpsPath {
                 path: dir.path().to_owned(),
@@ -554,9 +562,11 @@ mod tests {
             )]),
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["kind"], "directory");
         assert_eq!(result["repository"]["file_count"], 1);
+
+        Ok(())
     }
 
     #[test]
