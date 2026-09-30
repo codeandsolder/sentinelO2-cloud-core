@@ -1029,7 +1029,7 @@ mod tests {
         let file = dir.path().join("big.txt");
         let mut body = String::new();
         for line in 1..=1_200 {
-            write!(&mut body, "line {line:04} {}\n", "x".repeat(90)).test_value()?;
+            writeln!(&mut body, "line {line:04} {}", "x".repeat(90)).test_value()?;
         }
         fs::write(&file, body).test_value()?;
 
