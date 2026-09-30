@@ -6,7 +6,21 @@ PRUNER="$HERE/cargo-target-prune"
 SOURCE_PRUNER="$HERE/cargo-source-prune"
 WRAPPER="$HERE/cargo"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+
+cleanup() {
+    # Detached maintenance may still be in the small fork/exec window when the
+    # foreground wrapper returns. Retry cleanup rather than racing a helper
+    # creating/removing files inside the temporary source pool.
+    set +e
+    for _ in $(seq 1 100); do
+        rm -rf -- "$tmp" 2>/dev/null
+        [[ ! -e "$tmp" ]] && return 0
+        sleep 0.05
+    done
+    echo "warning: test cleanup could not fully remove $tmp after detached maintenance" >&2
+    rm -rf -- "$tmp" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 make_target() {
     local dir="$1"
@@ -268,18 +282,18 @@ set -e
 [[ -z "$(find "$wrapper_root" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]]
 [[ ! -e "$workspace/target" ]]
 
-# Idle warm source remains reclaimable by detached/periodic maintenance.
-slot="$source_root/uid-$(id -u)"
-# Drain maintenance spawned by previous wrapper calls before manipulating the
-# test timestamps explicitly.
-exec 10>"$slot/.prune.lock"
-flock -x 10
-flock -u 10
-exec 10>&-
+# Test source-pruner semantics in a separate pool. Wrapper integration above
+# intentionally launches detached maintenance, so reusing that same slot here
+# would make an explicit maintenance call legitimately coalesce with an older
+# background pass.
+maintenance_source_root="$tmp/maintenance-sources"
+slot="$maintenance_source_root/uid-$(id -u)"
+mkdir -p "$slot/src"
 printf 'old\n' >"$slot/src/old-file"
 touch -d '@1' "$slot/.last-used"
 idle_conf="$tmp/idle.conf"
 cp "$wrapper_conf" "$idle_conf"
+printf '%s\n' "SENTINELX_CARGO_SOURCE_TMP_ROOT=$maintenance_source_root" >>"$idle_conf"
 printf '%s\n' 'SENTINELX_CARGO_SOURCE_MAX_IDLE_SECONDS=1' >>"$idle_conf"
 printf '%s\n' 'SENTINELX_CARGO_SOURCE_PRUNE_INTERVAL_SECONDS=0' >>"$idle_conf"
 SENTINELX_BUILD_SCRATCH_CONF="$idle_conf" "$SOURCE_PRUNER"
@@ -290,6 +304,7 @@ SENTINELX_BUILD_SCRATCH_CONF="$idle_conf" "$SOURCE_PRUNER"
 printf 'oversized\n' >"$slot/src/oversized"
 source_cap_conf="$tmp/source-cap.conf"
 cp "$wrapper_conf" "$source_cap_conf"
+printf '%s\n' "SENTINELX_CARGO_SOURCE_TMP_ROOT=$maintenance_source_root" >>"$source_cap_conf"
 printf '%s\n' 'SENTINELX_CARGO_SOURCE_MAX_BYTES=1' >>"$source_cap_conf"
 printf '%s\n' 'SENTINELX_CARGO_SOURCE_MAX_IDLE_SECONDS=86400' >>"$source_cap_conf"
 printf '%s\n' 'SENTINELX_CARGO_SOURCE_PRUNE_INTERVAL_SECONDS=0' >>"$source_cap_conf"
