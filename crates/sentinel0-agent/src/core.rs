@@ -11,6 +11,7 @@ use num_traits::ToPrimitive;
 use sentinel0_proto::{Message, Op};
 use serde_json::{Map, Value, json};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -21,9 +22,9 @@ const MAX_CONCURRENT_SCANS: usize = 4;
 static SCAN_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS)));
 
-fn decode_exec_command(command: &str) -> Result<Option<String>, HandlerError> {
+fn decode_exec_command(command: &str) -> Result<Cow<'_, str>, HandlerError> {
     let Some(encoded) = command.strip_prefix("b64,") else {
-        return Ok(None);
+        return Ok(Cow::Borrowed(command));
     };
 
     let bytes = STANDARD.decode(encoded).map_err(|error| {
@@ -38,7 +39,7 @@ fn decode_exec_command(command: &str) -> Result<Option<String>, HandlerError> {
             format!("b64 command payload is not valid UTF-8: {error}"),
         )
     })?;
-    Ok(Some(decoded))
+    Ok(Cow::Owned(decoded))
 }
 
 #[derive(Clone)]
@@ -759,9 +760,8 @@ impl CoreDispatcher {
     }
 
     async fn exec(&self, payload: &Map<String, Value>) -> HandlerResult {
-        let raw_command = require_str(payload, "command")?;
-        let decoded_command = decode_exec_command(raw_command)?;
-        let command = decoded_command.as_deref().unwrap_or(raw_command);
+        let command = decode_exec_command(require_str(payload, "command")?)?;
+        let command = command.as_ref();
         let timeout_secs = payload
             .get("timeout")
             .and_then(Value::as_f64)
@@ -1349,11 +1349,11 @@ mod tests {
     #[test]
     fn exec_b64_command_decodes_utf8_and_leaves_plain_commands_unchanged() -> TestResult {
         let plain = "printf 'hello\\n'";
-        assert_eq!(decode_exec_command(plain)?, None);
+        assert_eq!(decode_exec_command(plain)?.as_ref(), plain);
 
         let encoded = STANDARD.encode(plain);
         let decoded = decode_exec_command(&format!("b64,{encoded}"))?;
-        assert_eq!(decoded.as_deref(), Some(plain));
+        assert_eq!(decoded.as_ref(), plain);
         Ok(())
     }
 
