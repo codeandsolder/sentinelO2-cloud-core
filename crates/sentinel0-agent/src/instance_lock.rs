@@ -142,7 +142,7 @@ mod tests {
             std::process::id().to_string()
         );
 
-        match acquire_path(path.clone()) {
+        match acquire_path(path) {
             Err(InstanceLockError::AlreadyRunning { holder, .. }) => {
                 assert_eq!(holder, Some(std::process::id()));
             }
