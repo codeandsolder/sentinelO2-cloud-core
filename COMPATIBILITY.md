@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.23.1 behavior at reviewed upstream commit
-  `1edee15d9255c1a000e71536ee0d28433b760884`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.23.2 behavior at reviewed upstream commit
+  `3c84e50ad4f2a40f5f7e683d33841dbc36b75fd7`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -149,6 +149,14 @@ Reference surfaces:
   a final symlink. Recursive copies preserve symlinks, and cross-filesystem
   copy/move stages and fsyncs the replacement before committing it.
 - Search reports Unicode character columns and also exposes `byte_column`.
+- Upstream 0.23.2 scan lifetime semantics are matched without copying Python's
+  executor implementation: list/search scans have a 50 s cooperative budget
+  and return partial results with `truncated_reason=time_budget`; result caps
+  report `max_entries`/`max_results`. At most four list/search workers may
+  occupy Tokio's blocking pool concurrently. The permit is owned by the
+  blocking task itself, so a caller timeout cannot free the slot while an
+  abandoned scan is still running, while ordinary reads never consume a scan
+  permit and remain responsive behind scan load.
 - Trusted `file_url` connections are pinned to the exact public DNS answers
   vetted by the SSRF check, closing the check/connect second-lookup race.
 - Local audit stores request key names and approximate size, not request values;
