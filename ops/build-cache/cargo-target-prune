@@ -5,9 +5,11 @@ CONF="${SENTINELX_BUILD_SCRATCH_CONF:-/etc/sentinelx/build-scratch.conf}"
 [[ -r "$CONF" ]] && . "$CONF"
 
 ROOT="${SENTINELX_CARGO_TARGET_ROOT:-/var/cache/sentinelx/cargo-target}"
+LOCK_ROOT="${SENTINELX_CARGO_TARGET_LOCK_ROOT:-$ROOT/../cargo-target-locks}"
 MAX="${SENTINELX_CARGO_TARGET_MAX_BYTES:-4294967296}"
 
 [[ -d "$ROOT" ]] || exit 0
+mkdir -p "$LOCK_ROOT"
 exec 8>"$ROOT/../.cargo-target-prune.lock"
 flock -n 8 || exit 0
 
@@ -35,9 +37,11 @@ total="$(size)"
 
 while IFS= read -r dir; do
     [[ -d "$dir" ]] || continue
-    lock="$dir/.sentinelx-build.lock"
+    lock="$LOCK_ROOT/$(basename "$dir").lock"
 
-    # Delete only if no Cargo wrapper currently holds the workspace lock.
+    # The lifetime lock is external to the disposable target. Holding the
+    # exclusive lock across rm -rf prevents a new wrapper from creating a new
+    # lock inode while deletion is still in progress.
     if flock -n "$lock" rm -rf -- "$dir"; then
         total="$(size)"
         (( total <= MAX )) && break
