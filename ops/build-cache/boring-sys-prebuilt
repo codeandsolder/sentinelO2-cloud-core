@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "usage: $0 <project-dir> [feature-key] [seed-boring-sys-out-dir]" >&2
+    exit 2
+}
+
+PROJECT=${1:-}
+FEATURE_KEY=${2:-default}
+SEED_OUT=${3:-}
+
+[[ -n "$PROJECT" && -f "$PROJECT/Cargo.lock" ]] || usage
+[[ "$FEATURE_KEY" =~ ^[A-Za-z0-9_,.+-]+$ ]] || {
+    echo "boring-sys-prebuilt: unsupported feature key: $FEATURE_KEY" >&2
+    exit 2
+}
+
+CACHE_ROOT=${BORING_BSSL_CACHE_ROOT:-${SENTINELX_BORING_SYS_CACHE_ROOT:-/srv/scratch/toolchains/boring-sys-prebuilt}}
+BUILD_ROOT=${SENTINELX_BORING_SYS_BUILD_ROOT:-/srv/scratch/toolchains/boring-sys-build}
+CARGO_WRAPPER=${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/libexec/sentinelx-bin/cargo}
+RUST_TOOLCHAIN=${SENTINELX_RUST_TOOLCHAIN:-1.98.1}
+mkdir -p "$CACHE_ROOT" "$BUILD_ROOT"
+
+lock_entry="$(
+    awk '
+        function unquote(s) {
+            sub(/^"/, "", s)
+            sub(/"$/, "", s)
+            return s
+        }
+        function finish_package() {
+            if (name == "boring-sys") {
+                count++
+                found_version = version
+                found_checksum = checksum
+            }
+        }
+        /^\[\[package\]\]$/ {
+            if (in_package) finish_package()
+            in_package = 1
+            name = version = checksum = ""
+            next
+        }
+        in_package && $1 == "name" && $2 == "=" { name = unquote($3) }
+        in_package && $1 == "version" && $2 == "=" { version = unquote($3) }
+        in_package && $1 == "checksum" && $2 == "=" { checksum = unquote($3) }
+        END {
+            if (in_package) finish_package()
+            if (count != 1 || found_version == "" || found_checksum == "") exit 2
+            print found_version, found_checksum
+        }
+    ' "$PROJECT/Cargo.lock"
+)" || {
+    echo "boring-sys-prebuilt: expected exactly one checksummed boring-sys package in $PROJECT/Cargo.lock" >&2
+    exit 2
+}
+read -r VERSION CHECKSUM <<<"$lock_entry"
+
+TARGET=${BORING_BSSL_TARGET:-x86_64-unknown-linux-gnu}
+TARGET_US=${TARGET//-/_}
+CC_BIN=${CC_x86_64_unknown_linux_gnu:-${HOST_CC:-${CC:-/usr/bin/cc}}}
+CXX_BIN=${CXX_x86_64_unknown_linux_gnu:-${HOST_CXX:-${CXX:-/usr/bin/c++}}}
+CC_PATH="$(command -v "$CC_BIN")"
+CXX_PATH="$(command -v "$CXX_BIN")"
+AS_PATH="$(command -v "${AS:-as}")"
+AR_PATH="$(command -v "${AR:-ar}")"
+CMAKE_PATH="$(command -v "${CMAKE:-cmake}")"
+
+tool_id() {
+    local p
+    p="$(readlink -f "$1")"
+    printf '%s@%s' "$p" "$(stat -Lc '%d:%i:%s:%Y' "$p")"
+}
+
+env_value() {
+    printenv "$1" 2>/dev/null || true
+}
+
+CC_ID="$(tool_id "$CC_PATH")"
+CXX_ID="$(tool_id "$CXX_PATH")"
+AS_ID="$(tool_id "$AS_PATH")"
+AR_ID="$(tool_id "$AR_PATH")"
+CMAKE_ID="$(tool_id "$CMAKE_PATH")"
+
+key_material="$(
+    printf '%s\n' \
+        "boring-sys-version=$VERSION" \
+        "boring-sys-checksum=$CHECKSUM" \
+        "features=$FEATURE_KEY" \
+        "target=$TARGET" \
+        "profile=release" \
+        "cc=$CC_ID" \
+        "cxx=$CXX_ID" \
+        "as=$AS_ID" \
+        "ar=$AR_ID" \
+        "cmake=$CMAKE_ID" \
+        "cflags=${CFLAGS:-}" \
+        "cflags-target=$(env_value "CFLAGS_$TARGET")" \
+        "cflags-target-us=$(env_value "CFLAGS_$TARGET_US")" \
+        "cxxflags=${CXXFLAGS:-}" \
+        "cxxflags-target=$(env_value "CXXFLAGS_$TARGET")" \
+        "cxxflags-target-us=$(env_value "CXXFLAGS_$TARGET_US")" \
+        "rustflags=${RUSTFLAGS:-}" \
+        "rustflags-target=$(env_value "CARGO_TARGET_${TARGET_US^^}_RUSTFLAGS")" \
+        "cmake-toolchain=${CMAKE_TOOLCHAIN_FILE:-}" \
+        "boring-sysroot=${BORING_BSSL_SYSROOT:-}" \
+        "boring-external-toolchain=${BORING_BSSL_COMPILER_EXTERNAL_TOOLCHAIN:-}" \
+        "release-opt=${CARGO_PROFILE_RELEASE_OPT_LEVEL:-3}" \
+        "release-debug=${CARGO_PROFILE_RELEASE_DEBUG:-false}"
+)"
+key="$(printf '%s' "$key_material" | sha256sum | cut -c1-20)"
+dest="$CACHE_ROOT/boring-sys-$VERSION-$FEATURE_KEY-$TARGET-$key"
+lock="$CACHE_ROOT/.boring-sys-$key.lock"
+
+complete() {
+    [[ -f "$dest/lib/libcrypto.a" ]] &&
+        [[ -f "$dest/lib/libssl.a" ]] &&
+        [[ -f "$dest/include/openssl/x509v3.h" ]] &&
+        [[ -f "$dest/MANIFEST.txt" ]] &&
+        [[ -f "$dest/SHA256SUMS" ]]
+}
+
+if complete; then
+    printf '%s\n' "$dest"
+    exit 0
+fi
+
+exec 9>"$lock"
+flock -x 9
+if complete; then
+    printf '%s\n' "$dest"
+    exit 0
+fi
+
+stage="$(mktemp -d "$CACHE_ROOT/.stage-$key-XXXXXX")"
+work=""
+cleanup() {
+    rc=$?
+    [[ -z "$work" ]] || rm -rf -- "$work"
+    rm -rf -- "$stage"
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM HUP
+
+mkdir -p "$stage/lib"
+
+feature_enabled() {
+    local want=$1 item
+    IFS=',' read -r -a feature_items <<<"$FEATURE_KEY"
+    for item in "${feature_items[@]}"; do
+        [[ "$item" == "$want" ]] && return 0
+    done
+    return 1
+}
+
+if [[ -n "$SEED_OUT" ]]; then
+    [[ -f "$SEED_OUT/build/libcrypto.a" && -f "$SEED_OUT/build/libssl.a" ]] || {
+        echo "boring-sys-prebuilt: seed OUT_DIR is incomplete: $SEED_OUT" >&2
+        exit 3
+    }
+    [[ -f "$SEED_OUT/boringssl/include/openssl/x509v3.h" ]] || {
+        echo "boring-sys-prebuilt: seed OUT_DIR lacks patched headers: $SEED_OUT" >&2
+        exit 3
+    }
+    cp -a "$SEED_OUT/build/libcrypto.a" "$stage/lib/"
+    cp -a "$SEED_OUT/build/libssl.a" "$stage/lib/"
+    if feature_enabled fips; then
+        [[ -f "$SEED_OUT/build/bcm.o" ]] || {
+            echo "boring-sys-prebuilt: FIPS seed is missing bcm.o" >&2
+            exit 3
+        }
+        cp -a "$SEED_OUT/build/bcm.o" "$stage/lib/"
+    fi
+    cp -a "$SEED_OUT/boringssl/include" "$stage/"
+else
+    work="$(mktemp -d "$BUILD_ROOT/bssl-prebuilt-$key-XXXXXX")"
+    mkdir -p "$work/project/src" "$work/install"
+
+    features_toml=""
+    if [[ "$FEATURE_KEY" != default ]]; then
+        IFS=',' read -r -a feature_items <<<"$FEATURE_KEY"
+        feature_list=""
+        for item in "${feature_items[@]}"; do
+            [[ -n "$item" ]] || continue
+            [[ -z "$feature_list" ]] || feature_list+=", "
+            feature_list+="\"$item\""
+        done
+        features_toml=", default-features = false, features = [$feature_list]"
+    fi
+
+    cat >"$work/project/Cargo.toml" <<EOF
+[package]
+name = "sentinelx-boringssl-prebuild"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+boring-sys = { version = "=$VERSION"$features_toml }
+EOF
+    printf '%s\n' '#![allow(dead_code)]' >"$work/project/src/lib.rs"
+
+    export CC="$CC_PATH"
+    export CXX="$CXX_PATH"
+    export CMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER:-/usr/local/libexec/sccache-client}
+    export CMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER:-/usr/local/libexec/sccache-client}
+
+    # This cache is keyed to the crate's bundled/patched BoringSSL source. Do
+    # not let a caller's prebuilt/source override leak into first generation.
+    unset BORING_BSSL_PATH BORING_BSSL_INCLUDE_PATH BORING_BSSL_SOURCE_PATH BORING_BSSL_ASSUME_PATCHED
+    unset BORING_BSSL_FIPS_PATH BORING_BSSL_FIPS_INCLUDE_PATH BORING_BSSL_FIPS_SOURCE_PATH BORING_BSSL_FIPS_ASSUME_PATCHED
+
+    if feature_enabled fips; then
+        export BORING_BSSL_FIPS_INSTALL_DIR="$work/install"
+        unset BORING_BSSL_INSTALL_DIR
+    else
+        export BORING_BSSL_INSTALL_DIR="$work/install"
+        unset BORING_BSSL_FIPS_INSTALL_DIR
+    fi
+
+    (
+        cd "$work/project"
+        # Use the site wrapper so cache generation gets the managed registry
+        # source pool, package-cache policy, native sccache launcher and target
+        # reclamation. A new crate version may fetch its archive once.
+        "$CARGO_WRAPPER" +"$RUST_TOOLCHAIN" build --release
+    )
+    cp -a "$work/install"/. "$stage"/
+fi
+
+cat >"$stage/MANIFEST.txt" <<EOF
+$key_material
+cache-key=$key
+created-utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+seed-out=$SEED_OUT
+EOF
+(
+    cd "$stage"
+    sha256sum lib/libcrypto.a lib/libssl.a >SHA256SUMS
+    [[ ! -f lib/bcm.o ]] || sha256sum lib/bcm.o >>SHA256SUMS
+)
+rm -rf -- "$dest"
+mv "$stage" "$dest"
+stage=""
+trap - EXIT INT TERM HUP
+[[ -z "$work" ]] || rm -rf -- "$work"
+printf '%s\n' "$dest"
