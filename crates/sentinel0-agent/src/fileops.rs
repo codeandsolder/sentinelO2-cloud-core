@@ -834,6 +834,7 @@ mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use std::fmt::Write as _;
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -1028,7 +1029,7 @@ mod tests {
         let file = dir.path().join("big.txt");
         let mut body = String::new();
         for line in 1..=1_200 {
-            body.push_str(&format!("line {line:04} {}\n", "x".repeat(90)));
+            write!(&mut body, "line {line:04} {}\n", "x".repeat(90)).test_value()?;
         }
         fs::write(&file, body).test_value()?;
 
@@ -1066,7 +1067,7 @@ mod tests {
         .test_value()?;
 
         assert_eq!(result["encoding"], "binary");
-        assert!(result.get("content").is_none());
+        assert!(!result.contains_key("content"));
         assert!(
             result["preview_hex"]
                 .as_str()
