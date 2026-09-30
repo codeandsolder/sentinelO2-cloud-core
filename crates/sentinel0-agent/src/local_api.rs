@@ -611,11 +611,16 @@ where
     }
 }
 
-async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
+struct HttpHead {
+    status: u16,
+    content_length: Option<usize>,
+    chunked: bool,
+}
+
+async fn read_http_head(reader: &mut BufReader<UnixStream>) -> Result<HttpHead, HandlerError> {
     const MAX_HEADER_BYTES: usize = 128 * 1024;
     const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
 
-    let mut reader = BufReader::new(stream);
     let mut header = Vec::new();
     loop {
         let remaining = MAX_HEADER_BYTES.saturating_sub(header.len());
@@ -623,7 +628,7 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
             return Err(HandlerError::new("too_large", "HTTP headers exceeded cap"));
         }
         let line = read_until_bounded(
-            &mut reader,
+            reader,
             b'\n',
             remaining.min(MAX_HEADER_LINE_BYTES),
             "HTTP header line",
@@ -655,7 +660,6 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
                 format!("unparseable HTTP status: {status_line:?}"),
             )
         })?;
-
     let mut content_length = None;
     let mut chunked = false;
     for line in lines {
@@ -683,70 +687,91 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
             chunked = true;
         }
     }
+    Ok(HttpHead {
+        status,
+        content_length,
+        chunked,
+    })
+}
 
-    let body = if chunked {
-        let mut body = Vec::new();
-        loop {
-            let size_line =
-                read_until_bounded(&mut reader, b'\n', 8192, "HTTP chunk-size line").await?;
-            if size_line.is_empty() {
-                return Err(HandlerError::new(
-                    "bad_response",
-                    "endpoint closed before chunk size",
-                ));
-            }
-            let size_line = String::from_utf8_lossy(&size_line);
-            let size_text = size_line.trim().split(';').next().unwrap_or("0");
-            let size = usize::from_str_radix(size_text, 16)
-                .map_err(|_| HandlerError::new("bad_response", "invalid chunk size"))?;
-            if size == 0 {
-                let mut trailer_bytes = 0_usize;
-                loop {
-                    let trailer =
-                        read_until_bounded(&mut reader, b'\n', 16 * 1024, "HTTP trailer line")
-                            .await?;
-                    if trailer.is_empty() {
-                        return Err(HandlerError::new(
-                            "bad_response",
-                            "endpoint closed inside HTTP trailers",
-                        ));
-                    }
-                    trailer_bytes = trailer_bytes.saturating_add(trailer.len());
-                    if trailer_bytes > MAX_HEADER_BYTES {
-                        return Err(HandlerError::new("too_large", "HTTP trailers exceeded cap"));
-                    }
-                    if trailer == b"\r\n" || trailer == b"\n" {
-                        break;
-                    }
-                }
-                break;
-            }
-            if body.len().saturating_add(size) > MAX_RESPONSE_BYTES {
-                return Err(HandlerError::new(
-                    "too_large",
-                    "endpoint response exceeded the cap",
-                ));
-            }
-            let start = body.len();
-            body.resize(start + size, 0);
-            reader
-                .read_exact(&mut body[start..])
-                .await
-                .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-            let mut crlf = [0_u8; 2];
-            reader
-                .read_exact(&mut crlf)
-                .await
-                .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-            if crlf != *b"\r\n" {
-                return Err(HandlerError::new(
-                    "bad_response",
-                    "chunk payload was not followed by CRLF",
-                ));
-            }
+async fn read_http_trailers(reader: &mut BufReader<UnixStream>) -> Result<(), HandlerError> {
+    const MAX_HEADER_BYTES: usize = 128 * 1024;
+    let mut trailer_bytes = 0_usize;
+    loop {
+        let trailer = read_until_bounded(reader, b'\n', 16 * 1024, "HTTP trailer line").await?;
+        if trailer.is_empty() {
+            return Err(HandlerError::new(
+                "bad_response",
+                "endpoint closed inside HTTP trailers",
+            ));
         }
-        body
-    } else if let Some(length) = content_length {
+        trailer_bytes = trailer_bytes.saturating_add(trailer.len());
+        if trailer_bytes > MAX_HEADER_BYTES {
+            return Err(HandlerError::new("too_large", "HTTP trailers exceeded cap"));
+        }
+        if trailer == b"\r\n" || trailer == b"\n" {
+            return Ok(());
+        }
+    }
+}
+
+async fn read_chunked_http_body(
+    reader: &mut BufReader<UnixStream>,
+) -> Result<Vec<u8>, HandlerError> {
+    let mut body = Vec::new();
+    loop {
+        let size_line = read_until_bounded(reader, b'\n', 8192, "HTTP chunk-size line").await?;
+        if size_line.is_empty() {
+            return Err(HandlerError::new(
+                "bad_response",
+                "endpoint closed before chunk size",
+            ));
+        }
+        let size_line = String::from_utf8_lossy(&size_line);
+        let size_text = size_line.trim().split(';').next().unwrap_or("0");
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|_| HandlerError::new("bad_response", "invalid chunk size"))?;
+        if size == 0 {
+            read_http_trailers(reader).await?;
+            return Ok(body);
+        }
+        if body.len().saturating_add(size) > MAX_RESPONSE_BYTES {
+            return Err(HandlerError::new(
+                "too_large",
+                "endpoint response exceeded the cap",
+            ));
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader
+            .read_exact(&mut body[start..])
+            .await
+            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+        let mut crlf = [0_u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .await
+            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+        if crlf
+            != *b"
+"
+        {
+            return Err(HandlerError::new(
+                "bad_response",
+                "chunk payload was not followed by CRLF",
+            ));
+        }
+    }
+}
+
+async fn read_http_payload(
+    reader: &mut BufReader<UnixStream>,
+    head: &HttpHead,
+) -> Result<Vec<u8>, HandlerError> {
+    if head.chunked {
+        return read_chunked_http_body(reader).await;
+    }
+    if let Some(length) = head.content_length {
         if length > MAX_RESPONSE_BYTES {
             return Err(HandlerError::new(
                 "too_large",
@@ -760,29 +785,31 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
                 .await
                 .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
         }
-        body
-    } else {
-        let mut body = Vec::new();
-        let mut limited = reader.take((MAX_RESPONSE_BYTES + 1) as u64);
-        limited
-            .read_to_end(&mut body)
-            .await
-            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(HandlerError::new(
-                "too_large",
-                "endpoint response exceeded the cap",
-            ));
-        }
-        body
-    };
+        return Ok(body);
+    }
 
+    let mut body = Vec::new();
+    let mut limited = reader.take(u64::try_from(MAX_RESPONSE_BYTES + 1).unwrap_or(u64::MAX));
+    limited
+        .read_to_end(&mut body)
+        .await
+        .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(HandlerError::new(
+            "too_large",
+            "endpoint response exceeded the cap",
+        ));
+    }
+    Ok(body)
+}
+
+fn decode_http_payload(status: u16, body: &[u8]) -> Result<Value, HandlerError> {
     if status >= 400 {
         return Err(HandlerError::new(
             "endpoint_error",
             format!(
                 "endpoint answered HTTP {status}: {}",
-                String::from_utf8_lossy(&body)
+                String::from_utf8_lossy(body)
                     .chars()
                     .take(200)
                     .collect::<String>()
@@ -792,9 +819,16 @@ async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
     if body.is_empty() {
         Ok(Value::Null)
     } else {
-        serde_json::from_slice(&body)
+        serde_json::from_slice(body)
             .map_err(|_| HandlerError::new("bad_response", "endpoint did not return JSON"))
     }
+}
+
+async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
+    let mut reader = BufReader::new(stream);
+    let head = read_http_head(&mut reader).await?;
+    let body = read_http_payload(&mut reader, &head).await?;
+    decode_http_payload(head.status, &body)
 }
 
 async fn call_http(
