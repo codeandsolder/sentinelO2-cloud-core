@@ -8,6 +8,7 @@ REAL_CARGO="${SENTINELX_REAL_CARGO:-/usr/local/libexec/cargo-rustup-real}"
 TARGET_ROOT="${SENTINELX_CARGO_TARGET_ROOT:-/var/cache/sentinelx/cargo-target}"
 TARGET_LOCK_ROOT="${SENTINELX_CARGO_TARGET_LOCK_ROOT:-$TARGET_ROOT/../cargo-target-locks}"
 PRUNER="${SENTINELX_CARGO_TARGET_PRUNER:-/usr/local/libexec/sentinelx-bin/cargo-target-prune}"
+SOURCE_PRUNER="${SENTINELX_CARGO_SOURCE_PRUNER:-/usr/local/libexec/sentinelx-bin/cargo-source-prune}"
 SOURCE_TMP_ROOT="${SENTINELX_CARGO_SOURCE_TMP_ROOT:-/var/cache/sentinelx/cargo-source-tmp}"
 INFRA_LOCK="${SENTINELX_CARGO_INFRA_LOCK:-/var/cache/sentinelx/.cargo-infra.lock}"
 MAINTENANCE_MARKER="${SENTINELX_CARGO_MAINTENANCE_MARKER:-/var/cache/sentinelx/.cargo-maintenance}"
@@ -73,50 +74,31 @@ source_prune_checked="$source_slot/.prune-checked"
 mkdir -p "$source_slot"
 exec 8>"$source_slot/.active.lock"
 
-source_pool_bytes() {
-    [[ -d "$source_tmp" ]] || {
-        printf '0\n'
-        return
-    }
-    du -s -B1 "$source_tmp" 2>/dev/null | awk '{print $1+0}'
+spawn_detached() {
+    local cmd="$1"
+    [[ -x "$cmd" ]] || return 0
+
+    # Detached maintenance must never inherit wrapper lifetime locks. setsid -f
+    # forks and returns immediately, so expensive tree walks stay off Cargo's
+    # latency-sensitive path.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -f "$cmd" 7>&- 8>&- 9>&- </dev/null >/dev/null 2>&1 || true
+    else
+        (
+            exec 7>&- 8>&- 9>&-
+            "$cmd" </dev/null >/dev/null 2>&1
+        ) &
+    fi
 }
 
-prune_source_pool() {
-    local max="${SENTINELX_CARGO_SOURCE_MAX_BYTES:-1073741824}"
-    local idle="${SENTINELX_CARGO_SOURCE_MAX_IDLE_SECONDS:-21600}"
-    local interval="${SENTINELX_CARGO_SOURCE_PRUNE_INTERVAL_SECONDS:-300}"
-    local bytes now last checked age
-    now="$(date +%s)"
-    checked=0
-    if [[ -e "$source_prune_checked" ]]; then
-        checked="$(stat -c %Y "$source_prune_checked" 2>/dev/null || echo 0)"
-    fi
-    if (( checked > 0 && interval > 0 && now - checked < interval )); then
-        return
-    fi
-
-    bytes="$(source_pool_bytes)"
-    last=0
-    if [[ -e "$source_last_used" ]]; then
-        last="$(stat -c %Y "$source_last_used" 2>/dev/null || echo 0)"
-    elif [[ -d "$source_tmp" ]]; then
-        last="$(stat -c %Y "$source_tmp" 2>/dev/null || echo 0)"
-    fi
-    age=$(( now - last ))
-
-    if (( bytes > max )) || (( last > 0 && idle > 0 && age > idle )); then
-        rm -rf -- "$source_tmp"
-    fi
-    mkdir -p "$source_tmp"
-    touch "$source_prune_checked" 2>/dev/null || true
+schedule_target_prune() {
+    spawn_detached "$PRUNER"
 }
 
-# If the pool is idle, one entrant may cheaply reclaim an oversized/stale pool.
-# Active Cargo users retain shared access and are never disrupted.
-if flock -n -x 8; then
-    prune_source_pool
-    flock -u 8
-fi
+schedule_source_prune() {
+    spawn_detached "$SOURCE_PRUNER"
+}
+
 flock -s 8
 mkdir -p "$source_tmp"
 export EPHEMERAL_CARGO_REGISTRY_SRC="$source_tmp"
@@ -124,13 +106,7 @@ export EPHEMERAL_CARGO_REGISTRY_SRC="$source_tmp"
 finish_source_pool() {
     touch "$source_last_used" 2>/dev/null || true
     flock -u 8 2>/dev/null || true
-    if flock -n -x 8; then
-        # The just-touched pool cannot age out here, but the hard size cap still
-        # keeps registry extraction bounded on the NVMe tier.
-        prune_source_pool
-        touch "$source_last_used" 2>/dev/null || true
-        flock -u 8 2>/dev/null || true
-    fi
+    schedule_source_prune
 }
 
 compile=0
@@ -185,12 +161,17 @@ touch "$target/.last-used"
 exec 9>"$target_lock"
 flock -s 9
 
-"$PRUNER" >/dev/null 2>&1 || true
-
 min_free="${SENTINELX_NVME_MIN_FREE_BYTES:-3221225472}"
 avail="$(df -B1 --output=avail "$TARGET_ROOT" 2>/dev/null | tail -n1 | tr -d ' ')"
 if [[ "$avail" =~ ^[0-9]+$ ]] && (( avail < min_free )); then
-    echo "cargo: NVMe scratch has only $avail bytes free; reserve is $min_free. Refusing to fill the root filesystem." >&2
+    # Low free space is the one case where synchronous maintenance is worth
+    # blocking Cargo. The current workspace remains protected by its shared
+    # lifetime lock while inactive targets are reclaimed.
+    SENTINELX_CARGO_TARGET_PRUNE_FORCE=1 "$PRUNER" >/dev/null 2>&1 || true
+    avail="$(df -B1 --output=avail "$TARGET_ROOT" 2>/dev/null | tail -n1 | tr -d ' ')"
+fi
+if [[ "$avail" =~ ^[0-9]+$ ]] && (( avail < min_free )); then
+    echo "cargo: NVMe scratch has only $avail bytes free after emergency pruning; reserve is $min_free. Refusing to fill the root filesystem." >&2
     flock -u 9
     finish_source_pool
     exit 75
@@ -255,10 +236,6 @@ cleanup() {
         mirror_final_artifacts || rc=$?
     fi
 
-    # Prune other inactive scratch targets while this workspace remains
-    # protected by its shared external lock.
-    "$PRUNER" >/dev/null 2>&1 || true
-
     flock -u 9 2>/dev/null || true
 
     # Targets are scratch-only even when Cargo fails. sccache retains useful
@@ -272,6 +249,7 @@ cleanup() {
         fi
     fi
 
+    schedule_target_prune
     finish_source_pool
     exit "$rc"
 }
