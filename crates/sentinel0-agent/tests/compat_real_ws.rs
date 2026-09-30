@@ -1,4 +1,7 @@
+mod common;
+
 use chrono::{TimeZone, Utc};
+use common::{TestError as _, TestResult, TestValue as _};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{
     Agent, AgentConfig, AgentError, AuthToken, DispatchResponse, Dispatcher, ReconnectPolicy,
@@ -75,57 +78,56 @@ fn config(addr: std::net::SocketAddr) -> AgentConfig {
 
 async fn accept_agent(
     listener: &TcpListener,
-) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
-    let (stream, _) = listener.accept().await.unwrap();
-    accept_hdr_async(
+) -> TestResult<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>> {
+    let (stream, _) = listener.accept().await.test_value()?;
+    let websocket = accept_hdr_async(
         stream,
         AssertHeaders(|req: &Request| {
             assert_eq!(req.uri().path(), "/agent/connect");
             assert_eq!(
-                req.headers().get("authorization").unwrap(),
-                "Bearer compat-token"
+                req.headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer compat-token")
             );
         }),
     )
     .await
-    .unwrap()
+    .test_value()?;
+    Ok(websocket)
 }
 
 async fn next_non_heartbeat(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-) -> WsMessage {
+) -> TestResult<WsMessage> {
     loop {
-        let frame = ws.next().await.unwrap().unwrap();
+        let frame = ws.next().await.test_value()?.test_value()?;
         if let WsMessage::Text(text) = &frame
             && matches!(
                 serde_json::from_str::<Message>(text),
                 Ok(Message::Ping { .. })
             )
         {
-            ws.send(WsMessage::Text(
-                serde_json::to_string(&Message::Pong {
-                    timestamp: Utc::now(),
-                })
-                .unwrap()
-                .into(),
-            ))
-            .await
-            .unwrap();
+            let pong = serde_json::to_string(&Message::Pong {
+                timestamp: Utc::now(),
+            })
+            .test_value()?;
+            ws.send(WsMessage::Text(pong.into())).await.test_value()?;
             continue;
         }
-        return frame;
+        return Ok(frame);
     }
 }
 
 async fn welcome(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     session: &str,
-) {
-    let WsMessage::Text(hello) = ws.next().await.unwrap().unwrap() else {
-        panic!("expected hello");
+) -> TestResult {
+    let WsMessage::Text(hello) = ws.next().await.test_value()?.test_value()? else {
+        return Err(std::io::Error::other("expected hello").into());
     };
     assert!(matches!(
-        serde_json::from_str::<Message>(&hello).unwrap(),
+        serde_json::from_str::<Message>(&hello).test_value()?,
         Message::Hello {
             preferred_profile: Some(PreferredProfile::Compact),
             ..
@@ -142,19 +144,20 @@ async fn welcome(
         .into(),
     ))
     .await
-    .unwrap();
+    .test_value()?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn enrollment_rejected_is_retryable_and_recovers_without_restart() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn enrollment_rejected_is_retryable_and_recovers_without_restart() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut first = accept_agent(&listener).await;
-        let _hello = first.next().await.unwrap().unwrap();
+        let mut first = accept_agent(&listener).await?;
+        let _hello = first.next().await.test_value()?.test_value()?;
         first
             .send(WsMessage::Text(
                 json!({
@@ -167,31 +170,33 @@ async fn enrollment_rejected_is_retryable_and_recovers_without_restart() {
                 .into(),
             ))
             .await
-            .unwrap();
+            .test_value()?;
         drop(first);
 
-        let mut second = accept_agent(&listener).await;
-        welcome(&mut second, "sess_recovered").await;
+        let mut second = accept_agent(&listener).await?;
+        welcome(&mut second, "sess_recovered").await?;
         server_cancel.cancel();
         let _ = second.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
-    let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
+    let agent = Agent::new(config(addr), UnsupportedDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
         .await
-        .expect("enrollment rejection did not retry")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn other_pre_welcome_error_is_fatal_and_does_not_retry() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn other_pre_welcome_error_is_fatal_and_does_not_retry() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        let _hello = ws.next().await.unwrap().unwrap();
+        let mut ws = accept_agent(&listener).await?;
+        let _hello = ws.next().await.test_value()?.test_value()?;
         ws.send(WsMessage::Text(
             json!({
                 "type": "error",
@@ -203,39 +208,41 @@ async fn other_pre_welcome_error_is_fatal_and_does_not_retry() {
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
+        Ok::<(), common::TestFailure>(())
     });
 
-    let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
+    let agent = Agent::new(config(addr), UnsupportedDispatcher).test_value()?;
     let error = tokio::time::timeout(
         Duration::from_millis(100),
         agent.run(CancellationToken::new()),
     )
     .await
-    .unwrap()
-    .unwrap_err();
+    .test_value()?
+    .test_error()?;
 
     assert!(matches!(
         error,
         AgentError::Rejected { ref code, .. } if code == "protocol_mismatch"
     ));
-    server.await.unwrap();
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_frames").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_frames").await?;
 
         ws.send(WsMessage::Text("{ definitely not json".into()))
             .await
-            .unwrap();
+            .test_value()?;
         ws.send(WsMessage::Text(
             json!({
                 "type": "request",
@@ -249,25 +256,26 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() {
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
 
-        let stale = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+        let stale = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).test_value()?;
         ws.send(WsMessage::Text(
             serde_json::to_string(&Message::Ping { timestamp: stale })
-                .unwrap()
+                .test_value()?
                 .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
 
         let reply = tokio::time::timeout(Duration::from_secs(1), next_non_heartbeat(&mut ws))
             .await
-            .expect("fresh pong did not arrive");
+            .test_value()?;
         let WsMessage::Text(reply) = reply else {
-            panic!("expected pong text frame");
+            return Err(std::io::Error::other("expected pong text frame").into());
         };
-        let Message::Pong { timestamp } = serde_json::from_str::<Message>(&reply).unwrap() else {
-            panic!("expected pong");
+        let Message::Pong { timestamp } = serde_json::from_str::<Message>(&reply).test_value()?
+        else {
+            return Err(std::io::Error::other("expected pong").into());
         };
         assert!(
             timestamp > stale,
@@ -276,14 +284,16 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() {
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
-    let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
+    let agent = Agent::new(config(addr), UnsupportedDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
-        .expect("frame-handling session did not finish")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -304,15 +314,15 @@ impl Dispatcher for EchoDispatcher {
 }
 
 #[tokio::test]
-async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_request").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_request").await?;
 
         ws.send(WsMessage::Text(
             json!({
@@ -327,36 +337,36 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
 
         let reply = tokio::time::timeout(Duration::from_secs(1), next_non_heartbeat(&mut ws))
             .await
-            .expect("operation response did not arrive");
+            .test_value()?;
         let WsMessage::Text(reply) = reply else {
-            panic!("expected response text frame");
+            return Err(std::io::Error::other("expected response text frame").into());
         };
         let Message::Response {
             id,
             ok,
             result,
             error,
-        } = serde_json::from_str::<Message>(&reply).unwrap()
+        } = serde_json::from_str::<Message>(&reply).test_value()?
         else {
-            panic!("expected response");
+            return Err(std::io::Error::other("expected response").into());
         };
         assert_eq!(id, "req_state");
         assert!(ok);
         assert!(error.is_none());
-        let result = result.unwrap();
+        let result = result.test_value()?;
         assert_eq!(result["op"], "state");
         assert_eq!(result["payload"], json!({"answer": 42}));
-        let timing = result["_sx_timing"].as_object().unwrap();
-        let received_at = timing["received_at"].as_f64().unwrap();
-        let finished_at = timing["finished_at"].as_f64().unwrap();
+        let timing = result["_sx_timing"].as_object().test_value()?;
+        let received_at = timing["received_at"].as_f64().test_value()?;
+        let finished_at = timing["finished_at"].as_f64().test_value()?;
         assert!(received_at <= finished_at);
 
-        let response_at = result["response_time"].as_str().unwrap();
-        chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").unwrap();
+        let response_at = result["response_time"].as_str().test_value()?;
+        chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").test_value()?;
 
         ws.send(WsMessage::Text(
             json!({
@@ -371,20 +381,20 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
         let second = next_non_heartbeat(&mut ws).await;
         let WsMessage::Text(second) = second else {
-            panic!("expected second response");
+            return Err(std::io::Error::other("expected second response").into());
         };
         let Message::Response {
             result: Some(second),
             ..
-        } = serde_json::from_str::<Message>(&second).unwrap()
+        } = serde_json::from_str::<Message>(&second).test_value()?
         else {
-            panic!("expected successful second response");
+            return Err(std::io::Error::other("expected successful second response").into());
         };
-        let response_time = second["response_time"].as_str().unwrap();
-        chrono::NaiveTime::parse_from_str(response_time, "%H:%M:%S").unwrap();
+        let response_time = second["response_time"].as_str().test_value()?;
+        chrono::NaiveTime::parse_from_str(response_time, "%H:%M:%S").test_value()?;
 
         tokio::time::sleep(Duration::from_millis(60)).await;
         ws.send(WsMessage::Text(
@@ -400,31 +410,33 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
         let third = next_non_heartbeat(&mut ws).await;
         let WsMessage::Text(third) = third else {
-            panic!("expected third response");
+            return Err(std::io::Error::other("expected third response").into());
         };
         let Message::Response {
             result: Some(third),
             ..
-        } = serde_json::from_str::<Message>(&third).unwrap()
+        } = serde_json::from_str::<Message>(&third).test_value()?
         else {
-            panic!("expected successful third response");
+            return Err(std::io::Error::other("expected successful third response").into());
         };
-        let response_at = third["response_time"].as_str().unwrap();
-        chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").unwrap();
+        let response_at = third["response_time"].as_str().test_value()?;
+        chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").test_value()?;
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
-    let agent = Agent::new(config(addr), EchoDispatcher).unwrap();
+    let agent = Agent::new(config(addr), EchoDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
-        .expect("frame-handling session did not finish")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -443,15 +455,15 @@ impl Dispatcher for SlowDispatcher {
 }
 
 #[tokio::test]
-async fn slow_request_does_not_block_ping_handling() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn slow_request_does_not_block_ping_handling() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_concurrent").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_concurrent").await?;
 
         ws.send(WsMessage::Text(
             json!({
@@ -466,65 +478,65 @@ async fn slow_request_does_not_block_ping_handling() {
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
 
         ws.send(WsMessage::Text(
             serde_json::to_string(&Message::Ping {
                 timestamp: Utc::now(),
             })
-            .unwrap()
+            .test_value()?
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
 
         let first = tokio::time::timeout(Duration::from_millis(80), ws.next())
             .await
-            .expect(
-                "slow request blocked read loop; official agent dispatches requests in background",
-            )
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         let WsMessage::Text(first) = first else {
-            panic!("expected text frame");
+            return Err(std::io::Error::other("expected text frame").into());
         };
         assert!(matches!(
-            serde_json::from_str::<Message>(&first).unwrap(),
+            serde_json::from_str::<Message>(&first).test_value()?,
             Message::Pong { .. }
         ));
 
         let second = tokio::time::timeout(Duration::from_millis(300), ws.next())
             .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         let WsMessage::Text(second) = second else {
-            panic!("expected response text frame");
+            return Err(std::io::Error::other("expected response text frame").into());
         };
         assert!(matches!(
-            serde_json::from_str::<Message>(&second).unwrap(),
+            serde_json::from_str::<Message>(&second).test_value()?,
             Message::Response { ref id, .. } if id == "req_slow"
         ));
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
-    let agent = Agent::new(config(addr), SlowDispatcher).unwrap();
+    let agent = Agent::new(config(addr), SlowDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_millis(600), agent.run(cancel.clone()))
         .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn held_job_completion_replays_after_welcome_and_is_cleared() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let temp = tempfile::tempdir().unwrap();
+async fn held_job_completion_replays_after_welcome_and_is_cleared() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
+    let temp = tempfile::tempdir().test_value()?;
     let upload_base = temp.path().join("uploads");
-    fs::create_dir(&upload_base).unwrap();
+    fs::create_dir(&upload_base).test_value()?;
 
     let event = json!({
         "type": "event",
@@ -532,46 +544,48 @@ async fn held_job_completion_replays_after_welcome_and_is_cleared() {
         "data": {"job_id": "job_held", "status": "failed"},
         "timestamp": "2026-09-21T21:00:00Z"
     });
-    let pending_path = pending_results::record(&upload_base, "job_held", &event).unwrap();
+    let pending_path = pending_results::record(&upload_base, "job_held", &event).test_value()?;
 
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
     let server_event = event.clone();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_replay").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_replay").await?;
 
         let replay = tokio::time::timeout(Duration::from_millis(100), ws.next())
             .await
-            .expect("held result was not replayed immediately after welcome")
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         let WsMessage::Text(replay) = replay else {
-            panic!("expected replayed event text frame");
+            return Err(std::io::Error::other("expected replayed event text frame").into());
         };
         assert_eq!(
-            serde_json::from_str::<Value>(&replay).unwrap(),
+            serde_json::from_str::<Value>(&replay).test_value()?,
             server_event
         );
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
     let mut cfg = config(addr);
     cfg.upload_base = upload_base;
-    let agent = Agent::new(cfg, UnsupportedDispatcher).unwrap();
+    let agent = Agent::new(cfg, UnsupportedDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
-        .expect("frame-handling session did not finish")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
 
     assert!(
         !pending_path.exists(),
         "successful replay must clear durable copy"
     );
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -593,19 +607,19 @@ impl Dispatcher for JobDispatcher {
 }
 
 #[tokio::test]
-async fn background_job_acks_immediately_then_emits_completion_without_litter() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let temp = tempfile::tempdir().unwrap();
+async fn background_job_acks_immediately_then_emits_completion_without_litter() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
+    let temp = tempfile::tempdir().test_value()?;
     let upload_base = temp.path().join("uploads");
-    fs::create_dir(&upload_base).unwrap();
+    fs::create_dir(&upload_base).test_value()?;
 
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_background").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_background").await?;
 
         ws.send(WsMessage::Text(
             json!({
@@ -620,23 +634,23 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
 
         let ack = tokio::time::timeout(Duration::from_millis(150), ws.next())
             .await
-            .expect("background request was not acknowledged promptly")
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         let WsMessage::Text(ack) = ack else {
-            panic!("expected ack text frame");
+            return Err(std::io::Error::other("expected ack text frame").into());
         };
         let Message::Response {
             ok: true,
             result: Some(result),
             ..
-        } = serde_json::from_str::<Message>(&ack).unwrap()
+        } = serde_json::from_str::<Message>(&ack).test_value()?
         else {
-            panic!("expected successful running ack");
+            return Err(std::io::Error::other("expected successful running ack").into());
         };
         assert_eq!(result["status"], "running");
         assert_eq!(result["job_id"], "job_fixture");
@@ -645,16 +659,16 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
 
         let completion = tokio::time::timeout(Duration::from_millis(800), ws.next())
             .await
-            .expect("job completion did not arrive")
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         let WsMessage::Text(completion) = completion else {
-            panic!("expected completion text frame");
+            return Err(std::io::Error::other("expected completion text frame").into());
         };
         let Message::Event { kind, data, .. } =
-            serde_json::from_str::<Message>(&completion).unwrap()
+            serde_json::from_str::<Message>(&completion).test_value()?
         else {
-            panic!("expected job_completed event");
+            return Err(std::io::Error::other("expected job_completed event").into());
         };
         assert_eq!(kind, "job_completed");
         assert_eq!(data["job_id"], "job_fixture");
@@ -664,34 +678,37 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
     let mut cfg = config(addr);
     cfg.upload_base = upload_base.clone();
-    let agent = Agent::new(cfg, JobDispatcher).unwrap();
+    let agent = Agent::new(cfg, JobDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_millis(1200), agent.run(cancel.clone()))
         .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
 
     assert!(pending_results::drain(&upload_base).is_empty());
+    Ok(())
 }
 
 #[tokio::test]
-async fn background_completion_survives_dead_request_socket_and_replays_next_connection() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let temp = tempfile::tempdir().unwrap();
+async fn background_completion_survives_dead_request_socket_and_replays_next_connection()
+-> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
+    let temp = tempfile::tempdir().test_value()?;
     let upload_base = temp.path().join("uploads");
-    fs::create_dir(&upload_base).unwrap();
+    fs::create_dir(&upload_base).test_value()?;
 
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut first = accept_agent(&listener).await;
-        welcome(&mut first, "sess_before_drop").await;
+        let mut first = accept_agent(&listener).await?;
+        welcome(&mut first, "sess_before_drop").await?;
 
         first
             .send(WsMessage::Text(
@@ -707,19 +724,19 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
                 .into(),
             ))
             .await
-            .unwrap();
+            .test_value()?;
 
         let ack = tokio::time::timeout(Duration::from_millis(150), first.next())
             .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         assert!(matches!(
             serde_json::from_str::<Message>(match &ack {
                 WsMessage::Text(text) => text,
-                _ => panic!("expected ack text"),
+                _ => return Err(std::io::Error::other("expected ack text").into()),
             })
-            .unwrap(),
+            .test_value()?,
             Message::Response { ok: true, .. }
         ));
 
@@ -729,12 +746,12 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
         // welcome until the old job has finished and persisted.
         drop(first);
 
-        let mut second = accept_agent(&listener).await;
-        let WsMessage::Text(hello) = second.next().await.unwrap().unwrap() else {
-            panic!("expected replacement hello");
+        let mut second = accept_agent(&listener).await?;
+        let WsMessage::Text(hello) = second.next().await.test_value()?.test_value()? else {
+            return Err(std::io::Error::other("expected replacement hello").into());
         };
         assert!(matches!(
-            serde_json::from_str::<Message>(&hello).unwrap(),
+            serde_json::from_str::<Message>(&hello).test_value()?,
             Message::Hello { .. }
         ));
         tokio::time::sleep(Duration::from_millis(650)).await;
@@ -750,19 +767,20 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
                 .into(),
             ))
             .await
-            .unwrap();
+            .test_value()?;
 
         let replay = tokio::time::timeout(Duration::from_millis(100), second.next())
             .await
-            .expect("completed background result was not replayed")
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         let WsMessage::Text(replay) = replay else {
-            panic!("expected replayed event text");
+            return Err(std::io::Error::other("expected replayed event text").into());
         };
-        let Message::Event { kind, data, .. } = serde_json::from_str::<Message>(&replay).unwrap()
+        let Message::Event { kind, data, .. } =
+            serde_json::from_str::<Message>(&replay).test_value()?
         else {
-            panic!("expected replayed job_completed event");
+            return Err(std::io::Error::other("expected replayed job_completed event").into());
         };
         assert_eq!(kind, "job_completed");
         assert_eq!(data["job_id"], "job_survives");
@@ -771,84 +789,88 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
 
         server_cancel.cancel();
         let _ = second.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
     let mut cfg = config(addr);
     cfg.upload_base = upload_base.clone();
     cfg.welcome_timeout = Duration::from_millis(900);
-    let agent = Agent::new(cfg, JobDispatcher).unwrap();
+    let agent = Agent::new(cfg, JobDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_millis(1800), agent.run(cancel.clone()))
         .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
 
     assert!(pending_results::drain(&upload_base).is_empty());
+    Ok(())
 }
 
 #[tokio::test]
-async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_app_heartbeat").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_app_heartbeat").await?;
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(180);
         while tokio::time::Instant::now() < deadline {
             let item = tokio::time::timeout(Duration::from_millis(60), ws.next())
                 .await
-                .expect("agent stopped sending application heartbeats")
-                .unwrap()
-                .unwrap();
+                .test_value()?
+                .test_value()?
+                .test_value()?;
             let WsMessage::Text(text) = item else {
                 continue;
             };
             if matches!(
-                serde_json::from_str::<Message>(&text).unwrap(),
+                serde_json::from_str::<Message>(&text).test_value()?,
                 Message::Ping { .. }
             ) {
                 ws.send(WsMessage::Text(
                     serde_json::to_string(&Message::Pong {
                         timestamp: Utc::now(),
                     })
-                    .unwrap()
+                    .test_value()?
                     .into(),
                 ))
                 .await
-                .unwrap();
+                .test_value()?;
             }
         }
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
     let mut cfg = config(addr);
     cfg.heartbeat_interval = Duration::from_millis(10);
     cfg.heartbeat_timeout = Duration::from_millis(30);
-    let agent = Agent::new(cfg, UnsupportedDispatcher).unwrap();
+    let agent = Agent::new(cfg, UnsupportedDispatcher).test_value()?;
 
     tokio::time::timeout(Duration::from_millis(400), agent.run(cancel.clone()))
         .await
-        .expect("application pong heartbeat failed to keep the session alive")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn unrelated_application_traffic_does_not_mask_missing_heartbeat_pong() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn unrelated_application_traffic_does_not_mask_missing_heartbeat_pong() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut first = accept_agent(&listener).await;
-        welcome(&mut first, "sess_no_pong").await;
+        let mut first = accept_agent(&listener).await?;
+        welcome(&mut first, "sess_no_pong").await?;
 
         // Keep sending valid application traffic while intentionally never
         // answering the agent's heartbeat Ping. This must not count as the
@@ -873,23 +895,25 @@ async fn unrelated_application_traffic_does_not_mask_missing_heartbeat_pong() {
 
         let mut second = tokio::time::timeout(Duration::from_millis(150), accept_agent(&listener))
             .await
-            .expect("missing application pong did not force a reconnect");
-        welcome(&mut second, "sess_after_no_pong").await;
+            .test_value()?;
+        welcome(&mut second, "sess_after_no_pong").await?;
         server_cancel.cancel();
         let _ = second.close(None).await;
         sender.abort();
+        Ok::<(), common::TestFailure>(())
     });
 
     let mut cfg = config(addr);
     cfg.heartbeat_interval = Duration::from_millis(10);
     cfg.heartbeat_timeout = Duration::from_millis(30);
-    let agent = Agent::new(cfg, UnsupportedDispatcher).unwrap();
+    let agent = Agent::new(cfg, UnsupportedDispatcher).test_value()?;
 
     tokio::time::timeout(Duration::from_millis(250), agent.run(cancel.clone()))
         .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -897,20 +921,20 @@ struct PanickingDispatcher;
 
 impl Dispatcher for PanickingDispatcher {
     async fn dispatch(&self, _id: &str, _op: Op, _payload: Map<String, Value>) -> DispatchResponse {
-        panic!("intentional dispatcher panic fixture");
+        std::panic::resume_unwind(Box::new("intentional dispatcher panic fixture"));
     }
 }
 
 #[tokio::test]
-async fn dispatcher_panic_becomes_internal_error_without_killing_socket_loop() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn dispatcher_panic_becomes_internal_error_without_killing_socket_loop() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_panic").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_panic").await?;
 
         ws.send(WsMessage::Text(
             json!({
@@ -925,99 +949,104 @@ async fn dispatcher_panic_becomes_internal_error_without_killing_socket_loop() {
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
 
         let reply = tokio::time::timeout(Duration::from_millis(150), ws.next())
             .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         let WsMessage::Text(reply) = reply else {
-            panic!("expected response");
+            return Err(std::io::Error::other("expected response").into());
         };
-        let Message::Response { ok, error, .. } = serde_json::from_str::<Message>(&reply).unwrap()
+        let Message::Response { ok, error, .. } =
+            serde_json::from_str::<Message>(&reply).test_value()?
         else {
-            panic!("expected response message");
+            return Err(std::io::Error::other("expected response message").into());
         };
         assert!(!ok);
-        assert_eq!(error.unwrap().code, "internal_error");
+        assert_eq!(error.test_value()?.code, "internal_error");
 
         ws.send(WsMessage::Text(
             serde_json::to_string(&Message::Ping {
                 timestamp: Utc::now(),
             })
-            .unwrap()
+            .test_value()?
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
         let pong = tokio::time::timeout(Duration::from_millis(100), ws.next())
             .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         assert!(matches!(
             serde_json::from_str::<Message>(match &pong {
                 WsMessage::Text(text) => text,
-                _ => panic!("expected text pong"),
+                _ => return Err(std::io::Error::other("expected text pong").into()),
             })
-            .unwrap(),
+            .test_value()?,
             Message::Pong { .. }
         ));
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
-    let agent = Agent::new(config(addr), PanickingDispatcher).unwrap();
+    let agent = Agent::new(config(addr), PanickingDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_millis(300), agent.run(cancel.clone()))
         .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn inbound_websocket_control_ping_is_answered_without_native_keepalive_timer() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+async fn inbound_websocket_control_ping_is_answered_without_native_keepalive_timer() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_control_ping").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_control_ping").await?;
 
         ws.send(WsMessage::Ping(vec![1, 2, 3, 4].into()))
             .await
-            .unwrap();
+            .test_value()?;
 
         let reply = tokio::time::timeout(Duration::from_millis(100), ws.next())
             .await
-            .expect("tungstenite did not emit automatic control pong")
-            .unwrap()
-            .unwrap();
+            .test_value()?
+            .test_value()?
+            .test_value()?;
         assert!(matches!(reply, WsMessage::Pong(ref payload) if payload.as_ref() == [1, 2, 3, 4]));
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
-    let agent = Agent::new(config(addr), UnsupportedDispatcher).unwrap();
+    let agent = Agent::new(config(addr), UnsupportedDispatcher).test_value()?;
     tokio::time::timeout(Duration::from_millis(250), agent.run(cancel.clone()))
         .await
-        .unwrap()
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk() {
-    let dir = tempfile::tempdir().unwrap();
+async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk() -> TestResult {
+    let dir = tempfile::tempdir().test_value()?;
     let source = dir.path().join("source.bin");
-    fs::write(&source, b"abcdef").unwrap();
+    fs::write(&source, b"abcdef").test_value()?;
     let upload_base = dir.path().join("uploads");
-    fs::create_dir_all(&upload_base).unwrap();
+    fs::create_dir_all(&upload_base).test_value()?;
     let received = upload_base.join("received.bin");
 
     let policy = Policy {
@@ -1030,15 +1059,15 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
     };
     let dispatcher = CoreDispatcher::new(policy, dir.path().join("config.yaml"), "test");
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
+    let addr = listener.local_addr().test_value()?;
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
     let source_for_server = source.display().to_string();
 
     let server = tokio::spawn(async move {
-        let mut ws = accept_agent(&listener).await;
-        welcome(&mut ws, "sess_binary_roundtrip").await;
+        let mut ws = accept_agent(&listener).await?;
+        welcome(&mut ws, "sess_binary_roundtrip").await?;
 
         let export_id = "01010101010101010101010101010101";
         ws.send(WsMessage::Text(
@@ -1058,13 +1087,13 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
         let init = next_non_heartbeat(&mut ws).await;
         let WsMessage::Text(init) = init else {
-            panic!("expected export init JSON response");
+            return Err(std::io::Error::other("expected export init JSON response").into());
         };
         assert!(matches!(
-            serde_json::from_str::<Message>(&init).unwrap(),
+            serde_json::from_str::<Message>(&init).test_value()?,
             Message::Response { ok: true, .. }
         ));
 
@@ -1084,28 +1113,32 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
 
         let first = next_non_heartbeat(&mut ws).await;
         let WsMessage::Binary(first) = first else {
-            panic!("binary export payload must arrive before JSON ack");
+            return Err(
+                std::io::Error::other("binary export payload must arrive before JSON ack").into(),
+            );
         };
-        let frame = decode_binary_frame(&first).unwrap();
+        let frame = decode_binary_frame(&first).test_value()?;
         assert_eq!(frame.transfer_id, [0x01; 16]);
         assert_eq!(frame.chunk_index, 0);
         assert_eq!(frame.payload, b"abc");
 
         let second = next_non_heartbeat(&mut ws).await;
         let WsMessage::Text(second) = second else {
-            panic!("expected JSON ack after binary export payload");
+            return Err(
+                std::io::Error::other("expected JSON ack after binary export payload").into(),
+            );
         };
         let Message::Response {
             ok: true,
             result: Some(result),
             ..
-        } = serde_json::from_str::<Message>(&second).unwrap()
+        } = serde_json::from_str::<Message>(&second).test_value()?
         else {
-            panic!("expected successful export chunk ack");
+            return Err(std::io::Error::other("expected successful export chunk ack").into());
         };
         assert_eq!(result["chunk_index"], 0);
         assert!(!result.contains_key("__binary_payload__"));
@@ -1128,7 +1161,7 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
         let upload_init = next_non_heartbeat(&mut ws).await;
         assert!(matches!(upload_init, WsMessage::Text(_)));
 
@@ -1136,16 +1169,17 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
             encode_binary_frame([0x10; 16], 0, b"xyz").into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
         let ack = tokio::time::timeout(Duration::from_millis(250), next_non_heartbeat(&mut ws))
             .await
-            .expect("missing transfer_chunk_ack");
+            .test_value()?;
         let WsMessage::Text(ack) = ack else {
-            panic!("expected transfer chunk ack event");
+            return Err(std::io::Error::other("expected transfer chunk ack event").into());
         };
-        let Message::Event { kind, data, .. } = serde_json::from_str::<Message>(&ack).unwrap()
+        let Message::Event { kind, data, .. } =
+            serde_json::from_str::<Message>(&ack).test_value()?
         else {
-            panic!("expected event");
+            return Err(std::io::Error::other("expected event").into());
         };
         assert_eq!(kind, "transfer_chunk_ack");
         assert_eq!(data["transfer_id"], inbound_id);
@@ -1166,12 +1200,12 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
             .into(),
         ))
         .await
-        .unwrap();
+        .test_value()?;
         let complete = next_non_heartbeat(&mut ws).await;
         let WsMessage::Text(complete) = complete else {
-            panic!("expected upload complete response");
+            return Err(std::io::Error::other("expected upload complete response").into());
         };
-        let complete = serde_json::from_str::<Message>(&complete).unwrap();
+        let complete = serde_json::from_str::<Message>(&complete).test_value()?;
         assert!(
             matches!(complete, Message::Response { ok: true, .. }),
             "unexpected upload complete response: {complete:?}"
@@ -1179,16 +1213,18 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
+        Ok::<(), common::TestFailure>(())
     });
 
     let mut cfg = config(addr);
     cfg.upload_base = upload_base;
-    let agent = Agent::new(cfg, dispatcher).unwrap();
+    let agent = Agent::new(cfg, dispatcher).test_value()?;
     tokio::time::timeout(Duration::from_secs(3), agent.run(cancel.clone()))
         .await
-        .expect("binary roundtrip session did not finish")
-        .unwrap();
-    server.await.unwrap();
+        .test_value()?
+        .test_value()?;
+    server.await.test_value()??;
 
-    assert_eq!(fs::read(received).unwrap(), b"xyz");
+    assert_eq!(fs::read(received).test_value()?, b"xyz");
+    Ok(())
 }
