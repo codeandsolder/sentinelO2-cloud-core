@@ -161,14 +161,14 @@ pub fn loadavg() -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::TestResult;
 
     #[test]
     fn host_info_has_required_identity_fields() -> TestResult {
         let host = gather_host_info("fixture".into(), None);
         assert_eq!(host.id, "fixture");
-        assert!(!host.hostname.is_empty());
-        assert!(!host.os.is_empty());
+        assert_ne!(host.hostname, "");
+        assert_ne!(host.os, "");
 
         Ok(())
     }

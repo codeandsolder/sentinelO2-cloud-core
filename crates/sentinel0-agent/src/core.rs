@@ -1070,7 +1070,7 @@ impl Dispatcher for CoreDispatcher {
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath, ServiceSpec};
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -1084,7 +1084,7 @@ mod tests {
             .await
             .message
         else {
-            panic!("expected capabilities response");
+            return Err(std::io::Error::other("expected capabilities response").into());
         };
         let advertised = result["ops_supported"].as_array().test_value()?;
         assert_eq!(advertised.len(), Op::ALL.len() - 1);
@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn unusable_commands_ignores_empty_and_whitespace_wildcards() -> TestResult {
-        let commands = vec!["".to_owned(), "   ".to_owned(), "echo".to_owned()];
+        let commands = vec![String::new(), "   ".to_owned(), "echo".to_owned()];
         assert_eq!(
             CoreDispatcher::unusable_commands_for(&commands, true),
             json!({})
@@ -1298,7 +1298,7 @@ mod tests {
             .await
             .message
         else {
-            panic!("exec failed");
+            return Err(std::io::Error::other("exec failed").into());
         };
         let Message::Response {
             ok: true,
@@ -1313,7 +1313,7 @@ mod tests {
             .await
             .message
         else {
-            panic!("read failed");
+            return Err(std::io::Error::other("read failed").into());
         };
         assert_eq!(result["content"], "hello");
 

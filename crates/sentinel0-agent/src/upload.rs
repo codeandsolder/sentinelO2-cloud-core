@@ -808,10 +808,11 @@ mod tests {
         }
     }
 
-    fn upload_meta(policy: &Policy, init: &BTreeMap<String, Value>) -> UploadMeta {
-        let id = init["upload_id"].as_str().unwrap();
-        let bytes = fs::read(meta_path(&upload_dir(policy, id).unwrap())).unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+    fn upload_meta(policy: &Policy, init: &BTreeMap<String, Value>) -> TestResult<UploadMeta> {
+        let id = init["upload_id"].as_str().test_value()?;
+        let dir = upload_dir(policy, id).test_value()?;
+        let bytes = fs::read(meta_path(&dir)).test_value()?;
+        serde_json::from_slice(&bytes).test_value()
     }
 
     #[test]
@@ -838,7 +839,7 @@ mod tests {
             ]),
         )
         .test_value()?;
-        let meta = upload_meta(&policy, &init);
+        let meta = upload_meta(&policy, &init)?;
         assert!(meta.landed_in_place);
         assert_eq!(PathBuf::from(meta.target_path), target);
 
@@ -869,7 +870,7 @@ mod tests {
             ]),
         )
         .test_value()?;
-        let meta = upload_meta(&policy, &init);
+        let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
 
@@ -896,7 +897,7 @@ mod tests {
             )]),
         )
         .test_value()?;
-        let meta = upload_meta(&policy, &init);
+        let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
 
@@ -923,7 +924,7 @@ mod tests {
             ]),
         )
         .test_value()?;
-        let meta = upload_meta(&policy, &init);
+        let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
 
@@ -969,7 +970,7 @@ mod tests {
             )]),
         )
         .test_value()?;
-        let meta = upload_meta(&policy, &init);
+        let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
         assert_eq!(
             PathBuf::from(meta.target_path),

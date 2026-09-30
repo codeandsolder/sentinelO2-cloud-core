@@ -539,7 +539,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[tokio::test]

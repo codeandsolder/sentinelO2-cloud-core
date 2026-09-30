@@ -213,7 +213,7 @@ pub async fn run_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::{TestResult, TestValue as _};
 
     const SUCCESS_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 

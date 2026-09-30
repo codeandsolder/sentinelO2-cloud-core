@@ -704,12 +704,12 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
-    fn parse(text: &str) -> Policy {
-        let raw: RawPolicy = yaml_serde::from_str(text).unwrap();
-        Policy::from_raw(raw).unwrap()
+    fn parse(text: &str) -> TestResult<Policy> {
+        let raw: RawPolicy = yaml_serde::from_str(text).test_value()?;
+        Policy::from_raw(raw).test_value()
     }
 
     #[test]
@@ -739,7 +739,7 @@ log:
   level: INFO
 upload_base: /var/lib/sentinelx/uploads
 "#,
-        );
+        )?;
         assert_eq!(policy.exec_timeout_default, 30);
         assert_eq!(policy.exec_timeout_max, 3600);
         assert!(!policy.exec_enforce_allowlist);
@@ -758,7 +758,7 @@ upload_base: /var/lib/sentinelx/uploads
             r"
 allowed_commands: [git]
 ",
-        );
+        )?;
         assert!(!policy.exec_enforce_allowlist);
 
         let policy = parse(
@@ -767,7 +767,7 @@ allowed_commands: [git]
 exec:
   enforce_allowlist: true
 ",
-        );
+        )?;
         assert!(policy.exec_enforce_allowlist);
 
         let policy = parse(
@@ -775,7 +775,7 @@ exec:
 allowed_commands: [git]
 exec_strict: true
 ",
-        );
+        )?;
         assert!(policy.exec_enforce_allowlist);
 
         Ok(())
@@ -928,7 +928,7 @@ file_ops:
   allowed_read_paths:
     - /tmp
 ",
-        );
+        )?;
         assert_eq!(policy.file_ops_paths[0].access, FileAccess::Read);
 
         Ok(())

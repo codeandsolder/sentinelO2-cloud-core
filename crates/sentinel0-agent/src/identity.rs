@@ -124,14 +124,14 @@ pub fn load_identity(path: &Path) -> Result<Identity, IdentityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
-    fn write(text: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempdir().unwrap();
+    fn write(text: &str) -> TestResult<(tempfile::TempDir, PathBuf)> {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("identity.json");
-        fs::write(&path, text).unwrap();
-        (dir, path)
+        fs::write(&path, text).test_value()?;
+        Ok((dir, path))
     }
 
     #[test]
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn missing_required_field_is_explicit() -> TestResult {
-        let (_dir, path) = write(r#"{"host_id":"h","token":"a.b.c"}"#);
+        let (_dir, path) = write(r#"{"host_id":"h","token":"a.b.c"}"#)?;
         assert!(matches!(
             load_identity(&path),
             Err(IdentityError::MissingField("hub"))

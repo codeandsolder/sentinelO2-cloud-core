@@ -209,7 +209,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::TestResult;
 
     #[test]
     fn direct_python_policy_catches_plain_and_sudo_invocations() -> TestResult {

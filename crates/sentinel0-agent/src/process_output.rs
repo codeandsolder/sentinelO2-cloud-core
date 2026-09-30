@@ -198,7 +198,7 @@ pub fn read_bounded_sync<R: Read>(mut reader: R, limit: usize) -> io::Result<Cap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::{TestResult, TestValue as _};
 
     #[test]
     fn bounded_capture_keeps_head_and_tail_and_counts_every_byte() -> TestResult {

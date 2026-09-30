@@ -106,16 +106,21 @@ pub fn build_completed_event_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::{TestResult, TestValue as _};
     use chrono::TimeZone;
     use sentinel0_proto::ResponseError;
 
-    fn times() -> (DateTime<Utc>, DateTime<Utc>) {
-        (
-            Utc.with_ymd_and_hms(2026, 9, 21, 21, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 9, 21, 21, 0, 1).unwrap()
-                + chrono::Duration::milliseconds(234),
-        )
+    fn times() -> TestResult<(DateTime<Utc>, DateTime<Utc>)> {
+        let start = Utc
+            .with_ymd_and_hms(2026, 9, 21, 21, 0, 0)
+            .single()
+            .test_value()?;
+        let finish = Utc
+            .with_ymd_and_hms(2026, 9, 21, 21, 0, 1)
+            .single()
+            .test_value()?
+            + chrono::Duration::milliseconds(234);
+        Ok((start, finish))
     }
 
     fn response(ok: bool, result: Option<BTreeMap<String, Value>>) -> Message {
@@ -129,7 +134,7 @@ mod tests {
 
     #[test]
     fn returncode_zero_maps_to_succeeded() -> TestResult {
-        let (start, finish) = times();
+        let (start, finish) = times()?;
         let data = build_completed_event_data(
             "job",
             "exec",
@@ -154,7 +159,7 @@ mod tests {
 
     #[test]
     fn nonzero_and_missing_returncode_map_to_failed() -> TestResult {
-        let (start, finish) = times();
+        let (start, finish) = times()?;
         for result in [
             BTreeMap::from([("returncode".into(), Value::from(7))]),
             BTreeMap::new(),
@@ -175,7 +180,7 @@ mod tests {
 
     #[test]
     fn timed_out_overrides_returncode() -> TestResult {
-        let (start, finish) = times();
+        let (start, finish) = times()?;
         let data = build_completed_event_data(
             "job",
             "exec",
@@ -197,7 +202,7 @@ mod tests {
 
     #[test]
     fn handler_error_maps_to_failed_with_message() -> TestResult {
-        let (start, finish) = times();
+        let (start, finish) = times()?;
         let response = Message::Response {
             id: "req".into(),
             ok: false,
@@ -218,7 +223,7 @@ mod tests {
 
     #[test]
     fn oversized_output_is_byte_bounded_and_flagged() -> TestResult {
-        let (start, finish) = times();
+        let (start, finish) = times()?;
         let output = "x".repeat(MAX_EVENT_OUTPUT_BYTES + 100);
         let data = build_completed_event_data(
             "job",

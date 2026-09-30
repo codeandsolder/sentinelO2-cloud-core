@@ -58,7 +58,7 @@ pub fn staging_root(upload_base: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]

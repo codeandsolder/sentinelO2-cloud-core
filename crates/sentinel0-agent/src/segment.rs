@@ -186,7 +186,7 @@ pub fn unauthorised_segment(policy: &Policy, command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use crate::test_support::TestResult;
 
     #[test]
     fn quoted_separators_are_data_not_structure() -> TestResult {
