@@ -1001,4 +1001,78 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn read_max_bytes_below_probe_is_a_hard_ceiling() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let file = dir.path().join("fourteen_k.txt");
+        fs::write(&file, "a".repeat(14_000)).test_value()?;
+        let result = read(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(file.display().to_string())),
+                ("max_bytes".into(), Value::from(257)),
+            ]),
+        )
+        .test_value()?;
+
+        assert_eq!(result["content"].as_str().test_value()?.len(), 257);
+        assert_eq!(result["size_bytes"], 14_000);
+        assert_eq!(result["truncated"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn read_late_range_reaches_beyond_default_prefix_cap() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let file = dir.path().join("big.txt");
+        let mut body = String::new();
+        for line in 1..=1_200 {
+            body.push_str(&format!("line {line:04} {}\n", "x".repeat(90)));
+        }
+        fs::write(&file, body).test_value()?;
+
+        let result = read(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(file.display().to_string())),
+                ("view_range".into(), serde_json::json!([900, 905])),
+            ]),
+        )
+        .test_value()?;
+        let lines: Vec<_> = result["content"].as_str().test_value()?.lines().collect();
+
+        assert_eq!(lines.len(), 6);
+        assert!(lines[0].starts_with("line 0900"));
+        assert!(lines[5].starts_with("line 0905"));
+        assert_eq!(result["view_range"], serde_json::json!([900, 905]));
+        assert_eq!(result["lines_returned"], 6);
+        assert_eq!(result["truncated"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn read_binary_probe_is_independent_of_small_response_cap() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let file = dir.path().join("blob.bin");
+        fs::write(&file, b"\0\x01\x02".repeat(4_000)).test_value()?;
+        let result = read(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(file.display().to_string())),
+                ("max_bytes".into(), Value::from(257)),
+            ]),
+        )
+        .test_value()?;
+
+        assert_eq!(result["encoding"], "binary");
+        assert!(result.get("content").is_none());
+        assert!(
+            result["preview_hex"]
+                .as_str()
+                .test_value()?
+                .starts_with("000102")
+        );
+        Ok(())
+    }
 }
