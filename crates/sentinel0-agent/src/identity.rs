@@ -124,6 +124,7 @@ pub fn load_identity(path: &Path) -> Result<Identity, IdentityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn write(text: &str) -> (tempfile::TempDir, PathBuf) {
@@ -134,32 +135,38 @@ mod tests {
     }
 
     #[test]
-    fn valid_identity_trims_scalar_fields() {
+    fn valid_identity_trims_scalar_fields() -> TestResult {
         let (_dir, path) = write(
             r#"{"host_id":" host_1 ","token":" aaa.bbb.ccc \n","hub":" https://hub.example "}"#,
         );
-        let identity = load_identity(&path).unwrap();
+        let identity = load_identity(&path).test_value()?;
         assert_eq!(identity.host_id, "host_1");
         assert_eq!(identity.hub, "https://hub.example");
         assert_eq!(format!("{:?}", identity.token), "[redacted]");
+
+        Ok(())
     }
 
     #[test]
-    fn malformed_tokens_fail_before_network_use() {
+    fn malformed_tokens_fail_before_network_use() -> TestResult {
         for token in ["", "one.two", "one..three", "one two.three.four", "ą.b.c"] {
             let (_dir, path) = write(&format!(
                 r#"{{"host_id":"h","token":"{token}","hub":"https://hub"}}"#
             ));
             assert!(load_identity(&path).is_err(), "{token:?}");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn missing_required_field_is_explicit() {
+    fn missing_required_field_is_explicit() -> TestResult {
         let (_dir, path) = write(r#"{"host_id":"h","token":"a.b.c"}"#);
         assert!(matches!(
             load_identity(&path),
             Err(IdentityError::MissingField("hub"))
         ));
+
+        Ok(())
     }
 }

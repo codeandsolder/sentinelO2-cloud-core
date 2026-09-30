@@ -213,11 +213,12 @@ pub async fn run_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
 
     const SUCCESS_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test]
-    async fn shell_merges_stdout_and_stderr_like_python_core() {
+    async fn shell_merges_stdout_and_stderr_like_python_core() -> TestResult {
         let result = run_shell(
             &Policy::default(),
             "printf out; printf err >&2",
@@ -226,21 +227,25 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["returncode"], 0);
         assert_eq!(result["output"], "out\nerr");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn empty_output_uses_legacy_marker() {
+    async fn empty_output_uses_legacy_marker() -> TestResult {
         let result = run_shell(&Policy::default(), "true", SUCCESS_TEST_TIMEOUT, None, None)
             .await
-            .unwrap();
+            .test_value()?;
         assert_eq!(result["output"], "⚠️ Sin salida");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn timeout_is_structured() {
+    async fn timeout_is_structured() -> TestResult {
         let result = run_shell(
             &Policy::default(),
             "sleep 10",
@@ -249,13 +254,15 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["returncode"], -1);
         assert_eq!(result["timed_out"], true);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn huge_output_is_bounded_and_reported() {
+    async fn huge_output_is_bounded_and_reported() -> TestResult {
         let policy = Policy {
             exec_capture_max_bytes: 64 * 1024,
             ..Policy::default()
@@ -268,10 +275,12 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["returncode"], 0);
         assert_eq!(result["output_truncated"], true);
         assert_eq!(result["stdout_bytes"], 1_000_000);
-        assert!(result["output"].as_str().unwrap().len() < 80_000);
+        assert!(result["output"].as_str().test_value()?.len() < 80_000);
+
+        Ok(())
     }
 }

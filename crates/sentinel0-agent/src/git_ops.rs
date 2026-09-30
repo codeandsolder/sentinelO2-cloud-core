@@ -936,6 +936,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path, write: bool) -> Policy {
@@ -953,13 +954,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_hunk_counts_are_recounted_in_dry_run() {
-        let dir = tempdir().unwrap();
+    async fn wrong_hunk_counts_are_recounted_in_dry_run() -> TestResult {
+        let dir = tempdir().test_value()?;
         std::fs::write(
             dir.path().join("f.txt"),
             (1..=10).map(|i| format!("line{i}\n")).collect::<String>(),
         )
-        .unwrap();
+        .test_value()?;
         for args in [
             vec!["init", "-q"],
             vec!["add", "f.txt"],
@@ -979,7 +980,7 @@ mod tests {
                     .arg(dir.path())
                     .args(args)
                     .status()
-                    .unwrap()
+                    .test_value()?
                     .success()
             );
         }
@@ -998,19 +999,21 @@ mod tests {
             ]),
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result.get("recounted"), Some(&Value::Bool(true)));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn force_push_without_lease_is_refused_before_network() {
-        let dir = tempdir().unwrap();
+    async fn force_push_without_lease_is_refused_before_network() -> TestResult {
+        let dir = tempdir().test_value()?;
         std::process::Command::new("git")
             .arg("-C")
             .arg(dir.path())
             .args(["init", "-q"])
             .status()
-            .unwrap();
+            .test_value()?;
         let error = handle(
             &policy(dir.path(), false),
             &Map::from_iter([
@@ -1024,14 +1027,16 @@ mod tests {
             ]),
         )
         .await
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "force_requires_lease");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn capped_git_stdout_drains_without_retaining_the_full_patch() {
-        let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("big.txt"), "changed line\n".repeat(10_000)).unwrap();
+    async fn capped_git_stdout_drains_without_retaining_the_full_patch() -> TestResult {
+        let dir = tempdir().test_value()?;
+        std::fs::write(dir.path().join("big.txt"), "changed line\n".repeat(10_000)).test_value()?;
         let args = vec![
             "diff".into(),
             "--no-index".into(),
@@ -1048,7 +1053,7 @@ mod tests {
             Duration::from_secs(60),
         )
         .await
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(rc, 1);
         assert!(exceeded);
@@ -1060,10 +1065,12 @@ mod tests {
             String::from_utf8_lossy(&stdout).contains("bytes omitted by SentinelO2"),
             "truncated output should explain the omission"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn name_status_parser_counts_all_but_keeps_only_requested_prefix() {
+    fn name_status_parser_counts_all_but_keeps_only_requested_prefix() -> TestResult {
         let raw = b"M\0a.txt\0R100\0old.txt\0new.txt\0A\0z.txt\0";
         let (rows, total) = parse_name_status(raw, 2);
         assert_eq!(total, 3);
@@ -1073,5 +1080,7 @@ mod tests {
             rows[1],
             ("new.txt".into(), "renamed".into(), Some("old.txt".into()))
         );
+
+        Ok(())
     }
 }

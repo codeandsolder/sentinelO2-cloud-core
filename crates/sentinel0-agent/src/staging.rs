@@ -58,13 +58,16 @@ pub fn staging_root(upload_base: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn configured_upload_base_gets_hidden_staging_child() {
-        let dir = tempdir().unwrap();
-        let root = staging_root(dir.path()).unwrap();
+    fn configured_upload_base_gets_hidden_staging_child() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let root = staging_root(dir.path()).test_value()?;
         assert_eq!(root, dir.path().join(STAGING_DIRNAME));
         assert!(root.is_dir());
+
+        Ok(())
     }
 }

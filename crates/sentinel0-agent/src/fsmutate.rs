@@ -767,6 +767,7 @@ pub fn handle(
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -780,17 +781,17 @@ mod tests {
     }
 
     #[test]
-    fn delete_requires_explicit_recursive_and_creates_backup() {
-        let dir = tempdir().unwrap();
+    fn delete_requires_explicit_recursive_and_creates_backup() -> TestResult {
+        let dir = tempdir().test_value()?;
         let victim = dir.path().join("victim");
-        fs::create_dir_all(&victim).unwrap();
-        fs::write(victim.join("x"), "x").unwrap();
+        fs::create_dir_all(&victim).test_value()?;
+        fs::write(victim.join("x"), "x").test_value()?;
 
         let err = delete(
             &policy(dir.path()),
             &Map::from_iter([("path".into(), Value::String(victim.display().to_string()))]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(err.code, "is_directory");
 
         let result = delete(
@@ -800,13 +801,15 @@ mod tests {
                 ("recursive".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert!(!victim.exists());
-        assert!(Path::new(result["backup"].as_str().unwrap()).exists());
+        assert!(Path::new(result["backup"].as_str().test_value()?).exists());
+
+        Ok(())
     }
 
     #[test]
-    fn recognizes_only_our_timestamped_backup_names() {
+    fn recognizes_only_our_timestamped_backup_names() -> TestResult {
         for name in [
             "model.gguf.bak.20260924-142530.123456",
             "project.bak.20260924-142530.123456.tar.gz",
@@ -828,64 +831,72 @@ mod tests {
         ] {
             assert!(!is_own_backup(Path::new(name)), "{name}");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn generated_backups_are_recognized_as_ours() {
-        let dir = tempdir().unwrap();
+    fn generated_backups_are_recognized_as_ours() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("important.txt");
-        fs::write(&file, "precious").unwrap();
-        let backup = backup_file(&file).unwrap();
+        fs::write(&file, "precious").test_value()?;
+        let backup = backup_file(&file).test_value()?;
         assert!(is_own_backup(&backup));
+
+        Ok(())
     }
 
     #[test]
-    fn deleting_our_backup_is_terminal() {
-        let dir = tempdir().unwrap();
+    fn deleting_our_backup_is_terminal() -> TestResult {
+        let dir = tempdir().test_value()?;
         let backup = dir.path().join("model.gguf.bak.20260924-142530.123456");
-        fs::write(&backup, "backup bytes").unwrap();
+        fs::write(&backup, "backup bytes").test_value()?;
 
         let result = delete(
             &policy(dir.path()),
             &Map::from_iter([("path".into(), Value::String(backup.display().to_string()))]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert!(!backup.exists());
         assert!(result["backup"].is_null());
         assert_eq!(result["terminal"], Value::Bool(true));
         assert_eq!(
             fs::read_dir(dir.path())
-                .unwrap()
+                .test_value()?
                 .filter_map(Result::ok)
                 .count(),
             0
         );
+
+        Ok(())
     }
 
     #[test]
-    fn deleting_user_bak_file_still_creates_backup() {
-        let dir = tempdir().unwrap();
+    fn deleting_user_bak_file_still_creates_backup() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("config.bak");
-        fs::write(&file, "user data").unwrap();
+        fs::write(&file, "user data").test_value()?;
 
         let result = delete(
             &policy(dir.path()),
             &Map::from_iter([("path".into(), Value::String(file.display().to_string()))]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert!(!file.exists());
-        let backup = Path::new(result["backup"].as_str().unwrap());
+        let backup = Path::new(result["backup"].as_str().test_value()?);
         assert!(backup.exists());
         assert!(!result.contains_key("terminal"));
+
+        Ok(())
     }
 
     #[test]
-    fn both_move_endpoints_require_rw() {
-        let dir = tempdir().unwrap();
+    fn both_move_endpoints_require_rw() -> TestResult {
+        let dir = tempdir().test_value()?;
         let source = dir.path().join("a");
-        fs::write(&source, "x").unwrap();
+        fs::write(&source, "x").test_value()?;
         let err = move_path(
             &policy(dir.path()),
             &Map::from_iter([
@@ -893,46 +904,50 @@ mod tests {
                 ("dst".into(), Value::String("/tmp/outside".into())),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(err.code, "path_not_allowed");
+
+        Ok(())
     }
 
     #[test]
-    fn directory_backup_preserves_nested_symlinks_without_reading_targets() {
+    fn directory_backup_preserves_nested_symlinks_without_reading_targets() -> TestResult {
         use flate2::read::GzDecoder;
         use std::os::unix::fs::symlink;
 
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+        let root = tempdir().test_value()?;
+        let outside = tempdir().test_value()?;
         let victim = root.path().join("victim");
-        fs::create_dir(&victim).unwrap();
+        fs::create_dir(&victim).test_value()?;
         let secret = outside.path().join("secret.txt");
-        fs::write(&secret, "outside secret").unwrap();
-        symlink(&secret, victim.join("link")).unwrap();
+        fs::write(&secret, "outside secret").test_value()?;
+        symlink(&secret, victim.join("link")).test_value()?;
 
-        let archive_path = backup_dir(&victim).unwrap();
-        let decoder = GzDecoder::new(fs::File::open(archive_path).unwrap());
+        let archive_path = backup_dir(&victim).test_value()?;
+        let decoder = GzDecoder::new(fs::File::open(archive_path).test_value()?);
         let mut archive = tar::Archive::new(decoder);
         let mut saw_link = false;
-        for entry in archive.entries().unwrap() {
-            let entry = entry.unwrap();
-            if entry.path().unwrap().ends_with("link") {
+        for entry in archive.entries().test_value()? {
+            let entry = entry.test_value()?;
+            if entry.path().test_value()?.ends_with("link") {
                 assert!(entry.header().entry_type().is_symlink());
                 saw_link = true;
             }
         }
         assert!(saw_link);
+
+        Ok(())
     }
 
     #[test]
-    fn copy_preserves_top_level_symlink_without_reading_its_target() {
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+    fn copy_preserves_top_level_symlink_without_reading_its_target() -> TestResult {
+        let root = tempdir().test_value()?;
+        let outside = tempdir().test_value()?;
         let secret = outside.path().join("secret");
-        fs::write(&secret, "do not read me").unwrap();
+        fs::write(&secret, "do not read me").test_value()?;
         let source = root.path().join("source-link");
         let destination = root.path().join("copied-link");
-        symlink(&secret, &source).unwrap();
+        symlink(&secret, &source).test_value()?;
 
         let result = copy_path(
             &policy(root.path()),
@@ -944,22 +959,24 @@ mod tests {
                 ),
             ]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(result["kind"], "symlink");
-        assert_eq!(fs::read_link(&destination).unwrap(), secret);
-        assert_eq!(fs::read_to_string(&secret).unwrap(), "do not read me");
+        assert_eq!(fs::read_link(&destination).test_value()?, secret);
+        assert_eq!(fs::read_to_string(&secret).test_value()?, "do not read me");
+
+        Ok(())
     }
 
     #[test]
-    fn failed_staged_copy_does_not_destroy_existing_destination() {
+    fn failed_staged_copy_does_not_destroy_existing_destination() -> TestResult {
         use std::os::unix::net::UnixListener;
 
-        let root = tempdir().unwrap();
+        let root = tempdir().test_value()?;
         let source = root.path().join("socket");
-        let _listener = UnixListener::bind(&source).unwrap();
+        let _listener = UnixListener::bind(&source).test_value()?;
         let destination = root.path().join("destination");
-        fs::write(&destination, "keep me").unwrap();
+        fs::write(&destination, "keep me").test_value()?;
 
         let error = copy_path(
             &policy(root.path()),
@@ -972,44 +989,48 @@ mod tests {
                 ("overwrite".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
 
         assert_eq!(error.code, "copy_failed");
-        assert_eq!(fs::read_to_string(destination).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(destination).test_value()?, "keep me");
+
+        Ok(())
     }
 
     #[test]
-    fn deleting_symlink_backs_up_link_not_target() {
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+    fn deleting_symlink_backs_up_link_not_target() -> TestResult {
+        let root = tempdir().test_value()?;
+        let outside = tempdir().test_value()?;
         let target = outside.path().join("target");
-        fs::write(&target, "still here").unwrap();
+        fs::write(&target, "still here").test_value()?;
         let link = root.path().join("link");
-        symlink(&target, &link).unwrap();
+        symlink(&target, &link).test_value()?;
 
         let result = delete(
             &policy(root.path()),
             &Map::from_iter([("path".into(), Value::String(link.display().to_string()))]),
         )
-        .unwrap();
+        .test_value()?;
 
-        assert!(!entry_exists(&link).unwrap());
-        assert_eq!(fs::read_to_string(&target).unwrap(), "still here");
-        let backup = PathBuf::from(result["backup"].as_str().unwrap());
+        assert!(!entry_exists(&link).test_value()?);
+        assert_eq!(fs::read_to_string(&target).test_value()?, "still here");
+        let backup = PathBuf::from(result["backup"].as_str().test_value()?);
         assert!(
             fs::symlink_metadata(&backup)
-                .unwrap()
+                .test_value()?
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(fs::read_link(backup).unwrap(), target);
+        assert_eq!(fs::read_link(backup).test_value()?, target);
+
+        Ok(())
     }
 
     #[test]
-    fn copy_to_same_entry_is_rejected_without_touching_source() {
-        let root = tempdir().unwrap();
+    fn copy_to_same_entry_is_rejected_without_touching_source() -> TestResult {
+        let root = tempdir().test_value()?;
         let source = root.path().join("same");
-        fs::write(&source, "keep me").unwrap();
+        fs::write(&source, "keep me").test_value()?;
 
         let error = copy_path(
             &policy(root.path()),
@@ -1019,21 +1040,23 @@ mod tests {
                 ("overwrite".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
 
         assert_eq!(error.code, "invalid_payload");
-        assert_eq!(fs::read_to_string(source).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(source).test_value()?, "keep me");
+
+        Ok(())
     }
     #[test]
-    fn directory_copy_preserves_nested_symlink_without_reading_target() {
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+    fn directory_copy_preserves_nested_symlink_without_reading_target() -> TestResult {
+        let root = tempdir().test_value()?;
+        let outside = tempdir().test_value()?;
         let source = root.path().join("source");
         let destination = root.path().join("destination");
-        fs::create_dir(&source).unwrap();
+        fs::create_dir(&source).test_value()?;
         let secret = outside.path().join("secret");
-        fs::write(&secret, "outside").unwrap();
-        symlink(&secret, source.join("nested-link")).unwrap();
+        fs::write(&secret, "outside").test_value()?;
+        symlink(&secret, source.join("nested-link")).test_value()?;
 
         let result = copy_path(
             &policy(root.path()),
@@ -1045,16 +1068,17 @@ mod tests {
                 ),
             ]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(result["kind"], "dir");
         let copied_link = destination.join("nested-link");
         assert!(
             fs::symlink_metadata(&copied_link)
-                .unwrap()
+                .test_value()?
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(fs::read_link(copied_link).unwrap(), secret);
+        assert_eq!(fs::read_link(copied_link).test_value()?, secret);
+        Ok(())
     }
 }

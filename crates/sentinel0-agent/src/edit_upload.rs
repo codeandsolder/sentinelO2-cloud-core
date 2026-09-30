@@ -166,13 +166,14 @@ pub fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult 
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn chunked_write_flows_through_native_editor() {
-        let dir = tempdir().unwrap();
+    fn chunked_write_flows_through_native_editor() -> TestResult {
+        let dir = tempdir().test_value()?;
         let target = dir.path().join("x.txt");
-        fs::write(&target, "before").unwrap();
+        fs::write(&target, "before").test_value()?;
         let policy = Policy {
             upload_base: dir.path().join("uploads"),
             file_ops_paths: vec![FileOpsPath {
@@ -181,8 +182,8 @@ mod tests {
             }],
             ..Policy::default()
         };
-        let init = init(&policy).unwrap();
-        let id = init["upload_id"].as_str().unwrap();
+        let init = init(&policy).test_value()?;
+        let id = init["upload_id"].as_str().test_value()?;
         file(
             &policy,
             &Map::from_iter([
@@ -191,7 +192,7 @@ mod tests {
                 ("content".into(), Value::String("after".into())),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         let result = complete(
             &policy,
             &Map::from_iter([
@@ -200,8 +201,10 @@ mod tests {
                 ("mode".into(), Value::String("write".into())),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["ok"], true);
-        assert_eq!(fs::read_to_string(target).unwrap(), "after");
+        assert_eq!(fs::read_to_string(target).test_value()?, "after");
+
+        Ok(())
     }
 }

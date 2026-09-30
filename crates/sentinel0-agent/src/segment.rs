@@ -186,24 +186,29 @@ pub fn unauthorised_segment(policy: &Policy, command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
 
     #[test]
-    fn quoted_separators_are_data_not_structure() {
+    fn quoted_separators_are_data_not_structure() -> TestResult {
         assert_eq!(
             split_top_level("printf ';|&&' && echo done"),
             vec!["printf ';|&&'", "echo done"]
         );
+
+        Ok(())
     }
 
     #[test]
-    fn substitution_ignores_single_quotes_but_not_double_quotes() {
+    fn substitution_ignores_single_quotes_but_not_double_quotes() -> TestResult {
         assert_eq!(has_substitution("echo '$(id)'"), None);
         assert_eq!(has_substitution("echo \"$(id)\""), Some("$("));
         assert_eq!(has_substitution("echo `id`"), Some("`"));
+
+        Ok(())
     }
 
     #[test]
-    fn strict_segments_match_official_concessions() {
+    fn strict_segments_match_official_concessions() -> TestResult {
         let policy = Policy {
             allowed_commands: vec!["make".into()],
             ..Policy::default()
@@ -216,5 +221,7 @@ mod tests {
             unauthorised_segment(&policy, "make; curl bad"),
             Some("curl bad".into())
         );
+
+        Ok(())
     }
 }

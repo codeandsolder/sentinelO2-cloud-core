@@ -633,6 +633,7 @@ pub fn select_help_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
 
     fn full() -> Map<String, Value> {
         Map::from_iter([
@@ -650,36 +651,40 @@ mod tests {
     }
 
     #[test]
-    fn path_selects_nested_value_and_neutralizes_tool_names() {
+    fn path_selects_nested_value_and_neutralizes_tool_names() -> TestResult {
         let payload = Map::from_iter([("path".into(), Value::String("navigation.exec".into()))]);
-        let result = select_help_response(&payload, full(), &BTreeMap::new()).unwrap();
+        let result = select_help_response(&payload, full(), &BTreeMap::new()).test_value()?;
         assert_eq!(result["value"], "op:exec");
         assert_eq!(
             result["presentation"]["tool_reference_map"]["sentinel_exec"],
             "exec"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn unknown_fields_are_rejected() {
+    fn unknown_fields_are_rejected() -> TestResult {
         let payload = Map::from_iter([("wat".into(), Value::Bool(true))]);
         assert_eq!(
             select_help_response(&payload, full(), &BTreeMap::new())
-                .unwrap_err()
+                .test_error()?
                 .code,
             "invalid_payload"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn capabilities_detail_is_strict() {
-        assert_eq!(capabilities_detail(&Map::new()).unwrap(), "full");
+    fn capabilities_detail_is_strict() -> TestResult {
+        assert_eq!(capabilities_detail(&Map::new()).test_value()?, "full");
         assert_eq!(
             capabilities_detail(&Map::from_iter([(
                 "detail".into(),
                 Value::String("SUMMARY".into()),
             )]))
-            .unwrap(),
+            .test_value()?,
             "summary"
         );
         assert!(
@@ -689,5 +694,7 @@ mod tests {
             )]))
             .is_err()
         );
+
+        Ok(())
     }
 }

@@ -1356,9 +1356,10 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
 
     #[test]
-    fn unknown_local_api_keys_fail_at_config_boundary() {
+    fn unknown_local_api_keys_fail_at_config_boundary() -> TestResult {
         for text in [
             "transport: unix
 protocol: jsonrpc
@@ -1394,31 +1395,35 @@ actions:
   a: { method: a }
 ",
         ] {
-            let raw: yaml_serde::Value = yaml_serde::from_str(text).unwrap();
+            let raw: yaml_serde::Value = yaml_serde::from_str(text).test_value()?;
             assert!(
                 endpoint_from_raw("x", &raw).is_err(),
                 "unknown local_api key unexpectedly parsed: {text:?}"
             );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn half_written_compatibility_constraint_is_rejected() {
+    fn half_written_compatibility_constraint_is_rejected() -> TestResult {
         let raw: yaml_serde::Value = yaml_serde::from_str(
             "transport: unix\nprotocol: jsonrpc\npath: /tmp/x.sock\ncompatibility:\n  accept: { exact: 20 }\nactions:\n  a: { method: a }\n",
         )
-        .unwrap();
-        let error = endpoint_from_raw("x", &raw).unwrap_err();
+        .test_value()?;
+        let error = endpoint_from_raw("x", &raw).test_error()?;
         assert!(error.contains("compatibility.probe"));
+
+        Ok(())
     }
 
     #[test]
-    fn run_as_endpoint_remains_usable_and_relay_has_no_shell() {
+    fn run_as_endpoint_remains_usable_and_relay_has_no_shell() -> TestResult {
         let raw: yaml_serde::Value = yaml_serde::from_str(
             "transport: unix\nprotocol: jsonrpc\npath: /run/user/1002/x.sock\nrun_as: userx\nactions:\n  a: { method: a }\n",
         )
-        .unwrap();
-        let endpoint = endpoint_from_raw("ep", &raw).unwrap();
+        .test_value()?;
+        let endpoint = endpoint_from_raw("ep", &raw).test_value()?;
         let policy = Policy::default();
         let sudo = policy.tooling.command("sudo").display().to_string();
         let argv = relay_command(
@@ -1426,7 +1431,7 @@ actions:
             &endpoint,
             Path::new("/usr/local/bin/sentinelx-core"),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(
             &argv[..5],
             &[
@@ -1451,10 +1456,12 @@ actions:
             ..Policy::default()
         };
         assert!(has_usable_endpoints(&policy));
+
+        Ok(())
     }
 
     #[test]
-    fn projection_supports_dotted_paths_and_arrays() {
+    fn projection_supports_dotted_paths_and_arrays() -> TestResult {
         let value = json!([
             {"Config": {"Image": "a"}, "Name": "one"},
             {"Config": {"Image": "b"}, "Name": "two"}
@@ -1462,11 +1469,15 @@ actions:
         let projected = project(value, &["Config.Image".into(), "Name".into()]);
         assert_eq!(projected[0]["Config.Image"], "a");
         assert_eq!(projected[1]["Name"], "two");
+
+        Ok(())
     }
 
     #[test]
-    fn missing_template_param_is_explicit() {
-        let error = render("/containers/{id}/json", &Map::new()).unwrap_err();
+    fn missing_template_param_is_explicit() -> TestResult {
+        let error = render("/containers/{id}/json", &Map::new()).test_error()?;
         assert_eq!(error.code, "missing_param");
+
+        Ok(())
     }
 }

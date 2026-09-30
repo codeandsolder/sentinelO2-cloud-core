@@ -257,6 +257,7 @@ pub async fn maybe_rotate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
@@ -281,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn rotates_past_half_life() {
+    fn rotates_past_half_life() -> TestResult {
         assert!(should_rotate(&AuthToken::new(token(
             100 * 86_400,
             Some(-300 * 86_400)
@@ -290,46 +291,52 @@ mod tests {
             300 * 86_400,
             Some(-60 * 86_400)
         ))));
+
+        Ok(())
     }
 
     #[test]
-    fn legacy_token_rotates_near_expiry() {
+    fn legacy_token_rotates_near_expiry() -> TestResult {
         assert!(should_rotate(&AuthToken::new(token(100 * 86_400, None))));
         assert!(!should_rotate(&AuthToken::new(token(300 * 86_400, None))));
         assert!(!should_rotate(&AuthToken::new("not-a-jwt")));
+
+        Ok(())
     }
 
     #[test]
-    fn persisted_rotated_identity_is_preferred() {
-        let dir = tempdir().unwrap();
+    fn persisted_rotated_identity_is_preferred() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join(ROTATED_NAME);
         let new = token(360 * 86_400, Some(0));
-        persist_rotated_to(&path, "h1", &new, "https://hub.example").unwrap();
+        persist_rotated_to(&path, "h1", &new, "https://hub.example").test_value()?;
 
         let effective =
             load_effective_identity_from(&path, identity("h1", token(300 * 86_400, None)));
         assert_eq!(effective.token.expose(), new);
         assert_eq!(effective.hub, "https://hub.example");
         assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&path).test_value()?.permissions().mode() & 0o777,
             0o600
         );
-        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+        assert!(fs::read_dir(dir.path()).test_value()?.all(|entry| {
             !entry
-                .unwrap()
+                .test_value()?
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".idrot-")
         }));
+
+        Ok(())
     }
 
     #[test]
-    fn corrupt_expired_or_wrong_host_rotated_identity_falls_back() {
-        let dir = tempdir().unwrap();
+    fn corrupt_expired_or_wrong_host_rotated_identity_falls_back() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join(ROTATED_NAME);
         let original = token(300 * 86_400, None);
 
-        fs::write(&path, "{broken").unwrap();
+        fs::write(&path, "{broken").test_value()?;
         assert_eq!(
             load_effective_identity_from(&path, identity("h1", original.clone()))
                 .token
@@ -343,7 +350,7 @@ mod tests {
             &token(-10, Some(-360 * 86_400)),
             "https://hub.example",
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(
             load_effective_identity_from(&path, identity("h1", original.clone()))
                 .token
@@ -357,12 +364,14 @@ mod tests {
             &token(300 * 86_400, None),
             "https://hub.example",
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(
             load_effective_identity_from(&path, identity("h1", original.clone()))
                 .token
                 .expose(),
             original
         );
+
+        Ok(())
     }
 }

@@ -539,13 +539,14 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn plain_directory_gets_bounded_summary() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.rs"), "fn main(){}").unwrap();
-        fs::create_dir(dir.path().join("src")).unwrap();
+    async fn plain_directory_gets_bounded_summary() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.rs"), "fn main(){}").test_value()?;
+        fs::create_dir(dir.path().join("src")).test_value()?;
         let policy = Policy {
             file_ops_paths: vec![FileOpsPath {
                 path: dir.path().to_owned(),
@@ -561,13 +562,15 @@ mod tests {
             )]),
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["kind"], "directory");
         assert_eq!(result["repository"]["file_count"], 1);
+
+        Ok(())
     }
 
     #[test]
-    fn top_counts_streams_paths_without_materializing_the_inventory() {
+    fn top_counts_streams_paths_without_materializing_the_inventory() -> TestResult {
         let paths = ["src/lib.rs", "src/main.rs", "README", ".gitignore"];
         let (tracked, top, extensions, truncated) = top_counts(paths);
         assert_eq!(tracked, 4);
@@ -576,5 +579,7 @@ mod tests {
         assert_eq!(extensions["<none>"], 1);
         assert_eq!(extensions["<dotfile>"], 1);
         assert!(!truncated);
+
+        Ok(())
     }
 }

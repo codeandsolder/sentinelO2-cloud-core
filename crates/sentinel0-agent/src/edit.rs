@@ -901,6 +901,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -915,11 +916,11 @@ mod tests {
     }
 
     #[test]
-    fn edit_updates_mtime_instead_of_preserving_stale_source_timestamp() {
-        let dir = tempdir().unwrap();
+    fn edit_updates_mtime_instead_of_preserving_stale_source_timestamp() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("x.txt");
-        fs::write(&path, "old").unwrap();
-        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "old").test_value()?;
+        let before = fs::metadata(&path).test_value()?.modified().test_value()?;
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         let result = edit(
@@ -930,16 +931,18 @@ mod tests {
                 ("new_text".into(), Value::String("new".into())),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["ok"], true);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
-        let after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(fs::read_to_string(&path).test_value()?, "new");
+        let after = fs::metadata(&path).test_value()?.modified().test_value()?;
         assert!(after > before, "successful edit preserved stale mtime");
+
+        Ok(())
     }
 
     #[test]
-    fn dry_run_create_leaves_target_tree_absent() {
-        let dir = tempdir().unwrap();
+    fn dry_run_create_leaves_target_tree_absent() -> TestResult {
+        let dir = tempdir().test_value()?;
         let target = dir.path().join("share").join("nested").join("new.txt");
 
         let result = edit(
@@ -953,22 +956,24 @@ mod tests {
                 ("diff".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(result["dry_run"], true);
-        assert!(result["diff"].as_str().unwrap().contains("+hello"));
+        assert!(result["diff"].as_str().test_value()?.contains("+hello"));
         assert!(!target.exists());
-        assert!(!target.parent().unwrap().exists());
+        assert!(!target.parent().test_value()?.exists());
         assert!(!dir.path().join("share").exists());
+
+        Ok(())
     }
 
     #[test]
-    fn dry_run_existing_file_leaves_no_sibling_temp_or_content_change() {
-        let dir = tempdir().unwrap();
+    fn dry_run_existing_file_leaves_no_sibling_temp_or_content_change() -> TestResult {
+        let dir = tempdir().test_value()?;
         let target = dir.path().join("config.yaml");
-        fs::write(&target, "a: 1\n").unwrap();
+        fs::write(&target, "a: 1\n").test_value()?;
         let before = fs::read_dir(dir.path())
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
             .collect::<std::collections::BTreeSet<_>>();
@@ -983,23 +988,25 @@ mod tests {
                 ("diff".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
 
         assert_eq!(result["dry_run"], true);
-        assert_eq!(fs::read_to_string(&target).unwrap(), "a: 1\n");
+        assert_eq!(fs::read_to_string(&target).test_value()?, "a: 1\n");
 
         let after = fs::read_dir(dir.path())
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
             .filter(|name| name != crate::staging::STAGING_DIRNAME)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(after, before);
+
+        Ok(())
     }
 
     #[test]
-    fn missing_target_without_create_leaves_parents_absent() {
-        let dir = tempdir().unwrap();
+    fn missing_target_without_create_leaves_parents_absent() -> TestResult {
+        let dir = tempdir().test_value()?;
         let target = dir.path().join("missing").join("x.txt");
         let error = edit(
             &policy(dir.path()),
@@ -1009,17 +1016,19 @@ mod tests {
                 ("new_text".into(), Value::String("x\n".into())),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
 
         assert_eq!(error.code, "target_not_found");
-        assert!(!target.parent().unwrap().exists());
+        assert!(!target.parent().test_value()?.exists());
+
+        Ok(())
     }
 
     #[test]
-    fn yaml_validation_rejects_bad_candidate_without_touching_target() {
-        let dir = tempdir().unwrap();
+    fn yaml_validation_rejects_bad_candidate_without_touching_target() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("x.yaml");
-        fs::write(&path, "ok: true\n").unwrap();
+        fs::write(&path, "ok: true\n").test_value()?;
         let error = edit(
             &policy(dir.path()),
             &Map::from_iter([
@@ -1029,12 +1038,12 @@ mod tests {
                 ("validator_preset".into(), Value::String("yaml".into())),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "validation_failed");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "ok: true\n");
+        assert_eq!(fs::read_to_string(&path).test_value()?, "ok: true\n");
         let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
         let leftovers = fs::read_dir(staging)
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
             .collect::<Vec<_>>();
@@ -1042,5 +1051,7 @@ mod tests {
             leftovers.is_empty(),
             "failed edit leaked staged files: {leftovers:?}"
         );
+
+        Ok(())
     }
 }

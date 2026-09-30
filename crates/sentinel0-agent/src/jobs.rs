@@ -106,6 +106,7 @@ pub fn build_completed_event_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use chrono::TimeZone;
     use sentinel0_proto::ResponseError;
 
@@ -127,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn returncode_zero_maps_to_succeeded() {
+    fn returncode_zero_maps_to_succeeded() -> TestResult {
         let (start, finish) = times();
         let data = build_completed_event_data(
             "job",
@@ -147,10 +148,12 @@ mod tests {
         assert_eq!(data["exit_code"], 0);
         assert_eq!(data["output"], "ok");
         assert_eq!(data["duration_s"], 1.23);
+
+        Ok(())
     }
 
     #[test]
-    fn nonzero_and_missing_returncode_map_to_failed() {
+    fn nonzero_and_missing_returncode_map_to_failed() -> TestResult {
         let (start, finish) = times();
         for result in [
             BTreeMap::from([("returncode".into(), Value::from(7))]),
@@ -166,10 +169,12 @@ mod tests {
             );
             assert_eq!(data["status"], "failed");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn timed_out_overrides_returncode() {
+    fn timed_out_overrides_returncode() -> TestResult {
         let (start, finish) = times();
         let data = build_completed_event_data(
             "job",
@@ -186,10 +191,12 @@ mod tests {
             finish,
         );
         assert_eq!(data["status"], "timeout");
+
+        Ok(())
     }
 
     #[test]
-    fn handler_error_maps_to_failed_with_message() {
+    fn handler_error_maps_to_failed_with_message() -> TestResult {
         let (start, finish) = times();
         let response = Message::Response {
             id: "req".into(),
@@ -205,10 +212,12 @@ mod tests {
         assert_eq!(data["status"], "failed");
         assert_eq!(data["exit_code"], Value::Null);
         assert_eq!(data["error"], "fixture failed");
+
+        Ok(())
     }
 
     #[test]
-    fn oversized_output_is_byte_bounded_and_flagged() {
+    fn oversized_output_is_byte_bounded_and_flagged() -> TestResult {
         let (start, finish) = times();
         let output = "x".repeat(MAX_EVENT_OUTPUT_BYTES + 100);
         let data = build_completed_event_data(
@@ -226,9 +235,11 @@ mod tests {
             finish,
         );
         assert_eq!(
-            data["output"].as_str().unwrap().len(),
+            data["output"].as_str().test_value()?.len(),
             MAX_EVENT_OUTPUT_BYTES
         );
         assert_eq!(data["output_truncated"], true);
+
+        Ok(())
     }
 }

@@ -30,19 +30,22 @@ pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn no_replace_preserves_existing_destination() {
-        let dir = tempdir().unwrap();
+    fn no_replace_preserves_existing_destination() -> TestResult {
+        let dir = tempdir().test_value()?;
         let src = dir.path().join("src");
         let dst = dir.path().join("dst");
-        std::fs::write(&src, "source").unwrap();
-        std::fs::write(&dst, "destination").unwrap();
+        std::fs::write(&src, "source").test_value()?;
+        std::fs::write(&dst, "destination").test_value()?;
 
-        let error = rename_no_replace(&src, &dst).unwrap_err();
+        let error = rename_no_replace(&src, &dst).test_error()?;
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read_to_string(&src).unwrap(), "source");
-        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "destination");
+        assert_eq!(std::fs::read_to_string(&src).test_value()?, "source");
+        assert_eq!(std::fs::read_to_string(&dst).test_value()?, "destination");
+
+        Ok(())
     }
 }

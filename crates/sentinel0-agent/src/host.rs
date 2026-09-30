@@ -161,22 +161,27 @@ pub fn loadavg() -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
 
     #[test]
-    fn host_info_has_required_identity_fields() {
+    fn host_info_has_required_identity_fields() -> TestResult {
         let host = gather_host_info("fixture".into(), None);
         assert_eq!(host.id, "fixture");
         assert!(!host.hostname.is_empty());
         assert!(!host.os.is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn uptime_and_loadavg_are_sane_on_linux_ci() {
+    fn uptime_and_loadavg_are_sane_on_linux_ci() -> TestResult {
         if Path::new("/proc/uptime").exists() {
             assert!(uptime_seconds().is_some_and(|value| value >= 0.0));
         }
         if Path::new("/proc/loadavg").exists() {
             assert!(loadavg().is_some());
         }
+
+        Ok(())
     }
 }

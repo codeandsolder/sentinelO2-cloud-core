@@ -1070,10 +1070,11 @@ impl Dispatcher for CoreDispatcher {
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath, ServiceSpec};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn capabilities_are_derived_from_real_dispatch_surface() {
+    async fn capabilities_are_derived_from_real_dispatch_surface() -> TestResult {
         let dispatcher = CoreDispatcher::new(Policy::default(), "/tmp/config".into(), "test");
         let Message::Response {
             result: Some(result),
@@ -1085,7 +1086,7 @@ mod tests {
         else {
             panic!("expected capabilities response");
         };
-        let advertised = result["ops_supported"].as_array().unwrap();
+        let advertised = result["ops_supported"].as_array().test_value()?;
         assert_eq!(advertised.len(), Op::ALL.len() - 1);
         assert!(!advertised.iter().any(|value| value == "local_api"));
 
@@ -1095,7 +1096,7 @@ mod tests {
             yaml_serde::from_str(
                 "transport: unix\nprotocol: http\npath: /tmp/fixture.sock\nactions:\n  ping:\n    request: GET /ping\n",
             )
-            .unwrap(),
+            .test_value()?,
         );
         let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
         let capabilities = dispatcher.capabilities();
@@ -1107,10 +1108,12 @@ mod tests {
             Op::ALL.len()
         );
         assert!(capabilities.iter().any(|name| name == "local_api"));
+
+        Ok(())
     }
 
     #[test]
-    fn unusable_commands_reports_only_sudo_under_no_new_privileges() {
+    fn unusable_commands_reports_only_sudo_under_no_new_privileges() -> TestResult {
         let commands = vec![
             "sudo systemctl".to_owned(),
             "/usr/bin/sudo -n true".to_owned(),
@@ -1127,19 +1130,23 @@ mod tests {
             CoreDispatcher::unusable_commands_for(&commands, false),
             json!({})
         );
+
+        Ok(())
     }
 
     #[test]
-    fn unusable_commands_ignores_empty_and_whitespace_wildcards() {
+    fn unusable_commands_ignores_empty_and_whitespace_wildcards() -> TestResult {
         let commands = vec!["".to_owned(), "   ".to_owned(), "echo".to_owned()];
         assert_eq!(
             CoreDispatcher::unusable_commands_for(&commands, true),
             json!({})
         );
+
+        Ok(())
     }
 
     #[test]
-    fn help_operations_only_recommends_live_reachable_surfaces() {
+    fn help_operations_only_recommends_live_reachable_surfaces() -> TestResult {
         let mut policy = Policy::default();
         policy.disabled_ops.extend(
             [
@@ -1158,8 +1165,8 @@ mod tests {
                 "topic".into(),
                 Value::String("operations".into()),
             )]))
-            .unwrap();
-        let navigation = response["navigation"].as_object().unwrap();
+            .test_value()?;
+        let navigation = response["navigation"].as_object().test_value()?;
 
         assert_eq!(navigation.len(), 3);
         assert!(navigation.contains_key("capabilities"));
@@ -1168,10 +1175,12 @@ mod tests {
         assert!(!navigation.contains_key("read / list / search"));
         assert!(!navigation.contains_key("service / restart"));
         assert!(!navigation.contains_key("playbooks"));
+
+        Ok(())
     }
 
     #[test]
-    fn help_access_tells_non_self_editing_host_to_change_config_on_host() {
+    fn help_access_tells_non_self_editing_host_to_change_config_on_host() -> TestResult {
         let mut policy = Policy::default();
         policy.disabled_ops.insert("edit".into());
         let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
@@ -1180,16 +1189,18 @@ mod tests {
                 "topic".into(),
                 Value::String("access".into()),
             )]))
-            .unwrap();
-        let note = response["extending_access"]["note"].as_str().unwrap();
+            .test_value()?;
+        let note = response["extending_access"]["note"].as_str().test_value()?;
 
         assert!(note.contains("cannot edit its own config remotely"));
         assert!(note.contains("ON the host"));
+
+        Ok(())
     }
 
     #[test]
-    fn help_navigation_requires_real_prerequisites() {
-        let dir = tempdir().unwrap();
+    fn help_navigation_requires_real_prerequisites() -> TestResult {
+        let dir = tempdir().test_value()?;
         let mut policy = Policy {
             file_ops_paths: vec![FileOpsPath {
                 path: dir.path().to_owned(),
@@ -1223,17 +1234,19 @@ mod tests {
                 "missing live help entry: {key}"
             );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn help_exec_matches_optional_allowlist_enforcement() {
+    fn help_exec_matches_optional_allowlist_enforcement() -> TestResult {
         let dispatcher = CoreDispatcher::new(Policy::default(), "/tmp/config".into(), "test");
         let navigation = dispatcher.help_navigation();
         assert!(navigation.contains_key("exec"));
         assert!(
             navigation["exec"]
                 .as_str()
-                .unwrap()
+                .test_value()?
                 .contains("enforcement is disabled")
         );
 
@@ -1241,7 +1254,7 @@ mod tests {
         assert!(
             access["command"]
                 .as_str()
-                .unwrap()
+                .test_value()?
                 .contains("does not require an allowed_commands entry")
         );
 
@@ -1254,16 +1267,18 @@ mod tests {
         assert!(
             dispatcher.help_extending_access()["command"]
                 .as_str()
-                .unwrap()
+                .test_value()?
                 .contains("enforcement is enabled")
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn exec_and_file_ops_cover_self_hosting_minimum() {
-        let dir = tempdir().unwrap();
+    async fn exec_and_file_ops_cover_self_hosting_minimum() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("hello.txt");
-        std::fs::write(&file, "hello").unwrap();
+        std::fs::write(&file, "hello").test_value()?;
         let policy = Policy {
             allowed_commands: vec!["printf".into()],
             file_ops_paths: vec![FileOpsPath {
@@ -1301,10 +1316,12 @@ mod tests {
             panic!("read failed");
         };
         assert_eq!(result["content"], "hello");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn read_only_service_action_does_not_add_sudo() {
+    async fn read_only_service_action_does_not_add_sudo() -> TestResult {
         let mut policy = Policy::default();
         policy.services.insert(
             "fixture".into(),
@@ -1327,7 +1344,9 @@ mod tests {
                 false,
             )
             .await
-            .unwrap();
+            .test_value()?;
         assert!(result.contains_key("returncode"));
+
+        Ok(())
     }
 }

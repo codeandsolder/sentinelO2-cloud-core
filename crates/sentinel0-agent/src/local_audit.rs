@@ -273,21 +273,24 @@ pub fn read_recent(limit: usize) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn read_recent_is_newest_first_and_malformed_rows_are_skipped() {
-        let dir = tempdir().unwrap();
+    fn read_recent_is_newest_first_and_malformed_rows_are_skipped() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("audit.jsonl");
-        fs::write(&path, b"{\"n\":1}\nnot-json\n{\"n\":2}\n").unwrap();
+        fs::write(&path, b"{\"n\":1}\nnot-json\n{\"n\":2}\n").test_value()?;
         let rows = read_recent_from(&path, 3);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["n"], 2);
         assert_eq!(rows[1]["n"], 1);
+
+        Ok(())
     }
 
     #[test]
-    fn payload_summary_keeps_useful_values_and_redacts_tokenish_strings() {
+    fn payload_summary_keeps_useful_values_and_redacts_tokenish_strings() -> TestResult {
         let payload = Map::from_iter([
             (
                 "path".into(),
@@ -319,10 +322,12 @@ mod tests {
         );
         assert_eq!(summary["env"]["MODE"], "debug");
         assert_eq!(summary["env"]["TOKEN"], "[redacted-tokenish]");
+
+        Ok(())
     }
 
     #[test]
-    fn tokenish_classifier_is_intentionally_simple() {
+    fn tokenish_classifier_is_intentionally_simple() -> TestResult {
         assert!(looks_tokenish("prefix=A1b2C3d4E5f6G7h8I9j0K1l2;suffix"));
         assert!(looks_tokenish(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -330,32 +335,38 @@ mod tests {
         assert!(!looks_tokenish("ordinary-written-text-without-digits"));
         assert!(!looks_tokenish("123456789012345678901234567890"));
         assert!(!looks_tokenish("550e8400-e29b-41d4-a716-446655440000"));
+
+        Ok(())
     }
 
     #[test]
-    fn trim_keeps_exactly_the_newest_rows() {
-        let dir = tempdir().unwrap();
+    fn trim_keeps_exactly_the_newest_rows() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("audit.jsonl");
         let mut input = Vec::new();
         for n in 1..=(TRIM_TRIGGER + 1) {
-            writeln!(&mut input, "{{\"n\":{n}}}").unwrap();
+            writeln!(&mut input, "{{\"n\":{n}}}").test_value()?;
         }
-        fs::write(&path, input).unwrap();
+        fs::write(&path, input).test_value()?;
 
-        maybe_trim(&path).unwrap();
+        maybe_trim(&path).test_value()?;
 
         let rows = read_recent_from(&path, MAX_LINES);
         assert_eq!(rows.len(), MAX_LINES);
         assert_eq!(rows[0]["n"], TRIM_TRIGGER + 1);
         assert_eq!(rows[MAX_LINES - 1]["n"], TRIM_TRIGGER + 2 - MAX_LINES);
+
+        Ok(())
     }
 
     #[test]
-    fn retention_probe_stops_at_the_requested_line_limit() {
-        let dir = tempdir().unwrap();
+    fn retention_probe_stops_at_the_requested_line_limit() -> TestResult {
+        let dir = tempdir().test_value()?;
         let path = dir.path().join("audit.jsonl");
-        fs::write(&path, b"one\ntwo\nthree\n").unwrap();
-        assert!(!has_more_than_lines(&path, 3).unwrap());
-        assert!(has_more_than_lines(&path, 2).unwrap());
+        fs::write(&path, b"one\ntwo\nthree\n").test_value()?;
+        assert!(!has_more_than_lines(&path, 3).test_value()?);
+        assert!(has_more_than_lines(&path, 2).test_value()?);
+
+        Ok(())
     }
 }

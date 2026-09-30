@@ -1,6 +1,47 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{fmt::Debug, io};
+
+    pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    pub trait TestValue<T> {
+        fn test_value(self) -> TestResult<T>;
+    }
+
+    impl<T, E: Debug> TestValue<T> for Result<T, E> {
+        fn test_value(self) -> TestResult<T> {
+            match self {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    Err(io::Error::other(format!("expected Ok(..), got Err({error:?})")).into())
+                }
+            }
+        }
+    }
+
+    impl<T> TestValue<T> for Option<T> {
+        fn test_value(self) -> TestResult<T> {
+            self.ok_or_else(|| io::Error::other("expected Some(..), got None").into())
+        }
+    }
+
+    pub trait TestError<E> {
+        fn test_error(self) -> TestResult<E>;
+    }
+
+    impl<T, E> TestError<E> for Result<T, E> {
+        fn test_error(self) -> TestResult<E> {
+            match self {
+                Err(error) => Ok(error),
+                Ok(_) => Err(io::Error::other("expected Err(..), got Ok(..)").into()),
+            }
+        }
+    }
+}
+
 pub mod core;
 pub mod edit;
 pub mod edit_upload;
@@ -550,16 +591,8 @@ impl<D: Dispatcher> Agent<D> {
         });
     }
 
-    async fn start_background_request(
-        &self,
-        ws: &mut AgentWebSocket,
-        tasks: &mut JoinSet<()>,
-        response_tx: mpsc::Sender<Outbound>,
-        id: String,
-        op: Op,
-        payload: serde_json::Map<String, serde_json::Value>,
-    ) -> Result<bool, AgentError> {
-        let job_id = payload
+    fn background_job_id(payload: &serde_json::Map<String, serde_json::Value>) -> String {
+        payload
             .get("job_id")
             .and_then(serde_json::Value::as_str)
             .map_or_else(
@@ -570,13 +603,16 @@ impl<D: Dispatcher> Agent<D> {
                     )
                 },
                 ToOwned::to_owned,
-            );
-        let mut ack = Message::Response {
-            id: id.clone(),
+            )
+    }
+
+    fn background_ack(&self, id: String, op: Op, job_id: &str) -> Message {
+        Message::Response {
+            id,
             ok: true,
             result: Some(BTreeMap::from([
                 ("status".into(), serde_json::Value::String("running".into())),
-                ("job_id".into(), serde_json::Value::String(job_id.clone())),
+                ("job_id".into(), serde_json::Value::String(job_id.into())),
                 ("tool".into(), serde_json::Value::String(op.as_str().into())),
                 (
                     "host".into(),
@@ -584,7 +620,20 @@ impl<D: Dispatcher> Agent<D> {
                 ),
             ])),
             error: None,
-        };
+        }
+    }
+
+    async fn start_background_request(
+        &self,
+        ws: &mut AgentWebSocket,
+        tasks: &mut JoinSet<()>,
+        response_tx: mpsc::Sender<Outbound>,
+        id: String,
+        op: Op,
+        payload: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<bool, AgentError> {
+        let job_id = Self::background_job_id(&payload);
+        let mut ack = self.background_ack(id.clone(), op, &job_id);
         add_response_time(&mut ack);
         if ws
             .send(WsMessage::Text(serde_json::to_string(&ack)?.into()))

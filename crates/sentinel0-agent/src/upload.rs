@@ -709,6 +709,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -719,8 +720,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_chunk_index_must_fit_binary_protocol_width() {
-        let dir = tempdir().unwrap();
+    fn legacy_json_chunk_index_must_fit_binary_protocol_width() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = policy(dir.path());
         let init = upload_init(
             &policy,
@@ -729,8 +730,8 @@ mod tests {
                 ("total_size".into(), Value::from(1)),
             ]),
         )
-        .unwrap();
-        let id = init["upload_id"].as_str().unwrap();
+        .test_value()?;
+        let id = init["upload_id"].as_str().test_value()?;
         let error = upload_chunk(
             &policy,
             &Map::from_iter([
@@ -742,13 +743,15 @@ mod tests {
                 ),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "invalid_payload");
+
+        Ok(())
     }
 
     #[test]
-    fn chunked_upload_reassembles_and_verifies_case_insensitive_hash() {
-        let dir = tempdir().unwrap();
+    fn chunked_upload_reassembles_and_verifies_case_insensitive_hash() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = policy(dir.path());
         let init = upload_init(
             &policy,
@@ -757,8 +760,8 @@ mod tests {
                 ("total_size".into(), Value::from(6)),
             ]),
         )
-        .unwrap();
-        let id = init["upload_id"].as_str().unwrap();
+        .test_value()?;
+        let id = init["upload_id"].as_str().test_value()?;
         for (index, bytes) in [(0, b"abc".as_slice()), (1, b"def".as_slice())] {
             upload_chunk(
                 &policy,
@@ -771,7 +774,7 @@ mod tests {
                     ),
                 ]),
             )
-            .unwrap();
+            .test_value()?;
         }
         let expected = hash_bytes(b"abcdef").to_ascii_uppercase();
         let done = upload_complete(
@@ -781,12 +784,14 @@ mod tests {
                 ("sha256".into(), Value::String(expected)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(done["size"], 6);
         assert_eq!(
-            fs::read(dir.path().join("nested/x.bin")).unwrap(),
+            fs::read(dir.path().join("nested/x.bin")).test_value()?,
             b"abcdef"
         );
+
+        Ok(())
     }
 
     fn landing_policy(
@@ -810,9 +815,9 @@ mod tests {
     }
 
     #[test]
-    fn land_in_place_under_rw_path() {
-        let uploads = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
+    fn land_in_place_under_rw_path() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let workspace = tempdir().test_value()?;
         let target = workspace.path().join("canary.txt");
         let policy = landing_policy(
             uploads.path(),
@@ -832,17 +837,19 @@ mod tests {
                 ("land_in_place".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         let meta = upload_meta(&policy, &init);
         assert!(meta.landed_in_place);
         assert_eq!(PathBuf::from(meta.target_path), target);
+
+        Ok(())
     }
 
     #[test]
-    fn land_in_place_outside_rw_falls_back_to_staging() {
-        let uploads = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
-        let elsewhere = tempdir().unwrap();
+    fn land_in_place_outside_rw_falls_back_to_staging() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let workspace = tempdir().test_value()?;
+        let elsewhere = tempdir().test_value()?;
         let target = elsewhere.path().join("x.txt");
         let policy = landing_policy(
             uploads.path(),
@@ -861,16 +868,18 @@ mod tests {
                 ("land_in_place".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         let meta = upload_meta(&policy, &init);
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+
+        Ok(())
     }
 
     #[test]
-    fn land_in_place_is_opt_in_even_under_rw_path() {
-        let uploads = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
+    fn land_in_place_is_opt_in_even_under_rw_path() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let workspace = tempdir().test_value()?;
         let target = workspace.path().join("default-staged.txt");
         let policy = landing_policy(
             uploads.path(),
@@ -886,16 +895,18 @@ mod tests {
                 Value::String(target.display().to_string()),
             )]),
         )
-        .unwrap();
+        .test_value()?;
         let meta = upload_meta(&policy, &init);
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+
+        Ok(())
     }
 
     #[test]
-    fn read_only_path_does_not_land_in_place() {
-        let uploads = tempdir().unwrap();
-        let readonly = tempdir().unwrap();
+    fn read_only_path_does_not_land_in_place() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let readonly = tempdir().test_value()?;
         let target = readonly.path().join("z.txt");
         let policy = landing_policy(
             uploads.path(),
@@ -911,16 +922,18 @@ mod tests {
                 ("land_in_place".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         let meta = upload_meta(&policy, &init);
         assert!(!meta.landed_in_place);
         assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+
+        Ok(())
     }
 
     #[test]
-    fn land_in_place_traversal_outside_rw_is_still_refused() {
-        let uploads = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
+    fn land_in_place_traversal_outside_rw_is_still_refused() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let workspace = tempdir().test_value()?;
         let policy = landing_policy(
             uploads.path(),
             vec![(
@@ -938,13 +951,15 @@ mod tests {
                 ("land_in_place".into(), Value::Bool(true)),
             ]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "path_traversal");
+
+        Ok(())
     }
 
     #[test]
-    fn absolute_staging_target_is_rooted_under_upload_base() {
-        let uploads = tempdir().unwrap();
+    fn absolute_staging_target_is_rooted_under_upload_base() -> TestResult {
+        let uploads = tempdir().test_value()?;
         let policy = policy(uploads.path());
         let init = upload_init(
             &policy,
@@ -953,31 +968,35 @@ mod tests {
                 Value::String("/srv/elsewhere/x.txt".into()),
             )]),
         )
-        .unwrap();
+        .test_value()?;
         let meta = upload_meta(&policy, &init);
         assert!(!meta.landed_in_place);
         assert_eq!(
             PathBuf::from(meta.target_path),
             uploads.path().join("srv/elsewhere/x.txt")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn upload_target_cannot_escape_upload_base() {
-        let dir = tempdir().unwrap();
+    fn upload_target_cannot_escape_upload_base() -> TestResult {
+        let dir = tempdir().test_value()?;
         let error = upload_init(
             &policy(dir.path()),
             &Map::from_iter([("target_path".into(), Value::String("../escape".into()))]),
         )
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "path_traversal");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn single_upload_finalize_failure_cleans_staged_file() {
-        let dir = tempdir().unwrap();
+    async fn single_upload_finalize_failure_cleans_staged_file() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = policy(dir.path());
-        fs::create_dir(dir.path().join("target-dir")).unwrap();
+        fs::create_dir(dir.path().join("target-dir")).test_value()?;
 
         let error = upload_file(
             &policy,
@@ -991,15 +1010,17 @@ mod tests {
             ]),
         )
         .await
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "io_error");
 
         let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
         let leaked = fs::read_dir(staging)
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".upload"))
             .collect::<Vec<_>>();
         assert!(leaked.is_empty(), "failed upload leaked staged file");
+
+        Ok(())
     }
 }

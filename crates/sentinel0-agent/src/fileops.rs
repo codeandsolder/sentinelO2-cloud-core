@@ -267,11 +267,11 @@ impl Utf16ScanState {
         }
     }
 
-    fn flag(&self, flag: u8) -> bool {
+    const fn flag(&self, flag: u8) -> bool {
         self.flags & flag != 0
     }
 
-    fn set_flag(&mut self, flag: u8, enabled: bool) {
+    const fn set_flag(&mut self, flag: u8, enabled: bool) {
         if enabled {
             self.flags |= flag;
         } else {
@@ -833,6 +833,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -846,20 +847,22 @@ mod tests {
     }
 
     #[test]
-    fn permission_denied_is_not_reported_as_internal_io_error() {
+    fn permission_denied_is_not_reported_as_internal_io_error() -> TestResult {
         let error = access_error(
             "/restricted/tree",
             &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         assert_eq!(error.code, "permission_denied");
         assert!(error.message.contains("/restricted/tree"));
+
+        Ok(())
     }
 
     #[test]
-    fn read_range_and_search_contracts() {
-        let dir = tempdir().unwrap();
+    fn read_range_and_search_contracts() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("a.txt");
-        fs::write(&file, "one\ntwo needle\nthree\n").unwrap();
+        fs::write(&file, "one\ntwo needle\nthree\n").test_value()?;
         let policy = policy(dir.path());
         let read_result = read(
             &policy,
@@ -868,7 +871,7 @@ mod tests {
                 ("view_range".into(), serde_json::json!([2, 3])),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(read_result["content"], "two needle\nthree");
 
         let search_result = search(
@@ -881,8 +884,10 @@ mod tests {
                 ("pattern".into(), Value::String("needle".into())),
             ]),
         )
-        .unwrap();
+        .test_value()?;
         assert_eq!(search_result["matches"][0]["line"], 2);
+
+        Ok(())
     }
 
     fn search_payload(root: &Path, pattern: &str) -> Map<String, Value> {
@@ -893,91 +898,109 @@ mod tests {
     }
 
     #[test]
-    fn search_is_case_insensitive_by_default_and_reports_byte_column() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "prefix NeEdLe suffix\n").unwrap();
-        let result = search(&policy(dir.path()), &search_payload(dir.path(), "needle")).unwrap();
+    fn search_is_case_insensitive_by_default_and_reports_byte_column() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "prefix NeEdLe suffix\n").test_value()?;
+        let result =
+            search(&policy(dir.path()), &search_payload(dir.path(), "needle")).test_value()?;
         assert_eq!(result["matches"][0]["line"], 1);
         assert_eq!(result["matches"][0]["column"], 8);
         assert_eq!(result["matches"][0]["text"], "prefix NeEdLe suffix");
+
+        Ok(())
     }
 
     #[test]
-    fn search_case_sensitive_mode_rejects_case_mismatch() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "NeEdLe\n").unwrap();
+    fn search_case_sensitive_mode_rejects_case_mismatch() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "NeEdLe\n").test_value()?;
         let mut payload = search_payload(dir.path(), "needle");
         payload.insert("case_sensitive".into(), Value::Bool(true));
-        let result = search(&policy(dir.path()), &payload).unwrap();
+        let result = search(&policy(dir.path()), &payload).test_value()?;
         assert_eq!(result["matches"], serde_json::json!([]));
+
+        Ok(())
     }
 
     #[test]
-    fn search_regex_mode_uses_ripgrep_matcher() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "abc 123 xyz\n").unwrap();
+    fn search_regex_mode_uses_ripgrep_matcher() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "abc 123 xyz\n").test_value()?;
         let mut payload = search_payload(dir.path(), r"\d{3}");
         payload.insert("regex".into(), Value::Bool(true));
-        let result = search(&policy(dir.path()), &payload).unwrap();
+        let result = search(&policy(dir.path()), &payload).test_value()?;
         assert_eq!(result["matches"][0]["column"], 5);
+
+        Ok(())
     }
 
     #[test]
-    fn search_skips_binary_noise_dirs_and_nonmatching_globs() {
-        let dir = tempdir().unwrap();
-        fs::create_dir(dir.path().join("target")).unwrap();
-        fs::write(dir.path().join("target").join("hidden.txt"), "needle\n").unwrap();
-        fs::write(dir.path().join("keep.rs"), "needle\n").unwrap();
-        fs::write(dir.path().join("wrong.txt"), "needle\n").unwrap();
-        fs::write(dir.path().join("binary.rs"), b"needle\0more\n").unwrap();
+    fn search_skips_binary_noise_dirs_and_nonmatching_globs() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::create_dir(dir.path().join("target")).test_value()?;
+        fs::write(dir.path().join("target").join("hidden.txt"), "needle\n").test_value()?;
+        fs::write(dir.path().join("keep.rs"), "needle\n").test_value()?;
+        fs::write(dir.path().join("wrong.txt"), "needle\n").test_value()?;
+        fs::write(dir.path().join("binary.rs"), b"needle\0more\n").test_value()?;
 
         let mut payload = search_payload(dir.path(), "needle");
         payload.insert("file_glob".into(), Value::String("*.rs".into()));
-        let result = search(&policy(dir.path()), &payload).unwrap();
-        let matches = result["matches"].as_array().unwrap();
+        let result = search(&policy(dir.path()), &payload).test_value()?;
+        let matches = result["matches"].as_array().test_value()?;
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["file"], "keep.rs");
         assert_eq!(result["files_searched"], 1);
+
+        Ok(())
     }
 
     #[test]
-    fn search_global_result_cap_sets_truncated() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "needle\nneedle\n").unwrap();
+    fn search_global_result_cap_sets_truncated() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "needle\nneedle\n").test_value()?;
         let mut payload = search_payload(dir.path(), "needle");
         payload.insert("max_results".into(), Value::from(1));
-        let result = search(&policy(dir.path()), &payload).unwrap();
-        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        let result = search(&policy(dir.path()), &payload).test_value()?;
+        assert_eq!(result["matches"].as_array().test_value()?.len(), 1);
         assert_eq!(result["truncated"], true);
+
+        Ok(())
     }
 
     #[test]
-    fn search_single_file_preserves_basename_contract() {
-        let dir = tempdir().unwrap();
+    fn search_single_file_preserves_basename_contract() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("a.txt");
-        fs::write(&file, "needle\n").unwrap();
-        let result = search(&policy(dir.path()), &search_payload(&file, "needle")).unwrap();
+        fs::write(&file, "needle\n").test_value()?;
+        let result = search(&policy(dir.path()), &search_payload(&file, "needle")).test_value()?;
         assert_eq!(result["matches"][0]["file"], "a.txt");
+
+        Ok(())
     }
 
     #[test]
-    fn invalid_regex_is_a_payload_error() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+    fn invalid_regex_is_a_payload_error() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "needle\n").test_value()?;
         let mut payload = search_payload(dir.path(), "(");
         payload.insert("regex".into(), Value::Bool(true));
-        let error = search(&policy(dir.path()), &payload).unwrap_err();
+        let error = search(&policy(dir.path()), &payload).test_error()?;
         assert_eq!(error.code, "invalid_payload");
         assert!(error.message.contains("valid regex"));
+
+        Ok(())
     }
 
     #[test]
-    fn search_column_is_character_based_and_byte_column_is_explicit() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("utf8.txt"), "żółw needle\n").unwrap();
-        let result = search(&policy(dir.path()), &search_payload(dir.path(), "needle")).unwrap();
-        let first = &result["matches"].as_array().unwrap()[0];
+    fn search_column_is_character_based_and_byte_column_is_explicit() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("utf8.txt"), "żółw needle\n").test_value()?;
+        let result =
+            search(&policy(dir.path()), &search_payload(dir.path(), "needle")).test_value()?;
+        let first = &result["matches"].as_array().test_value()?[0];
         assert_eq!(first["column"], 6);
         assert_eq!(first["byte_column"], 9);
+
+        Ok(())
     }
 }

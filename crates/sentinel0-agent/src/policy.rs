@@ -704,6 +704,7 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     fn parse(text: &str) -> Policy {
@@ -712,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_core_fields_parse_with_official_defaults() {
+    fn actual_core_fields_parse_with_official_defaults() -> TestResult {
         let policy = parse(
             r#"
 allowed_commands: [git, "sudo systemctl"]
@@ -747,10 +748,12 @@ upload_base: /var/lib/sentinelx/uploads
         assert!(policy.service_action_allowed("nginx", "restart"));
         assert_eq!(policy.preferred_profile.as_deref(), Some("compact"));
         assert_eq!(policy.file_ops_paths.len(), 2);
+
+        Ok(())
     }
 
     #[test]
-    fn allowlist_enforcement_is_opt_in_but_legacy_strict_still_enforces() {
+    fn allowlist_enforcement_is_opt_in_but_legacy_strict_still_enforces() -> TestResult {
         let policy = parse(
             r"
 allowed_commands: [git]
@@ -774,10 +777,12 @@ exec_strict: true
 ",
         );
         assert!(policy.exec_enforce_allowlist);
+
+        Ok(())
     }
 
     #[test]
-    fn unknown_top_level_keys_fail_at_parse_boundary() {
+    fn unknown_top_level_keys_fail_at_parse_boundary() -> TestResult {
         for text in [
             "allow: [git]\n",
             "allowedCommands: [git]\n",
@@ -793,10 +798,12 @@ exec_strict: true
                 "unknown top-level key unexpectedly parsed: {text:?}"
             );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn invalid_file_access_fails_loudly() {
+    fn invalid_file_access_fails_loudly() -> TestResult {
         let raw: RawPolicy = yaml_serde::from_str(
             "file_ops:
   paths:
@@ -804,7 +811,7 @@ exec_strict: true
       access: wr
 ",
         )
-        .unwrap();
+        .test_value()?;
         assert!(matches!(
             Policy::from_raw(raw),
             Err(PolicyError::InvalidValue {
@@ -812,10 +819,12 @@ exec_strict: true
                 ..
             })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn malformed_local_api_fails_config_load() {
+    fn malformed_local_api_fails_config_load() -> TestResult {
         let raw: RawPolicy = yaml_serde::from_str(
             "local_apis:
   x:
@@ -826,7 +835,7 @@ exec_strict: true
       ping: { method: ping }
 ",
         )
-        .unwrap();
+        .test_value()?;
         assert!(matches!(
             Policy::from_raw(raw),
             Err(PolicyError::InvalidValue {
@@ -834,17 +843,19 @@ exec_strict: true
                 ..
             })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn impossible_exec_limits_fail_loudly() {
+    fn impossible_exec_limits_fail_loudly() -> TestResult {
         let raw: RawPolicy = yaml_serde::from_str(
             "exec:
   timeout_default: 60
   timeout_max: 10
 ",
         )
-        .unwrap();
+        .test_value()?;
         assert!(matches!(
             Policy::from_raw(raw),
             Err(PolicyError::InvalidValue {
@@ -852,10 +863,12 @@ exec_strict: true
                 ..
             })
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn compatibility_blocks_are_strictly_typed() {
+    fn compatibility_blocks_are_strictly_typed() -> TestResult {
         for text in [
             "log:
   path: /tmp/x.log
@@ -883,10 +896,12 @@ exec_strict: true
                 );
             }
         }
+
+        Ok(())
     }
 
     #[test]
-    fn nested_config_typos_fail_at_parse_boundary() {
+    fn nested_config_typos_fail_at_parse_boundary() -> TestResult {
         for text in [
             "exec:\n  timeout_defualt: 30\n",
             "security:\n  file_url_timeout_second: 15\n",
@@ -901,10 +916,12 @@ exec_strict: true
                 "nested typo unexpectedly parsed: {text:?}"
             );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn legacy_read_paths_stay_read_only() {
+    fn legacy_read_paths_stay_read_only() -> TestResult {
         let policy = parse(
             r"
 file_ops:
@@ -913,15 +930,17 @@ file_ops:
 ",
         );
         assert_eq!(policy.file_ops_paths[0].access, FileAccess::Read);
+
+        Ok(())
     }
 
     #[test]
-    fn path_prefix_check_has_component_boundary() {
-        let dir = tempdir().unwrap();
+    fn path_prefix_check_has_component_boundary() -> TestResult {
+        let dir = tempdir().test_value()?;
         let allowed = dir.path().join("allowed");
         let sibling = dir.path().join("allowed-not");
-        fs::create_dir_all(&allowed).unwrap();
-        fs::create_dir_all(&sibling).unwrap();
+        fs::create_dir_all(&allowed).test_value()?;
+        fs::create_dir_all(&sibling).test_value()?;
 
         let policy = Policy {
             file_ops_paths: vec![FileOpsPath {
@@ -933,27 +952,29 @@ file_ops:
 
         assert!(
             policy
-                .resolve_path(allowed.join("x").to_str().unwrap(), true)
+                .resolve_path(allowed.join("x").to_str().test_value()?, true)
                 .is_some()
         );
         assert!(
             policy
-                .resolve_path(sibling.to_str().unwrap(), false)
+                .resolve_path(sibling.to_str().test_value()?, false)
                 .is_none()
         );
+
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn symlink_escape_is_resolved_before_allowlist_check() {
+    fn symlink_escape_is_resolved_before_allowlist_check() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().test_value()?;
         let allowed = dir.path().join("allowed");
         let outside = dir.path().join("outside");
-        fs::create_dir_all(&allowed).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        symlink(&outside, allowed.join("escape")).unwrap();
+        fs::create_dir_all(&allowed).test_value()?;
+        fs::create_dir_all(&outside).test_value()?;
+        symlink(&outside, allowed.join("escape")).test_value()?;
 
         let policy = Policy {
             file_ops_paths: vec![FileOpsPath {
@@ -965,8 +986,9 @@ file_ops:
 
         assert!(
             policy
-                .resolve_path(allowed.join("escape/new.txt").to_str().unwrap(), true)
+                .resolve_path(allowed.join("escape/new.txt").to_str().test_value()?, true)
                 .is_none()
         );
+        Ok(())
     }
 }

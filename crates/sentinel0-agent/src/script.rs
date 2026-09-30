@@ -653,10 +653,11 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[test]
-    fn staging_host_conditions_have_specific_error_codes() {
+    fn staging_host_conditions_have_specific_error_codes() -> TestResult {
         let path = Path::new("/var/lib/sentinelx/uploads/.sentinelx_uploads/script_job_x");
         assert_eq!(
             staging_oserror(&std::io::Error::from_raw_os_error(nix::libc::ENOSPC), path).code,
@@ -681,11 +682,13 @@ mod tests {
         assert!(message.contains("host condition"));
         assert!(message.contains("unstable"));
         assert!(message.contains(&path.display().to_string()));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn bash_script_captures_output_and_exit_code() {
-        let dir = tempdir().unwrap();
+    async fn bash_script_captures_output_and_exit_code() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
@@ -701,16 +704,18 @@ mod tests {
             ]),
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["returncode"], 7);
         assert_eq!(result["ok"], false);
-        assert!(result["output"].as_str().unwrap().contains("hello"));
-        assert!(result["output"].as_str().unwrap().contains("err"));
+        assert!(result["output"].as_str().test_value()?.contains("hello"));
+        assert!(result["output"].as_str().test_value()?.contains("err"));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_cwd_is_named_not_found() {
-        let dir = tempdir().unwrap();
+    async fn missing_cwd_is_named_not_found() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
@@ -725,16 +730,18 @@ mod tests {
             ]),
         )
         .await
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "not_found");
         assert!(error.message.contains("cwd"));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn file_cwd_is_named_not_a_directory() {
-        let dir = tempdir().unwrap();
+    async fn file_cwd_is_named_not_a_directory() -> TestResult {
+        let dir = tempdir().test_value()?;
         let file = dir.path().join("file");
-        fs::write(&file, b"x").unwrap();
+        fs::write(&file, b"x").test_value()?;
         let policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
@@ -748,13 +755,15 @@ mod tests {
             ]),
         )
         .await
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "not_a_directory");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_interpreter_is_not_mistaken_for_missing_cwd() {
-        let dir = tempdir().unwrap();
+    async fn missing_interpreter_is_not_mistaken_for_missing_cwd() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
@@ -771,13 +780,15 @@ mod tests {
             ]),
         )
         .await
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "interpreter_missing");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn timed_out_script_kills_descendant_tree() {
-        let dir = tempdir().unwrap();
+    async fn timed_out_script_kills_descendant_tree() -> TestResult {
+        let dir = tempdir().test_value()?;
         let marker = dir.path().join("survived");
         let policy = Policy {
             upload_base: dir.path().to_owned(),
@@ -795,15 +806,17 @@ mod tests {
             ]),
         )
         .await
-        .unwrap();
+        .test_value()?;
         assert_eq!(result["timed_out"], true);
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!marker.exists());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_interpreter_cleans_workdir_by_default() {
-        let dir = tempdir().unwrap();
+    async fn missing_interpreter_cleans_workdir_by_default() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
@@ -820,12 +833,12 @@ mod tests {
             ]),
         )
         .await
-        .unwrap_err();
+        .test_error()?;
         assert_eq!(error.code, "interpreter_missing");
 
         let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
         let leftovers = fs::read_dir(staging)
-            .unwrap()
+            .test_value()?
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
             .collect::<Vec<_>>();
@@ -833,5 +846,7 @@ mod tests {
             leftovers.is_empty(),
             "failed script launch leaked workdir: {leftovers:?}"
         );
+
+        Ok(())
     }
 }
