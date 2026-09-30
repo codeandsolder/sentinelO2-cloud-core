@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Return success when a Cargo.lock is safe to build fully offline from crates.io cache."""
+
+from __future__ import annotations
+
+import sys
+import tomllib
+from pathlib import Path
+
+CRATES_IO_SOURCES = {
+    "registry+https://github.com/rust-lang/crates.io-index",
+    "registry+https://index.crates.io/",
+}
+
+
+def index_rel(name: str) -> Path:
+    name = name.lower()
+    if len(name) == 1:
+        return Path("1") / name
+    if len(name) == 2:
+        return Path("2") / name
+    if len(name) == 3:
+        return Path("3") / name[0] / name
+    return Path(name[:2]) / name[2:4] / name
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        return 2
+
+    workspace = Path(sys.argv[1])
+    cargo_home = Path(sys.argv[2])
+    lock_path = workspace / "Cargo.lock"
+    if not lock_path.is_file():
+        return 1
+
+    try:
+        data = tomllib.loads(lock_path.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return 1
+
+    cache_dirs = sorted((cargo_home / "registry" / "cache").glob("index.crates.io-*"))
+    index_dirs = sorted((cargo_home / "registry" / "index").glob("index.crates.io-*"))
+    if not cache_dirs or not index_dirs:
+        return 1
+
+    # Sparse/index metadata needs config.json as well as each package entry.
+    usable_index_dirs = [d for d in index_dirs if (d / "config.json").is_file()]
+    if not usable_index_dirs:
+        return 1
+
+    for pkg in data.get("package", []):
+        source = pkg.get("source")
+        if source is None:
+            continue
+        if source not in CRATES_IO_SOURCES:
+            # Git and alternate registries stay on Cargo's normal online path.
+            return 1
+
+        name = pkg.get("name")
+        version = pkg.get("version")
+        if not isinstance(name, str) or not isinstance(version, str):
+            return 1
+
+        archive = f"{name}-{version}.crate"
+        if not any((d / archive).is_file() and (d / archive).stat().st_size > 0 for d in cache_dirs):
+            return 1
+
+        rel = index_rel(name)
+        if not any((d / ".cache" / rel).is_file() for d in usable_index_dirs):
+            return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
