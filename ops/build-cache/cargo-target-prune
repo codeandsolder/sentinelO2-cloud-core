@@ -6,15 +6,37 @@ CONF="${SENTINELX_BUILD_SCRATCH_CONF:-/etc/sentinelx/build-scratch.conf}"
 
 ROOT="${SENTINELX_CARGO_TARGET_ROOT:-/var/cache/sentinelx/cargo-target}"
 LOCK_ROOT="${SENTINELX_CARGO_TARGET_LOCK_ROOT:-$ROOT/../cargo-target-locks}"
+RECLAIM_ROOT="${SENTINELX_CARGO_TARGET_RECLAIM_ROOT:-$ROOT/../cargo-target-reclaim}"
 MAX="${SENTINELX_CARGO_TARGET_MAX_BYTES:-4294967296}"
+INTERVAL="${SENTINELX_CARGO_TARGET_PRUNE_INTERVAL_SECONDS:-300}"
+CHECKED="${SENTINELX_CARGO_TARGET_PRUNE_CHECKED:-$ROOT/../.cargo-target-prune-checked}"
+FORCE="${SENTINELX_CARGO_TARGET_PRUNE_FORCE:-0}"
 
 [[ -d "$ROOT" ]] || exit 0
-mkdir -p "$LOCK_ROOT"
+mkdir -p "$LOCK_ROOT" "$RECLAIM_ROOT" "$(dirname "$CHECKED")"
 exec 8>"$ROOT/../.cargo-target-prune.lock"
 flock -n 8 || exit 0
 
+now="$(date +%s)"
+checked=0
+if [[ -e "$CHECKED" ]]; then
+    checked="$(stat -c %Y "$CHECKED" 2>/dev/null || echo 0)"
+fi
+if [[ "$FORCE" != 1 ]] && (( checked > 0 && INTERVAL > 0 && now - checked < INTERVAL )); then
+    exit 0
+fi
+touch "$CHECKED" 2>/dev/null || true
+
+# Leftovers only occur if an earlier background pruner was interrupted. They
+# are outside ROOT, so cleaning them cannot race target creation.
+find "$RECLAIM_ROOT" -mindepth 1 -maxdepth 1 -type d -exec rm -rf -- {} + 2>/dev/null || true
+
 size() {
     du -s -B1 "$ROOT" 2>/dev/null | awk '{print $1+0}'
+}
+
+dir_size() {
+    du -s -B1 "$1" 2>/dev/null | awk '{print $1+0}'
 }
 
 lru_targets() {
@@ -37,13 +59,29 @@ total="$(size)"
 
 while IFS= read -r dir; do
     [[ -d "$dir" ]] || continue
-    lock="$LOCK_ROOT/$(basename "$dir").lock"
+    base="$(basename "$dir")"
+    lock="$LOCK_ROOT/$base.lock"
+    bytes="$(dir_size "$dir")"
+    trash="$RECLAIM_ROOT/$base.$$.$(date +%s%N)"
 
-    # The lifetime lock is external to the disposable target. Holding the
-    # exclusive lock across rm -rf prevents a new wrapper from creating a new
-    # lock inode while deletion is still in progress.
-    if flock -n "$lock" rm -rf -- "$dir"; then
-        total="$(size)"
-        (( total <= MAX )) && break
+    # Acquire the external lifetime lock only long enough to atomically rotate
+    # the target out of the live namespace. New Cargo users can recreate the
+    # normal path as soon as the lock is released while deletion continues.
+    exec 9>"$lock"
+    if flock -n -x 9; then
+        if mv -- "$dir" "$trash" 2>/dev/null; then
+            flock -u 9
+            exec 9>&-
+            rm -rf -- "$trash" 2>/dev/null || true
+            if [[ "$bytes" =~ ^[0-9]+$ ]]; then
+                (( total = total > bytes ? total - bytes : 0 ))
+            else
+                total="$(size)"
+            fi
+            (( total <= MAX )) && break
+            continue
+        fi
+        flock -u 9
     fi
+    exec 9>&-
 done < <(lru_targets)

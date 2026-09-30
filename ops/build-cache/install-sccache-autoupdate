@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if (( EUID != 0 )); then
+    echo "install-sccache-autoupdate: run as root" >&2
+    exit 2
+fi
+
+install -o root -g root -m 0755 "$HERE/sccache-release-update" /usr/local/libexec/sccache-release-update
+install -o root -g root -m 0644 "$HERE/sccache-release-update.service" /etc/systemd/system/sccache-release-update.service
+install -o root -g root -m 0644 "$HERE/sccache-release-update.timer" /etc/systemd/system/sccache-release-update.timer
+mkdir -p /var/lib/sccache-autoupdate /var/cache/sccache-autoupdate
+chown root:root /var/lib/sccache-autoupdate /var/cache/sccache-autoupdate
+chmod 0755 /var/lib/sccache-autoupdate /var/cache/sccache-autoupdate
+systemctl daemon-reload
+systemctl enable --now sccache-release-update.timer
+systemctl start sccache-release-update.service
+systemctl --no-pager --full status sccache-release-update.timer || true

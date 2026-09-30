@@ -3,9 +3,29 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRUNER="$HERE/cargo-target-prune"
+SOURCE_PRUNER="$HERE/cargo-source-prune"
 WRAPPER="$HERE/cargo"
+
+# Keep all shipped shell helpers under the maintenance-scripts CI lane even
+# when a test below does not execute a root/systemd-only code path.
+bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$HERE/sccache-release-update"     "$HERE/install-sccache-autoupdate"
+
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+
+cleanup() {
+    # Detached maintenance may still be in the small fork/exec window when the
+    # foreground wrapper returns. Retry cleanup rather than racing a helper
+    # creating/removing files inside the temporary source pool.
+    set +e
+    for _ in $(seq 1 100); do
+        rm -rf -- "$tmp" 2>/dev/null
+        [[ ! -e "$tmp" ]] && return 0
+        sleep 0.05
+    done
+    echo "warning: test cleanup could not fully remove $tmp after detached maintenance" >&2
+    rm -rf -- "$tmp" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 make_target() {
     local dir="$1"
@@ -23,6 +43,7 @@ write_pruner_conf() {
 SENTINELX_CARGO_TARGET_ROOT=$root
 SENTINELX_CARGO_TARGET_LOCK_ROOT=$locks
 SENTINELX_CARGO_TARGET_MAX_BYTES=$max
+SENTINELX_CARGO_TARGET_PRUNE_INTERVAL_SECONDS=0
 EOF
 }
 
@@ -135,20 +156,23 @@ probe="$tmp/probe-pruner"
 cat >"$probe" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-n=0
-[[ -r "$PROBE_COUNTER" ]] && n="$(cat "$PROBE_COUNTER")"
-n=$(( n + 1 ))
-printf '%s\n' "$n" >"$PROBE_COUNTER"
-target="$(find "$PROBE_ROOT" -mindepth 1 -maxdepth 1 -type d -print -quit)"
-base="$(basename "$target")"
-if flock -n "$PROBE_LOCK_ROOT/$base.lock" true; then
-    state=unlocked
-else
-    state=locked
-fi
-printf '%s:%s\n' "$n" "$state" >>"$PROBE_LOG"
+touch "$PROBE_STARTED"
+while [[ ! -e "$PROBE_RELEASE" ]]; do
+    sleep 0.05
+done
+touch "$PROBE_DONE"
 EOF
 chmod +x "$probe"
+
+wait_for_file() {
+    local file="$1"
+    for _ in $(seq 1 100); do
+        [[ -e "$file" ]] && return 0
+        sleep 0.05
+    done
+    echo "timed out waiting for $file" >&2
+    return 1
+}
 
 native_launcher="$tmp/fake-native-launcher"
 printf '#!/bin/sh\nexec "$@"\n' >"$native_launcher"
@@ -160,10 +184,12 @@ SENTINELX_REAL_CARGO=$fake_cargo
 SENTINELX_CARGO_TARGET_ROOT=$wrapper_root
 SENTINELX_CARGO_TARGET_LOCK_ROOT=$wrapper_locks
 SENTINELX_CARGO_TARGET_PRUNER=$probe
+SENTINELX_CARGO_SOURCE_PRUNER=$SOURCE_PRUNER
 SENTINELX_NVME_MIN_FREE_BYTES=0
 SENTINELX_CARGO_SOURCE_TMP_ROOT=$source_root
 SENTINELX_CARGO_SOURCE_MAX_BYTES=1048576
 SENTINELX_CARGO_SOURCE_MAX_IDLE_SECONDS=86400
+SENTINELX_CARGO_SOURCE_PRUNE_INTERVAL_SECONDS=0
 SENTINELX_CARGO_TARGET_EPHEMERAL=1
 SENTINELX_CARGO_ARTIFACT_MIRROR=1
 SENTINELX_CARGO_INFRA_LOCK=$tmp/infra.lock
@@ -171,8 +197,9 @@ SENTINELX_CARGO_MAINTENANCE_MARKER=$tmp/maintenance
 SENTINELX_CMAKE_COMPILER_LAUNCHER=$native_launcher
 EOF
 
-counter="$tmp/probe-counter"
-log="$tmp/probe-log"
+probe_started="$tmp/probe-started"
+probe_release="$tmp/probe-release"
+probe_done="$tmp/probe-done"
 warm_probe="$tmp/warm-probe"
 cmake_c_probe="$tmp/cmake-c-probe"
 cmake_cxx_probe="$tmp/cmake-cxx-probe"
@@ -182,17 +209,19 @@ cmake_cxx_probe="$tmp/cmake-cxx-probe"
     FAKE_WARM_PROBE="$warm_probe" \
     FAKE_CMAKE_C_PROBE="$cmake_c_probe" \
     FAKE_CMAKE_CXX_PROBE="$cmake_cxx_probe" \
-    PROBE_ROOT="$wrapper_root" \
-    PROBE_LOCK_ROOT="$wrapper_locks" \
-    PROBE_COUNTER="$counter" \
-    PROBE_LOG="$log" \
+    PROBE_STARTED="$probe_started" \
+    PROBE_RELEASE="$probe_release" \
+    PROBE_DONE="$probe_done" \
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build
 )
 
-mapfile -t states <"$log"
-[[ "${states[0]}" == "1:locked" ]]
-[[ "${states[1]}" == "2:locked" ]]
+# Target maintenance is detached: the wrapper must return while the helper is
+# still deliberately blocked, then the helper can finish independently.
+wait_for_file "$probe_started"
+[[ ! -e "$probe_done" ]]
+touch "$probe_release"
+wait_for_file "$probe_done"
 [[ -x "$workspace/target/debug/fake-bin" ]]
 [[ -f "$workspace/target/debug/libfake.rlib" ]]
 [[ ! -e "$workspace/target/debug/fake-bin.d" ]]
@@ -203,16 +232,13 @@ mapfile -t states <"$log"
 [[ "$(cat "$cmake_cxx_probe")" == "$native_launcher" ]]
 
 # A second invocation must see the retained source pool as warm.
-: >"$log"
-: >"$counter"
 (
     cd "$workspace"
     FAKE_WORKSPACE="$workspace" \
     FAKE_WARM_PROBE="$warm_probe" \
-    PROBE_ROOT="$wrapper_root" \
-    PROBE_LOCK_ROOT="$wrapper_locks" \
-    PROBE_COUNTER="$counter" \
-    PROBE_LOG="$log" \
+    PROBE_STARTED="$probe_started" \
+    PROBE_RELEASE="$probe_release" \
+    PROBE_DONE="$probe_done" \
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build
 )
@@ -226,10 +252,9 @@ mapfile -t states <"$log"
     FAKE_CMAKE_CXX_PROBE="$cmake_cxx_probe" \
     CMAKE_C_COMPILER_LAUNCHER=custom-c \
     CMAKE_CXX_COMPILER_LAUNCHER=custom-cxx \
-    PROBE_ROOT="$wrapper_root" \
-    PROBE_LOCK_ROOT="$wrapper_locks" \
-    PROBE_COUNTER="$counter" \
-    PROBE_LOG="$log" \
+    PROBE_STARTED="$probe_started" \
+    PROBE_RELEASE="$probe_release" \
+    PROBE_DONE="$probe_done" \
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build
 )
@@ -250,10 +275,9 @@ set +e
     cd "$workspace"
     FAKE_WORKSPACE="$workspace" \
     FAKE_FAIL_BUILD=1 \
-    PROBE_ROOT="$wrapper_root" \
-    PROBE_LOCK_ROOT="$wrapper_locks" \
-    PROBE_COUNTER="$counter" \
-    PROBE_LOG="$log" \
+    PROBE_STARTED="$probe_started" \
+    PROBE_RELEASE="$probe_release" \
+    PROBE_DONE="$probe_done" \
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build
 )
@@ -263,15 +287,40 @@ set -e
 [[ -z "$(find "$wrapper_root" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]]
 [[ ! -e "$workspace/target" ]]
 
-# Idle warm source is reclaimable on the next entrant.
-slot="$source_root/uid-$(id -u)"
+# Test source-pruner semantics in a separate pool. Wrapper integration above
+# intentionally launches detached maintenance, so reusing that same slot here
+# would make an explicit maintenance call legitimately coalesce with an older
+# background pass.
+maintenance_source_root="$tmp/maintenance-sources"
+slot="$maintenance_source_root/uid-$(id -u)"
+mkdir -p "$slot/src"
 printf 'old\n' >"$slot/src/old-file"
 touch -d '@1' "$slot/.last-used"
 idle_conf="$tmp/idle.conf"
 cp "$wrapper_conf" "$idle_conf"
+printf '%s\n' "SENTINELX_CARGO_SOURCE_TMP_ROOT=$maintenance_source_root" >>"$idle_conf"
 printf '%s\n' 'SENTINELX_CARGO_SOURCE_MAX_IDLE_SECONDS=1' >>"$idle_conf"
 printf '%s\n' 'SENTINELX_CARGO_SOURCE_PRUNE_INTERVAL_SECONDS=0' >>"$idle_conf"
-FAKE_WORKSPACE="$workspace" SENTINELX_BUILD_SCRATCH_CONF="$idle_conf" "$WRAPPER" --version
+SENTINELX_BUILD_SCRATCH_CONF="$idle_conf" "$SOURCE_PRUNER"
 [[ ! -e "$slot/src/old-file" ]]
 
-printf 'ok: Cargo scratch target + artifact mirror + warm registry source\n'
+# Source maintenance may size the pool concurrently, but it must never rotate a
+# source tree while Cargo holds the shared active lock.
+printf 'oversized\n' >"$slot/src/oversized"
+source_cap_conf="$tmp/source-cap.conf"
+cp "$wrapper_conf" "$source_cap_conf"
+printf '%s\n' "SENTINELX_CARGO_SOURCE_TMP_ROOT=$maintenance_source_root" >>"$source_cap_conf"
+printf '%s\n' 'SENTINELX_CARGO_SOURCE_MAX_BYTES=1' >>"$source_cap_conf"
+printf '%s\n' 'SENTINELX_CARGO_SOURCE_MAX_IDLE_SECONDS=86400' >>"$source_cap_conf"
+printf '%s\n' 'SENTINELX_CARGO_SOURCE_PRUNE_INTERVAL_SECONDS=0' >>"$source_cap_conf"
+touch "$slot/.last-used"
+exec 10>"$slot/.active.lock"
+flock -s 10
+SENTINELX_BUILD_SCRATCH_CONF="$source_cap_conf" "$SOURCE_PRUNER"
+[[ -e "$slot/src/oversized" ]]
+flock -u 10
+exec 10>&-
+SENTINELX_BUILD_SCRATCH_CONF="$source_cap_conf" "$SOURCE_PRUNER"
+[[ ! -e "$slot/src/oversized" ]]
+
+printf 'ok: Cargo scratch target + detached pruning + artifact mirror + warm registry source\n'

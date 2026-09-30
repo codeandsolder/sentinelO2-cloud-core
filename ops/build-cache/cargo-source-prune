@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+CONF="${SENTINELX_BUILD_SCRATCH_CONF:-/etc/sentinelx/build-scratch.conf}"
+[[ -r "$CONF" ]] && . "$CONF"
+
+SOURCE_TMP_ROOT="${SENTINELX_CARGO_SOURCE_TMP_ROOT:-/var/cache/sentinelx/cargo-source-tmp}"
+MAX="${SENTINELX_CARGO_SOURCE_MAX_BYTES:-1073741824}"
+IDLE="${SENTINELX_CARGO_SOURCE_MAX_IDLE_SECONDS:-21600}"
+INTERVAL="${SENTINELX_CARGO_SOURCE_PRUNE_INTERVAL_SECONDS:-300}"
+FORCE="${SENTINELX_CARGO_SOURCE_PRUNE_FORCE:-0}"
+
+slot="$SOURCE_TMP_ROOT/uid-$(id -u)"
+src="$slot/src"
+last_used="$slot/.last-used"
+checked="$slot/.prune-checked"
+
+[[ -d "$slot" ]] || exit 0
+mkdir -p "$slot"
+
+# Coalesce maintenance attempts without taking the active-Cargo lock. The
+# expensive size walk must never make a new Cargo invocation wait.
+exec 9>"$slot/.prune.lock"
+flock -n 9 || exit 0
+
+now="$(date +%s)"
+previous=0
+if [[ -e "$checked" ]]; then
+    previous="$(stat -c %Y "$checked" 2>/dev/null || echo 0)"
+fi
+if [[ "$FORCE" != 1 ]] && (( previous > 0 && INTERVAL > 0 && now - previous < INTERVAL )); then
+    exit 0
+fi
+touch "$checked" 2>/dev/null || true
+
+last=0
+if [[ -e "$last_used" ]]; then
+    last="$(stat -c %Y "$last_used" 2>/dev/null || echo 0)"
+elif [[ -d "$src" ]]; then
+    last="$(stat -c %Y "$src" 2>/dev/null || echo 0)"
+fi
+
+reclaim=0
+if [[ "$last" =~ ^[0-9]+$ ]] && (( last > 0 && IDLE > 0 && now - last > IDLE )); then
+    reclaim=1
+elif [[ -d "$src" ]]; then
+    bytes="$(du -s -B1 "$src" 2>/dev/null | awk '{print $1+0}')"
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > MAX )); then
+        reclaim=1
+    fi
+fi
+
+(( reclaim )) || exit 0
+
+# If Cargo is using the pool, skip this pass. Otherwise rotate the directory
+# under the exclusive lock, release it immediately, and perform the expensive
+# deletion without blocking a subsequent Cargo invocation.
+exec 8>"$slot/.active.lock"
+flock -n -x 8 || exit 0
+
+trash="$slot/reclaim-$$-$(date +%s%N)"
+if [[ -d "$src" ]]; then
+    mv -- "$src" "$trash" || exit 0
+fi
+mkdir -p "$src"
+touch "$last_used" 2>/dev/null || true
+flock -u 8
+
+[[ -e "$trash" ]] && rm -rf -- "$trash" 2>/dev/null || true
