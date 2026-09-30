@@ -161,7 +161,6 @@ pub fn loadavg() -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestResult;
 
     #[test]
     fn host_info_has_required_identity_fields() {

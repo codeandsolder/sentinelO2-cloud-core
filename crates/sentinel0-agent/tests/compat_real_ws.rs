@@ -263,7 +263,10 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() -> 
         .await
         .test_value()?;
 
-        let stale = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).test_value()?;
+        let stale = Utc
+            .with_ymd_and_hms(2000, 1, 1, 0, 0, 0)
+            .single()
+            .test_value()?;
         ws.send(WsMessage::Text(
             serde_json::to_string(&Message::Ping { timestamp: stale })
                 .test_value()?
@@ -274,6 +277,7 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() -> 
 
         let reply = tokio::time::timeout(Duration::from_secs(1), next_non_heartbeat(&mut ws))
             .await
+            .test_value()?
             .test_value()?;
         let WsMessage::Text(reply) = reply else {
             return Err(std::io::Error::other("expected pong text frame").into());
@@ -346,6 +350,7 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
 
         let reply = tokio::time::timeout(Duration::from_secs(1), next_non_heartbeat(&mut ws))
             .await
+            .test_value()?
             .test_value()?;
         let WsMessage::Text(reply) = reply else {
             return Err(std::io::Error::other("expected response text frame").into());
@@ -387,7 +392,7 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         ))
         .await
         .test_value()?;
-        let second = next_non_heartbeat(&mut ws).await;
+        let second = next_non_heartbeat(&mut ws).await?;
         let WsMessage::Text(second) = second else {
             return Err(std::io::Error::other("expected second response").into());
         };
@@ -416,7 +421,7 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         ))
         .await
         .test_value()?;
-        let third = next_non_heartbeat(&mut ws).await;
+        let third = next_non_heartbeat(&mut ws).await?;
         let WsMessage::Text(third) = third else {
             return Err(std::io::Error::other("expected third response").into());
         };
@@ -900,6 +905,7 @@ async fn unrelated_application_traffic_does_not_mask_missing_heartbeat_pong() ->
 
         let mut second = tokio::time::timeout(Duration::from_millis(150), accept_agent(&listener))
             .await
+            .test_value()?
             .test_value()?;
         welcome(&mut second, "sess_after_no_pong").await?;
         server_cancel.cancel();
@@ -1093,7 +1099,7 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
         ))
         .await
         .test_value()?;
-        let init = next_non_heartbeat(&mut ws).await;
+        let init = next_non_heartbeat(&mut ws).await?;
         let WsMessage::Text(init) = init else {
             return Err(std::io::Error::other("expected export init JSON response").into());
         };
@@ -1120,7 +1126,7 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
         .await
         .test_value()?;
 
-        let first = next_non_heartbeat(&mut ws).await;
+        let first = next_non_heartbeat(&mut ws).await?;
         let WsMessage::Binary(first) = first else {
             return Err(
                 std::io::Error::other("binary export payload must arrive before JSON ack").into(),
@@ -1131,7 +1137,7 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
         assert_eq!(frame.chunk_index, 0);
         assert_eq!(frame.payload, b"abc");
 
-        let second = next_non_heartbeat(&mut ws).await;
+        let second = next_non_heartbeat(&mut ws).await?;
         let WsMessage::Text(second) = second else {
             return Err(
                 std::io::Error::other("expected JSON ack after binary export payload").into(),
@@ -1167,7 +1173,7 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
         ))
         .await
         .test_value()?;
-        let upload_init = next_non_heartbeat(&mut ws).await;
+        let upload_init = next_non_heartbeat(&mut ws).await?;
         assert!(matches!(upload_init, WsMessage::Text(_)));
 
         ws.send(WsMessage::Binary(
@@ -1177,6 +1183,7 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
         .test_value()?;
         let ack = tokio::time::timeout(Duration::from_millis(250), next_non_heartbeat(&mut ws))
             .await
+            .test_value()?
             .test_value()?;
         let WsMessage::Text(ack) = ack else {
             return Err(std::io::Error::other("expected transfer chunk ack event").into());
@@ -1206,7 +1213,7 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
         ))
         .await
         .test_value()?;
-        let complete = next_non_heartbeat(&mut ws).await;
+        let complete = next_non_heartbeat(&mut ws).await?;
         let WsMessage::Text(complete) = complete else {
             return Err(std::io::Error::other("expected upload complete response").into());
         };

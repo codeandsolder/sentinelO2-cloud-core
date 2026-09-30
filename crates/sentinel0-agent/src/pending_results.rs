@@ -560,7 +560,7 @@ mod tests {
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
             .collect();
-        assert_eq!(temps, []);
+        assert_eq!(temps, Vec::<PathBuf>::new());
 
         Ok(())
     }
