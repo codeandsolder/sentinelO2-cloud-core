@@ -24,9 +24,8 @@
       "automergeType": "pr"
     },
     {
-      "description": "Cargo lockfile maintenance is age-gated by repository CI",
+      "description": "Cargo lockfile maintenance uses the global 3-day release age",
       "matchUpdateTypes": ["lockFileMaintenance"],
-      "minimumReleaseAge": null,
       "automerge": true,
       "automergeType": "pr"
     },
