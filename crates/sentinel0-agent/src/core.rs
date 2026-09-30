@@ -1352,7 +1352,8 @@ mod tests {
         assert_eq!(decode_exec_command(plain)?.as_ref(), plain);
 
         let encoded = STANDARD.encode(plain);
-        let decoded = decode_exec_command(&format!("b64,{encoded}"))?;
+        let encoded_command = format!("b64,{encoded}");
+        let decoded = decode_exec_command(&encoded_command)?;
         assert_eq!(decoded.as_ref(), plain);
         Ok(())
     }
