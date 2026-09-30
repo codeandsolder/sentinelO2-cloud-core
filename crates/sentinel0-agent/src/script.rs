@@ -227,9 +227,7 @@ struct ScriptRequest<'a> {
     filename: String,
 }
 
-fn parse_script_request<'a>(
-    payload: &'a Map<String, Value>,
-) -> Result<ScriptRequest<'a>, HandlerError> {
+fn parse_script_request(payload: &Map<String, Value>) -> Result<ScriptRequest<'_>, HandlerError> {
     let interpreter = require_str(payload, "interpreter")?;
     if !["bash", "python3", "powershell", "pwsh"].contains(&interpreter) {
         return Err(HandlerError::new(
@@ -480,9 +478,10 @@ async fn capture_failure(
         cleanup_error.get_or_insert(message);
     }
     if cleanup && let Some(workdir_error) = cleanup_workdir_error(workdir).await {
-        cleanup_error = Some(cleanup_error.map_or(workdir_error.clone(), |existing| {
-            format!("{existing}; {workdir_error}")
-        }));
+        cleanup_error = Some(cleanup_error.map_or_else(
+            || workdir_error.clone(),
+            |existing| format!("{existing}; {workdir_error}"),
+        ));
     }
     with_cleanup_detail(
         HandlerError::new("io_error", format!("script output capture failed: {error}")),

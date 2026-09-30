@@ -366,7 +366,7 @@ fn select_playbook(
         let (selected, pagination) = project_selected(selected, payload)?;
         let (value, refs) = neutralize(selected);
         result.insert("playbook".into(), Value::String(playbook_name.clone()));
-        result.insert("path".into(), Value::String(path.to_owned()));
+        result.insert("path".into(), Value::String(path.clone()));
         result.insert("value".into(), value);
         if let Some(pagination) = pagination {
             let next_offset = pagination["next_offset"].as_u64();
@@ -411,7 +411,7 @@ fn select_path(
     full: &Map<String, Value>,
     path: &str,
 ) -> HandlerResult {
-    let selected = lookup(&Value::Object(full.clone()), &path)?;
+    let selected = lookup(&Value::Object(full.clone()), path)?;
     let (selected, pagination) = project_selected(selected, payload)?;
     let (value, refs) = neutralize(selected);
     let mut result = base(full);

@@ -318,7 +318,6 @@ fn validator_argv(
 ) -> Result<Option<Vec<String>>, HandlerError> {
     let argv = if let Some(preset) = preset {
         match preset {
-            "json" | "yaml" | "toml" => return Ok(None),
             "python" => vec![
                 policy.tooling.command("uv").display().to_string(),
                 "run".into(),

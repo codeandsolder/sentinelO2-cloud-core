@@ -911,7 +911,7 @@ async fn kill_and_reap_relay(
 fn interpret_relay_output(
     endpoint: &Endpoint,
     executable: &Path,
-    captured: CapturedOutput,
+    captured: &CapturedOutput,
 ) -> Result<Vec<u8>, HandlerError> {
     if captured.stdout.truncated() {
         return Err(HandlerError::new(
@@ -1031,7 +1031,7 @@ async fn call_via_run_as(
         }
     };
 
-    interpret_relay_output(endpoint, &executable, captured)
+    interpret_relay_output(endpoint, &executable, &captured)
 }
 
 async fn call_jsonrpc(

@@ -238,6 +238,12 @@ fn scan_utf8(
     ))
 }
 
+const UTF16_SAW_ANY: u8 = 1 << 0;
+const UTF16_LAST_NEWLINE: u8 = 1 << 1;
+const UTF16_TRUNCATED: u8 = 1 << 2;
+const UTF16_STOPPED_EARLY: u8 = 1 << 3;
+const UTF16_FIRST_UNIT: u8 = 1 << 4;
+
 struct Utf16ScanState {
     units: Vec<u16>,
     start: usize,
@@ -245,11 +251,7 @@ struct Utf16ScanState {
     cap: usize,
     line: usize,
     last_selected: usize,
-    saw_any: bool,
-    last_was_newline: bool,
-    truncated: bool,
-    stopped_early: bool,
-    first_unit: bool,
+    flags: u8,
 }
 
 impl Utf16ScanState {
@@ -261,22 +263,30 @@ impl Utf16ScanState {
             cap,
             line: 1,
             last_selected: start.saturating_sub(1),
-            saw_any: false,
-            last_was_newline: false,
-            truncated: false,
-            stopped_early: false,
-            first_unit: true,
+            flags: UTF16_FIRST_UNIT,
+        }
+    }
+
+    fn flag(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    fn set_flag(&mut self, flag: u8, enabled: bool) {
+        if enabled {
+            self.flags |= flag;
+        } else {
+            self.flags &= !flag;
         }
     }
 
     fn push_unit(&mut self, unit: u16) -> bool {
-        if self.first_unit && unit == 0xfeff {
-            self.first_unit = false;
+        if self.flag(UTF16_FIRST_UNIT) && unit == 0xfeff {
+            self.set_flag(UTF16_FIRST_UNIT, false);
             return false;
         }
-        self.first_unit = false;
-        self.saw_any = true;
-        self.last_was_newline = unit == 0x000a;
+        self.set_flag(UTF16_FIRST_UNIT, false);
+        self.set_flag(UTF16_SAW_ANY, true);
+        self.set_flag(UTF16_LAST_NEWLINE, unit == 0x000a);
         let selected = self.line >= self.start && self.end.is_none_or(|last| self.line <= last);
 
         if unit == 0x000a {
@@ -286,23 +296,23 @@ impl Utf16ScanState {
                 let next_selected = next >= self.start && self.end.is_none_or(|last| next <= last);
                 if next_selected {
                     if self.units.len() >= self.cap {
-                        self.truncated = true;
-                        self.stopped_early = true;
+                        self.set_flag(UTF16_TRUNCATED, true);
+                        self.set_flag(UTF16_STOPPED_EARLY, true);
                         return true;
                     }
                     self.units.push(0x000a);
                 }
             }
             if self.end.is_some_and(|last| self.line >= last) {
-                self.stopped_early = true;
+                self.set_flag(UTF16_STOPPED_EARLY, true);
                 return true;
             }
             self.line = self.line.saturating_add(1);
         } else if selected {
             self.last_selected = self.line;
             if self.units.len() >= self.cap {
-                self.truncated = true;
-                self.stopped_early = true;
+                self.set_flag(UTF16_TRUNCATED, true);
+                self.set_flag(UTF16_STOPPED_EARLY, true);
                 return true;
             }
             self.units.push(unit);
@@ -311,11 +321,12 @@ impl Utf16ScanState {
     }
 
     fn finish(mut self) -> (String, usize, bool, bool, usize) {
-        let total_lines = if !self.saw_any {
+        let stopped_early = self.flag(UTF16_STOPPED_EARLY);
+        let total_lines = if !self.flag(UTF16_SAW_ANY) {
             0
-        } else if self.stopped_early {
+        } else if stopped_early {
             self.line
-        } else if self.last_was_newline {
+        } else if self.flag(UTF16_LAST_NEWLINE) {
             self.line.saturating_sub(1)
         } else {
             self.line
@@ -323,18 +334,20 @@ impl Utf16ScanState {
         let mut content = String::from_utf16_lossy(&self.units);
         let before = content.len();
         content = clip(content, self.cap);
-        self.truncated |= content.len() < before;
+        if content.len() < before {
+            self.set_flag(UTF16_TRUNCATED, true);
+        }
         (
             content,
             total_lines,
-            !self.stopped_early,
-            self.truncated,
+            !stopped_early,
+            self.flag(UTF16_TRUNCATED),
             self.last_selected,
         )
     }
 }
 
-fn utf16_unit(pair: [u8; 2], little_endian: bool) -> u16 {
+const fn utf16_unit(pair: [u8; 2], little_endian: bool) -> u16 {
     if little_endian {
         u16::from_le_bytes(pair)
     } else {
@@ -702,6 +715,19 @@ fn search_candidate(
     state.matches.len() >= state.cap
 }
 
+fn search_file_glob(payload: &Map<String, Value>) -> Result<Option<Pattern>, HandlerError> {
+    match payload.get("file_glob") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Pattern::new(text)
+            .map(Some)
+            .map_err(|e| HandlerError::new("invalid_payload", format!("invalid file_glob: {e}"))),
+        _ => Err(HandlerError::new(
+            "invalid_payload",
+            "file_glob must be a string",
+        )),
+    }
+}
+
 /// # Errors
 /// Returns an error when the search request is invalid, disallowed, or cannot be executed.
 pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -716,18 +742,7 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("regex")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let file_glob = match payload.get("file_glob") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(text)) => Some(Pattern::new(text).map_err(|e| {
-            HandlerError::new("invalid_payload", format!("invalid file_glob: {e}"))
-        })?),
-        _ => {
-            return Err(HandlerError::new(
-                "invalid_payload",
-                "file_glob must be a string",
-            ));
-        }
-    };
+    let file_glob = search_file_glob(payload)?;
     let cap = payload
         .get("max_results")
         .and_then(Value::as_u64)
