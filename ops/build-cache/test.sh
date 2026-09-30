@@ -5,6 +5,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRUNER="$HERE/cargo-target-prune"
 SOURCE_PRUNER="$HERE/cargo-source-prune"
 WRAPPER="$HERE/cargo"
+
+# Keep all shipped shell helpers under the maintenance-scripts CI lane even
+# when a test below does not execute a root/systemd-only code path.
+bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$HERE/sccache-release-update"     "$HERE/install-sccache-autoupdate"
+
 tmp="$(mktemp -d)"
 
 cleanup() {
