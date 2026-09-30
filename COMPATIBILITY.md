@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.22.0 behavior at reviewed upstream commit
-  `a18dcbda92869de6c4f891495452aa89d061e42c`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.22.1 behavior at reviewed upstream commit
+  `b55ea1d32d5b3c4959da37294e22cc0d28de59f4`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -121,7 +121,9 @@ Reference surfaces:
   its historical contract.
 - `exec` and `script_run` capture child output with bounded head/tail buffers,
   report exact stdout/stderr byte counts when truncated, and kill process
-  groups on timeout.
+  groups on timeout. Upstream 0.22.1 cancellation semantics are also matched:
+  cancelling an in-flight `exec` drops a process-group guard that synchronously
+  kills the shell's whole group, so descendants cannot outlive the request.
 - Service actions invoke `systemctl`/`sudo` as argv rather than routing fixed
   operations through a shell.
 - External edit validators have bounded diagnostics, a deadline and process
