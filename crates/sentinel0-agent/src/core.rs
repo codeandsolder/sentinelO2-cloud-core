@@ -12,9 +12,13 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
+
+const MAX_CONCURRENT_SCANS: usize = 4;
+static SCAN_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS)));
 
 #[derive(Clone)]
 pub struct CoreDispatcher {
@@ -933,26 +937,44 @@ impl CoreDispatcher {
 
     async fn blocking_file_op(&self, op: Op, payload: Map<String, Value>) -> HandlerResult {
         let policy = Arc::clone(&self.policy);
-        tokio::task::spawn_blocking(move || match op {
-            Op::Read => fileops::read(&policy, &payload),
-            Op::List => fileops::list(&policy, &payload),
-            Op::Search => fileops::search(&policy, &payload),
-            Op::Edit => edit::edit(&policy, &payload),
-            Op::EditUploadInit => crate::edit_upload::init(&policy),
-            Op::EditUploadFile => crate::edit_upload::file(&policy, &payload),
-            Op::EditUploadComplete => crate::edit_upload::complete(&policy, &payload),
-            Op::UploadInit => crate::upload::upload_init(&policy, &payload),
-            Op::UploadChunk => crate::upload::upload_chunk(&policy, &payload),
-            Op::UploadComplete => crate::upload::upload_complete(&policy, &payload),
-            Op::FileExportInit => crate::file_export::init(&policy, &payload),
-            Op::FileExportComplete => crate::file_export::complete(&payload),
-            Op::Move | Op::Copy | Op::Delete | Op::Chmod | Op::Chown => {
-                crate::fsmutate::handle(&policy, op, &payload)
+        let scan_permit = if matches!(op, Op::List | Op::Search) {
+            Some(
+                Arc::clone(&SCAN_PERMITS)
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| {
+                        HandlerError::new(
+                            "internal_error",
+                            format!("scan concurrency limiter closed unexpectedly: {error}"),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        tokio::task::spawn_blocking(move || {
+            let _scan_permit = scan_permit;
+            match op {
+                Op::Read => fileops::read(&policy, &payload),
+                Op::List => fileops::list(&policy, &payload),
+                Op::Search => fileops::search(&policy, &payload),
+                Op::Edit => edit::edit(&policy, &payload),
+                Op::EditUploadInit => crate::edit_upload::init(&policy),
+                Op::EditUploadFile => crate::edit_upload::file(&policy, &payload),
+                Op::EditUploadComplete => crate::edit_upload::complete(&policy, &payload),
+                Op::UploadInit => crate::upload::upload_init(&policy, &payload),
+                Op::UploadChunk => crate::upload::upload_chunk(&policy, &payload),
+                Op::UploadComplete => crate::upload::upload_complete(&policy, &payload),
+                Op::FileExportInit => crate::file_export::init(&policy, &payload),
+                Op::FileExportComplete => crate::file_export::complete(&payload),
+                Op::Move | Op::Copy | Op::Delete | Op::Chmod | Op::Chown => {
+                    crate::fsmutate::handle(&policy, op, &payload)
+                }
+                _ => Err(HandlerError::new(
+                    "unsupported_op",
+                    "not a blocking file op",
+                )),
             }
-            _ => Err(HandlerError::new(
-                "unsupported_op",
-                "not a blocking file op",
-            )),
         })
         .await
         .map_err(|error| {
@@ -1072,6 +1094,37 @@ mod tests {
     use crate::policy::{FileAccess, FileOpsPath, ServiceSpec};
     use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn read_does_not_wait_for_scan_permits() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let file = dir.path().join("small.txt");
+        std::fs::write(&file, "hello\n").test_value()?;
+        let policy = Policy {
+            file_ops_paths: vec![FileOpsPath {
+                path: dir.path().to_owned(),
+                access: FileAccess::Read,
+            }],
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
+        let _all_scan_permits = Arc::clone(&SCAN_PERMITS)
+            .acquire_many_owned(u32::try_from(MAX_CONCURRENT_SCANS).test_value()?)
+            .await
+            .test_value()?;
+        let payload = Map::from_iter([("path".into(), Value::String(file.display().to_string()))]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatcher.blocking_file_op(Op::Read, payload),
+        )
+        .await
+        .test_value()?
+        .test_value()?;
+
+        assert_eq!(result["content"], "hello\n");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn capabilities_are_derived_from_real_dispatch_surface() -> TestResult {

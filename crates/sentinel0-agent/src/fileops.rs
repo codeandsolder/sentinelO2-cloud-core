@@ -12,14 +12,16 @@ use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Seek},
+    io::{self, Read, Seek},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use walkdir::WalkDir;
 
 const PROBE: usize = 8192;
 const PREVIEW_CHARS: usize = 200;
 const MAX_SEARCH_ERRORS: usize = 32;
+const FILEOPS_TIME_BUDGET: Duration = Duration::from_secs(50);
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "__pycache__",
@@ -491,6 +493,14 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 /// # Errors
 /// Returns an error when the directory request is invalid, disallowed, or cannot be read.
 pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+    list_with_budget(policy, payload, FILEOPS_TIME_BUDGET)
+}
+
+fn list_with_budget(
+    policy: &Policy,
+    payload: &Map<String, Value>,
+    budget: Duration,
+) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let root = resolve(policy, raw)?;
     let meta = fs::metadata(&root).map_err(|error| access_error(raw, &error))?;
@@ -527,6 +537,8 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 
     let mut entries = Vec::new();
     let mut truncated = false;
+    let mut timed_out = false;
+    let deadline = Instant::now() + budget;
     for entry in WalkDir::new(&root)
         .min_depth(1)
         .max_depth(depth)
@@ -537,6 +549,10 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
             !SKIP_DIRS.contains(&name.as_ref()) && (hidden || !name.starts_with('.'))
         })
     {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy();
         if pattern.as_ref().is_some_and(|p| !p.matches(&name)) {
@@ -562,13 +578,32 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     }
 
     let total = entries.len();
-    Ok(BTreeMap::from([
+    let mut result = BTreeMap::from([
         ("ok".into(), Value::Bool(true)),
         ("path".into(), Value::String(root.display().to_string())),
         ("entries".into(), Value::Array(entries)),
         ("total".into(), Value::from(total as u64)),
-        ("truncated".into(), Value::Bool(truncated)),
-    ]))
+        ("truncated".into(), Value::Bool(truncated || timed_out)),
+    ]);
+    if timed_out {
+        result.insert(
+            "truncated_reason".into(),
+            Value::String("time_budget".into()),
+        );
+        result.insert(
+            "note".into(),
+            Value::String(format!(
+                "Stopped after {:.0} s; these are the entries found so far. Narrow the path, depth or glob for the rest.",
+                budget.as_secs_f64()
+            )),
+        );
+    } else if truncated {
+        result.insert(
+            "truncated_reason".into(),
+            Value::String("max_entries".into()),
+        );
+    }
+    Ok(result)
 }
 
 fn skip_search_file(path: &Path) -> bool {
@@ -584,6 +619,26 @@ struct SearchState {
     errors: Vec<Value>,
     error_count: u64,
     cap: usize,
+    timed_out: bool,
+}
+
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: Instant,
+    timed_out: bool,
+}
+
+impl<R: Read> Read for DeadlineReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            self.timed_out = true;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "file-ops search time budget exceeded",
+            ));
+        }
+        self.inner.read(buf)
+    }
 }
 
 fn build_search_matcher(
@@ -610,13 +665,71 @@ fn build_search_matcher(
     }
 }
 
+fn record_search_match(
+    path: &Path,
+    rel: &str,
+    matcher: &RegexMatcher,
+    state: &mut SearchState,
+    line_number: u64,
+    line: &[u8],
+) -> bool {
+    let line = match std::str::from_utf8(line) {
+        Ok(line) => line,
+        Err(error) => {
+            record_search_error(
+                &mut state.errors,
+                &mut state.error_count,
+                Some(path),
+                format!("line {line_number} is not UTF-8: {error}"),
+            );
+            return true;
+        }
+    };
+    let found = match matcher.find(line.as_bytes()) {
+        Ok(Some(found)) => found,
+        Ok(None) => return true,
+        Err(error) => {
+            record_search_error(
+                &mut state.errors,
+                &mut state.error_count,
+                Some(path),
+                format!("matcher failed on line {line_number}: {error}"),
+            );
+            return true;
+        }
+    };
+    let mut preview = line.trim().to_owned();
+    if preview.chars().count() > PREVIEW_CHARS {
+        preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
+    }
+    let byte_column = found.start() + 1;
+    let column = line
+        .char_indices()
+        .take_while(|(index, _)| *index < found.start())
+        .count()
+        + 1;
+    state.matches.push(serde_json::json!({
+        "file": rel,
+        "line": line_number,
+        "column": column,
+        "byte_column": byte_column,
+        "text": preview,
+    }));
+    state.matches.len() < state.cap
+}
+
 fn search_candidate(
     path: &Path,
     rel: &str,
     matcher: &RegexMatcher,
     searcher: &mut Searcher,
     state: &mut SearchState,
+    deadline: Instant,
 ) -> bool {
+    if Instant::now() >= deadline {
+        state.timed_out = true;
+        return true;
+    }
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) => {
@@ -655,55 +768,29 @@ fn search_candidate(
         return false;
     }
     state.files_searched += 1;
-    let result = searcher.search_file(
+    let mut reader = DeadlineReader {
+        inner: &mut file,
+        deadline,
+        timed_out: false,
+    };
+    let result = searcher.search_reader(
         matcher,
-        &file,
+        &mut reader,
         Bytes(|line_number, line| {
-            let line = match std::str::from_utf8(line) {
-                Ok(line) => line,
-                Err(error) => {
-                    record_search_error(
-                        &mut state.errors,
-                        &mut state.error_count,
-                        Some(path),
-                        format!("line {line_number} is not UTF-8: {error}"),
-                    );
-                    return Ok(true);
-                }
-            };
-            let found = match matcher.find(line.as_bytes()) {
-                Ok(Some(found)) => found,
-                Ok(None) => return Ok(true),
-                Err(error) => {
-                    record_search_error(
-                        &mut state.errors,
-                        &mut state.error_count,
-                        Some(path),
-                        format!("matcher failed on line {line_number}: {error}"),
-                    );
-                    return Ok(true);
-                }
-            };
-            let mut preview = line.trim().to_owned();
-            if preview.chars().count() > PREVIEW_CHARS {
-                preview = preview.chars().take(PREVIEW_CHARS).collect::<String>() + "…";
-            }
-            let byte_column = found.start() + 1;
-            let column = line
-                .char_indices()
-                .take_while(|(index, _)| *index < found.start())
-                .count()
-                + 1;
-            state.matches.push(serde_json::json!({
-                "file": rel,
-                "line": line_number,
-                "column": column,
-                "byte_column": byte_column,
-                "text": preview,
-            }));
-            Ok(state.matches.len() < state.cap)
+            Ok(record_search_match(
+                path,
+                rel,
+                matcher,
+                state,
+                line_number,
+                line,
+            ))
         }),
     );
+    if reader.timed_out {
+        state.timed_out = true;
+        return true;
+    }
     if let Err(error) = result {
         record_search_error(
             &mut state.errors,
@@ -728,9 +815,69 @@ fn search_file_glob(payload: &Map<String, Value>) -> Result<Option<Pattern>, Han
     }
 }
 
+fn relative_search_path(root: &Path, raw: &str, path: &Path) -> String {
+    if root.is_file() {
+        root.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(raw)
+            .to_owned()
+    } else {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+fn finish_search_result(
+    root: &Path,
+    needle: &str,
+    state: SearchState,
+    budget: Duration,
+) -> BTreeMap<String, Value> {
+    let hit_cap = state.matches.len() >= state.cap;
+    let mut result = BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("path".into(), Value::String(root.display().to_string())),
+        ("pattern".into(), Value::String(needle.into())),
+        ("matches".into(), Value::Array(state.matches)),
+        ("files_searched".into(), Value::from(state.files_searched)),
+        ("search_error_count".into(), Value::from(state.error_count)),
+        ("search_errors".into(), Value::Array(state.errors)),
+        ("truncated".into(), Value::Bool(hit_cap || state.timed_out)),
+    ]);
+    if state.timed_out {
+        result.insert(
+            "truncated_reason".into(),
+            Value::String("time_budget".into()),
+        );
+        result.insert(
+            "note".into(),
+            Value::String(format!(
+                "Stopped after {:.0} s; these are the matches found so far. Narrow the path or file_glob for the rest.",
+                budget.as_secs_f64()
+            )),
+        );
+    } else if hit_cap {
+        result.insert(
+            "truncated_reason".into(),
+            Value::String("max_results".into()),
+        );
+    }
+    result
+}
+
 /// # Errors
 /// Returns an error when the search request is invalid, disallowed, or cannot be executed.
 pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+    search_with_budget(policy, payload, FILEOPS_TIME_BUDGET)
+}
+
+fn search_with_budget(
+    policy: &Policy,
+    payload: &Map<String, Value>,
+    budget: Duration,
+) -> HandlerResult {
     let raw = require_str(payload, "path")?;
     let needle = require_str(payload, "pattern")?;
     let root = resolve(policy, raw)?;
@@ -757,7 +904,9 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         errors: Vec::new(),
         error_count: 0,
         cap,
+        timed_out: false,
     };
+    let deadline = Instant::now() + budget;
     let mut walker = WalkBuilder::new(&root);
     walker
         .hidden(false)
@@ -777,6 +926,10 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .build();
 
     for entry in walker.build() {
+        if Instant::now() >= deadline {
+            state.timed_out = true;
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -798,35 +951,20 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         {
             continue;
         }
-        let rel = if root.is_file() {
-            root.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(raw)
-                .to_owned()
-        } else {
-            entry
-                .path()
-                .strip_prefix(&root)
-                .unwrap_or_else(|_| entry.path())
-                .to_string_lossy()
-                .into_owned()
-        };
-        if search_candidate(entry.path(), &rel, &matcher, &mut searcher, &mut state) {
+        let rel = relative_search_path(&root, raw, entry.path());
+        if search_candidate(
+            entry.path(),
+            &rel,
+            &matcher,
+            &mut searcher,
+            &mut state,
+            deadline,
+        ) {
             break;
         }
     }
 
-    let truncated = state.matches.len() >= state.cap;
-    Ok(BTreeMap::from([
-        ("ok".into(), Value::Bool(true)),
-        ("path".into(), Value::String(root.display().to_string())),
-        ("pattern".into(), Value::String(needle.into())),
-        ("matches".into(), Value::Array(state.matches)),
-        ("files_searched".into(), Value::from(state.files_searched)),
-        ("search_error_count".into(), Value::from(state.error_count)),
-        ("search_errors".into(), Value::Array(state.errors)),
-        ("truncated".into(), Value::Bool(truncated)),
-    ]))
+    Ok(finish_search_result(&root, needle, state, budget))
 }
 
 #[cfg(test)]
@@ -962,7 +1100,86 @@ mod tests {
         let result = search(&policy(dir.path()), &payload).test_value()?;
         assert_eq!(result["matches"].as_array().test_value()?.len(), 1);
         assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncated_reason"], "max_results");
 
+        Ok(())
+    }
+
+    #[test]
+    fn expired_search_budget_returns_partial_contract() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("big.txt"), "x\n".repeat(200_000)).test_value()?;
+        let result = search_with_budget(
+            &policy(dir.path()),
+            &search_payload(dir.path(), "needle"),
+            Duration::ZERO,
+        )
+        .test_value()?;
+
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncated_reason"], "time_budget");
+        assert!(
+            result["note"]
+                .as_str()
+                .test_value()?
+                .contains("Narrow the path")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deadline_reader_interrupts_file_io_after_deadline() -> TestResult {
+        let mut reader = DeadlineReader {
+            inner: std::io::Cursor::new(b"needle".as_slice()),
+            deadline: Instant::now(),
+            timed_out: false,
+        };
+        let mut buf = [0_u8; 16];
+        let error = reader.read(&mut buf).err().test_value()?;
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(reader.timed_out);
+        Ok(())
+    }
+
+    #[test]
+    fn list_time_budget_returns_partial_contract() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::create_dir(dir.path().join("child")).test_value()?;
+        let payload = Map::from_iter([(
+            "path".into(),
+            Value::String(dir.path().display().to_string()),
+        )]);
+        let result =
+            list_with_budget(&policy(dir.path()), &payload, Duration::ZERO).test_value()?;
+
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncated_reason"], "time_budget");
+        assert!(
+            result["note"]
+                .as_str()
+                .test_value()?
+                .contains("Narrow the path")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_result_cap_reports_max_entries() -> TestResult {
+        let dir = tempdir().test_value()?;
+        fs::write(dir.path().join("a.txt"), "a").test_value()?;
+        fs::write(dir.path().join("b.txt"), "b").test_value()?;
+        let mut capped = policy(dir.path());
+        capped.file_ops_max_list_entries = 1;
+        let payload = Map::from_iter([(
+            "path".into(),
+            Value::String(dir.path().display().to_string()),
+        )]);
+        let result = list(&capped, &payload).test_value()?;
+
+        assert_eq!(result["entries"].as_array().test_value()?.len(), 1);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["truncated_reason"], "max_entries");
         Ok(())
     }
 
