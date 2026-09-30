@@ -213,17 +213,14 @@ async fn other_pre_welcome_error_is_fatal_and_does_not_retry() -> TestResult {
     });
 
     let agent = Agent::new(config(addr), UnsupportedDispatcher).test_value()?;
-    let error = match tokio::time::timeout(
+    let Err(error) = tokio::time::timeout(
         Duration::from_millis(100),
         agent.run(CancellationToken::new()),
     )
     .await
     .test_value()?
-    {
-        Err(error) => error,
-        Ok(()) => {
-            return Err(std::io::Error::other("expected protocol rejection").into());
-        }
+    else {
+        return Err(std::io::Error::other("expected protocol rejection").into());
     };
 
     assert!(matches!(
@@ -309,17 +306,65 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() -> 
 struct EchoDispatcher;
 
 impl Dispatcher for EchoDispatcher {
-    async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> DispatchResponse {
+    fn dispatch(
+        &self,
+        id: &str,
+        op: Op,
+        payload: Map<String, Value>,
+    ) -> impl std::future::Future<Output = DispatchResponse> + Send {
         let mut result = BTreeMap::new();
         result.insert("op".into(), Value::String(op.as_str().into()));
         result.insert("payload".into(), Value::Object(payload));
-        DispatchResponse::message(Message::Response {
+        std::future::ready(DispatchResponse::message(Message::Response {
             id: id.into(),
             ok: true,
             result: Some(result),
             error: None,
-        })
+        }))
     }
+}
+
+async fn state_request_roundtrip(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    id: &str,
+    payload: Value,
+    opaque_ref: Option<&str>,
+) -> TestResult<BTreeMap<String, Value>> {
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "request",
+            "id": id,
+            "op": "state",
+            "payload": payload,
+            "deadline": null,
+            "opaque_ref": opaque_ref
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .test_value()?;
+
+    let reply = tokio::time::timeout(Duration::from_secs(1), next_non_heartbeat(ws))
+        .await
+        .test_value()?
+        .test_value()?;
+    let WsMessage::Text(reply) = reply else {
+        return Err(std::io::Error::other("expected response text frame").into());
+    };
+    let Message::Response {
+        id: response_id,
+        ok,
+        result,
+        error,
+    } = serde_json::from_str::<Message>(&reply).test_value()?
+    else {
+        return Err(std::io::Error::other("expected response").into());
+    };
+    assert_eq!(response_id, id);
+    assert!(ok);
+    assert!(error.is_none());
+    result.test_value()
 }
 
 #[tokio::test]
@@ -333,105 +378,24 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         let mut ws = accept_agent(&listener).await?;
         welcome(&mut ws, "sess_request").await?;
 
-        ws.send(WsMessage::Text(
-            json!({
-                "type": "request",
-                "id": "req_state",
-                "op": "state",
-                "payload": {"answer": 42},
-                "deadline": null,
-                "opaque_ref": "fixture"
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .test_value()?;
-
-        let reply = tokio::time::timeout(Duration::from_secs(1), next_non_heartbeat(&mut ws))
-            .await
-            .test_value()?
-            .test_value()?;
-        let WsMessage::Text(reply) = reply else {
-            return Err(std::io::Error::other("expected response text frame").into());
-        };
-        let Message::Response {
-            id,
-            ok,
-            result,
-            error,
-        } = serde_json::from_str::<Message>(&reply).test_value()?
-        else {
-            return Err(std::io::Error::other("expected response").into());
-        };
-        assert_eq!(id, "req_state");
-        assert!(ok);
-        assert!(error.is_none());
-        let result = result.test_value()?;
+        let result =
+            state_request_roundtrip(&mut ws, "req_state", json!({"answer": 42}), Some("fixture"))
+                .await?;
         assert_eq!(result["op"], "state");
         assert_eq!(result["payload"], json!({"answer": 42}));
         let timing = result["_sx_timing"].as_object().test_value()?;
         let received_at = timing["received_at"].as_f64().test_value()?;
         let finished_at = timing["finished_at"].as_f64().test_value()?;
         assert!(received_at <= finished_at);
-
         let response_at = result["response_time"].as_str().test_value()?;
         chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").test_value()?;
 
-        ws.send(WsMessage::Text(
-            json!({
-                "type": "request",
-                "id": "req_state_2",
-                "op": "state",
-                "payload": {},
-                "deadline": null,
-                "opaque_ref": null
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .test_value()?;
-        let second = next_non_heartbeat(&mut ws).await?;
-        let WsMessage::Text(second) = second else {
-            return Err(std::io::Error::other("expected second response").into());
-        };
-        let Message::Response {
-            result: Some(second),
-            ..
-        } = serde_json::from_str::<Message>(&second).test_value()?
-        else {
-            return Err(std::io::Error::other("expected successful second response").into());
-        };
+        let second = state_request_roundtrip(&mut ws, "req_state_2", json!({}), None).await?;
         let response_time = second["response_time"].as_str().test_value()?;
         chrono::NaiveTime::parse_from_str(response_time, "%H:%M:%S").test_value()?;
 
         tokio::time::sleep(Duration::from_millis(60)).await;
-        ws.send(WsMessage::Text(
-            json!({
-                "type": "request",
-                "id": "req_state_3",
-                "op": "state",
-                "payload": {},
-                "deadline": null,
-                "opaque_ref": null
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .test_value()?;
-        let third = next_non_heartbeat(&mut ws).await?;
-        let WsMessage::Text(third) = third else {
-            return Err(std::io::Error::other("expected third response").into());
-        };
-        let Message::Response {
-            result: Some(third),
-            ..
-        } = serde_json::from_str::<Message>(&third).test_value()?
-        else {
-            return Err(std::io::Error::other("expected successful third response").into());
-        };
+        let third = state_request_roundtrip(&mut ws, "req_state_3", json!({}), None).await?;
         let response_at = third["response_time"].as_str().test_value()?;
         chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").test_value()?;
 
@@ -700,7 +664,7 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
         .test_value()?;
     server.await.test_value()??;
 
-    assert!(pending_results::drain(&upload_base).is_empty());
+    assert_eq!(pending_results::drain(&upload_base), Vec::new());
     Ok(())
 }
 
@@ -812,7 +776,7 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
         .test_value()?;
     server.await.test_value()??;
 
-    assert!(pending_results::drain(&upload_base).is_empty());
+    assert_eq!(pending_results::drain(&upload_base), Vec::new());
     Ok(())
 }
 
@@ -1051,6 +1015,157 @@ async fn inbound_websocket_control_ping_is_answered_without_native_keepalive_tim
     Ok(())
 }
 
+async fn verify_export_roundtrip(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    source_path: &str,
+) -> TestResult {
+    let export_id = "01010101010101010101010101010101";
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "request",
+            "id": "export_init",
+            "op": "file_export_init",
+            "payload": {
+                "transfer_id": export_id,
+                "source_path": source_path,
+                "chunk_size": 3
+            },
+            "deadline": null,
+            "opaque_ref": null
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .test_value()?;
+    let init = next_non_heartbeat(ws).await?;
+    let WsMessage::Text(init) = init else {
+        return Err(std::io::Error::other("expected export init JSON response").into());
+    };
+    assert!(matches!(
+        serde_json::from_str::<Message>(&init).test_value()?,
+        Message::Response { ok: true, .. }
+    ));
+
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "request",
+            "id": "export_chunk",
+            "op": "file_export_chunk",
+            "payload": {
+                "transfer_id": export_id,
+                "chunk_index": 0
+            },
+            "deadline": null,
+            "opaque_ref": null
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .test_value()?;
+
+    let binary = next_non_heartbeat(ws).await?;
+    let WsMessage::Binary(binary) = binary else {
+        return Err(
+            std::io::Error::other("binary export payload must arrive before JSON ack").into(),
+        );
+    };
+    let frame = decode_binary_frame(&binary).test_value()?;
+    assert_eq!(frame.transfer_id, [0x01; 16]);
+    assert_eq!(frame.chunk_index, 0);
+    assert_eq!(frame.payload, b"abc");
+
+    let ack = next_non_heartbeat(ws).await?;
+    let WsMessage::Text(ack) = ack else {
+        return Err(std::io::Error::other("expected JSON ack after binary export payload").into());
+    };
+    let Message::Response {
+        ok: true,
+        result: Some(result),
+        ..
+    } = serde_json::from_str::<Message>(&ack).test_value()?
+    else {
+        return Err(std::io::Error::other("expected successful export chunk ack").into());
+    };
+    assert_eq!(result["chunk_index"], 0);
+    assert!(!result.contains_key("__binary_payload__"));
+    Ok(())
+}
+
+async fn verify_upload_roundtrip(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) -> TestResult {
+    let inbound_id = "10101010101010101010101010101010";
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "request",
+            "id": "upload_init",
+            "op": "upload_init",
+            "payload": {
+                "upload_id": inbound_id,
+                "target_path": "received.bin",
+                "total_size": 3
+            },
+            "deadline": null,
+            "opaque_ref": null
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .test_value()?;
+    let upload_init = next_non_heartbeat(ws).await?;
+    assert!(matches!(upload_init, WsMessage::Text(_)));
+
+    ws.send(WsMessage::Binary(
+        encode_binary_frame([0x10; 16], 0, b"xyz").into(),
+    ))
+    .await
+    .test_value()?;
+    let ack = tokio::time::timeout(Duration::from_millis(250), next_non_heartbeat(ws))
+        .await
+        .test_value()?
+        .test_value()?;
+    let WsMessage::Text(ack) = ack else {
+        return Err(std::io::Error::other("expected transfer chunk ack event").into());
+    };
+    let Message::Event { kind, data, .. } = serde_json::from_str::<Message>(&ack).test_value()?
+    else {
+        return Err(std::io::Error::other("expected event").into());
+    };
+    assert_eq!(kind, "transfer_chunk_ack");
+    assert_eq!(data["transfer_id"], inbound_id);
+    assert_eq!(data["chunk_index"], 0);
+    assert_eq!(data["ok"], true);
+    assert_eq!(data["bytes"], 3);
+
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "request",
+            "id": "upload_complete",
+            "op": "upload_complete",
+            "payload": {"upload_id": inbound_id},
+            "deadline": null,
+            "opaque_ref": null
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .test_value()?;
+    let complete = next_non_heartbeat(ws).await?;
+    let WsMessage::Text(complete) = complete else {
+        return Err(std::io::Error::other("expected upload complete response").into());
+    };
+    let complete = serde_json::from_str::<Message>(&complete).test_value()?;
+    assert!(
+        matches!(complete, Message::Response { ok: true, .. }),
+        "unexpected upload complete response: {complete:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk() -> TestResult {
     let dir = tempfile::tempdir().test_value()?;
@@ -1079,150 +1194,8 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
     let server = tokio::spawn(async move {
         let mut ws = accept_agent(&listener).await?;
         welcome(&mut ws, "sess_binary_roundtrip").await?;
-
-        let export_id = "01010101010101010101010101010101";
-        ws.send(WsMessage::Text(
-            json!({
-                "type": "request",
-                "id": "export_init",
-                "op": "file_export_init",
-                "payload": {
-                    "transfer_id": export_id,
-                    "source_path": source_for_server,
-                    "chunk_size": 3
-                },
-                "deadline": null,
-                "opaque_ref": null
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .test_value()?;
-        let init = next_non_heartbeat(&mut ws).await?;
-        let WsMessage::Text(init) = init else {
-            return Err(std::io::Error::other("expected export init JSON response").into());
-        };
-        assert!(matches!(
-            serde_json::from_str::<Message>(&init).test_value()?,
-            Message::Response { ok: true, .. }
-        ));
-
-        ws.send(WsMessage::Text(
-            json!({
-                "type": "request",
-                "id": "export_chunk",
-                "op": "file_export_chunk",
-                "payload": {
-                    "transfer_id": export_id,
-                    "chunk_index": 0
-                },
-                "deadline": null,
-                "opaque_ref": null
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .test_value()?;
-
-        let first = next_non_heartbeat(&mut ws).await?;
-        let WsMessage::Binary(first) = first else {
-            return Err(
-                std::io::Error::other("binary export payload must arrive before JSON ack").into(),
-            );
-        };
-        let frame = decode_binary_frame(&first).test_value()?;
-        assert_eq!(frame.transfer_id, [0x01; 16]);
-        assert_eq!(frame.chunk_index, 0);
-        assert_eq!(frame.payload, b"abc");
-
-        let second = next_non_heartbeat(&mut ws).await?;
-        let WsMessage::Text(second) = second else {
-            return Err(
-                std::io::Error::other("expected JSON ack after binary export payload").into(),
-            );
-        };
-        let Message::Response {
-            ok: true,
-            result: Some(result),
-            ..
-        } = serde_json::from_str::<Message>(&second).test_value()?
-        else {
-            return Err(std::io::Error::other("expected successful export chunk ack").into());
-        };
-        assert_eq!(result["chunk_index"], 0);
-        assert!(!result.contains_key("__binary_payload__"));
-
-        let inbound_id = "10101010101010101010101010101010";
-        ws.send(WsMessage::Text(
-            json!({
-                "type": "request",
-                "id": "upload_init",
-                "op": "upload_init",
-                "payload": {
-                    "upload_id": inbound_id,
-                    "target_path": "received.bin",
-                    "total_size": 3
-                },
-                "deadline": null,
-                "opaque_ref": null
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .test_value()?;
-        let upload_init = next_non_heartbeat(&mut ws).await?;
-        assert!(matches!(upload_init, WsMessage::Text(_)));
-
-        ws.send(WsMessage::Binary(
-            encode_binary_frame([0x10; 16], 0, b"xyz").into(),
-        ))
-        .await
-        .test_value()?;
-        let ack = tokio::time::timeout(Duration::from_millis(250), next_non_heartbeat(&mut ws))
-            .await
-            .test_value()?
-            .test_value()?;
-        let WsMessage::Text(ack) = ack else {
-            return Err(std::io::Error::other("expected transfer chunk ack event").into());
-        };
-        let Message::Event { kind, data, .. } =
-            serde_json::from_str::<Message>(&ack).test_value()?
-        else {
-            return Err(std::io::Error::other("expected event").into());
-        };
-        assert_eq!(kind, "transfer_chunk_ack");
-        assert_eq!(data["transfer_id"], inbound_id);
-        assert_eq!(data["chunk_index"], 0);
-        assert_eq!(data["ok"], true);
-        assert_eq!(data["bytes"], 3);
-
-        ws.send(WsMessage::Text(
-            json!({
-                "type": "request",
-                "id": "upload_complete",
-                "op": "upload_complete",
-                "payload": {"upload_id": inbound_id},
-                "deadline": null,
-                "opaque_ref": null
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .test_value()?;
-        let complete = next_non_heartbeat(&mut ws).await?;
-        let WsMessage::Text(complete) = complete else {
-            return Err(std::io::Error::other("expected upload complete response").into());
-        };
-        let complete = serde_json::from_str::<Message>(&complete).test_value()?;
-        assert!(
-            matches!(complete, Message::Response { ok: true, .. }),
-            "unexpected upload complete response: {complete:?}"
-        );
-
+        verify_export_roundtrip(&mut ws, &source_for_server).await?;
+        verify_upload_roundtrip(&mut ws).await?;
         server_cancel.cancel();
         let _ = ws.close(None).await;
         Ok::<(), common::TestFailure>(())
@@ -1236,7 +1209,6 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
         .test_value()?
         .test_value()?;
     server.await.test_value()??;
-
     assert_eq!(fs::read(received).test_value()?, b"xyz");
     Ok(())
 }
