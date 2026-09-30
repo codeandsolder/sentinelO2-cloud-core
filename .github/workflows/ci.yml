@@ -44,6 +44,7 @@ jobs:
         run: ops/build-cache/test.sh
 
   rust:
+    if: github.event_name == 'pull_request'
     name: Rust 1.98.1
     runs-on: ubuntu-24.04
     env:
@@ -62,6 +63,23 @@ jobs:
         run: cargo +1.98.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo +1.98.1 test --locked --workspace --all-targets
+
+
+  rust-shared-cache:
+    name: Rust 1.98.1 (shared sccache)
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@main
+    with:
+      command: |
+        cargo +1.98.1 fmt --all -- --check
+        cargo +1.98.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
+        cargo +1.98.1 test --locked --workspace --all-targets
+      rust-toolchain: "1.98.1"
+      rust-components: "rustfmt clippy"
+      rustflags: "-C target-cpu=x86-64-v2"
 
   msrv:
     name: Rust 1.88 MSRV
@@ -107,7 +125,7 @@ jobs:
   release:
     name: Release binary
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lockfile, maintenance-scripts, rust]
+    needs: [lockfile, maintenance-scripts, rust-shared-cache]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
