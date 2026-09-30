@@ -138,7 +138,7 @@ mod tests {
     fn valid_identity_trims_scalar_fields() -> TestResult {
         let (_dir, path) = write(
             r#"{"host_id":" host_1 ","token":" aaa.bbb.ccc \n","hub":" https://hub.example "}"#,
-        );
+        )?;
         let identity = load_identity(&path).test_value()?;
         assert_eq!(identity.host_id, "host_1");
         assert_eq!(identity.hub, "https://hub.example");
