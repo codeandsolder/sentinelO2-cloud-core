@@ -212,7 +212,7 @@ mod tests {
     use crate::test_support::TestResult;
 
     #[test]
-    fn direct_python_policy_catches_plain_and_sudo_invocations() -> TestResult {
+    fn direct_python_policy_catches_plain_and_sudo_invocations() {
         let tooling = Tooling::default();
         assert_eq!(
             tooling.direct_python_violation("python3 x.py"),
@@ -228,7 +228,5 @@ mod tests {
         );
         assert_eq!(tooling.direct_python_violation("uv run python x.py"), None);
         assert_eq!(tooling.direct_python_violation("echo python3"), None);
-
-        Ok(())
     }
 }

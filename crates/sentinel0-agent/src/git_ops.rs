@@ -958,7 +958,12 @@ mod tests {
         let dir = tempdir().test_value()?;
         std::fs::write(
             dir.path().join("f.txt"),
-            (1..=10).map(|i| format!("line{i}\n")).collect::<String>(),
+            (1..=10).fold(String::new(), |mut output, i| {
+                output.push_str("line");
+                output.push_str(&i.to_string());
+                output.push('\n');
+                output
+            }),
         )
         .test_value()?;
         for args in [
@@ -1070,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn name_status_parser_counts_all_but_keeps_only_requested_prefix() -> TestResult {
+    fn name_status_parser_counts_all_but_keeps_only_requested_prefix() {
         let raw = b"M\0a.txt\0R100\0old.txt\0new.txt\0A\0z.txt\0";
         let (rows, total) = parse_name_status(raw, 2);
         assert_eq!(total, 3);
@@ -1080,7 +1085,5 @@ mod tests {
             rows[1],
             ("new.txt".into(), "renamed".into(), Some("old.txt".into()))
         );
-
-        Ok(())
     }
 }

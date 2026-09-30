@@ -782,7 +782,7 @@ exec_strict: true
     }
 
     #[test]
-    fn unknown_top_level_keys_fail_at_parse_boundary() -> TestResult {
+    fn unknown_top_level_keys_fail_at_parse_boundary() {
         for text in [
             "allow: [git]\n",
             "allowedCommands: [git]\n",
@@ -798,8 +798,6 @@ exec_strict: true
                 "unknown top-level key unexpectedly parsed: {text:?}"
             );
         }
-
-        Ok(())
     }
 
     #[test]
@@ -868,7 +866,7 @@ exec_strict: true
     }
 
     #[test]
-    fn compatibility_blocks_are_strictly_typed() -> TestResult {
+    fn compatibility_blocks_are_strictly_typed() {
         for text in [
             "log:
   path: /tmp/x.log
@@ -896,12 +894,10 @@ exec_strict: true
                 );
             }
         }
-
-        Ok(())
     }
 
     #[test]
-    fn nested_config_typos_fail_at_parse_boundary() -> TestResult {
+    fn nested_config_typos_fail_at_parse_boundary() {
         for text in [
             "exec:\n  timeout_defualt: 30\n",
             "security:\n  file_url_timeout_second: 15\n",
@@ -916,8 +912,6 @@ exec_strict: true
                 "nested typo unexpectedly parsed: {text:?}"
             );
         }
-
-        Ok(())
     }
 
     #[test]

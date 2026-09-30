@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_summary_keeps_useful_values_and_redacts_tokenish_strings() -> TestResult {
+    fn payload_summary_keeps_useful_values_and_redacts_tokenish_strings() {
         let payload = Map::from_iter([
             (
                 "path".into(),
@@ -322,12 +322,10 @@ mod tests {
         );
         assert_eq!(summary["env"]["MODE"], "debug");
         assert_eq!(summary["env"]["TOKEN"], "[redacted-tokenish]");
-
-        Ok(())
     }
 
     #[test]
-    fn tokenish_classifier_is_intentionally_simple() -> TestResult {
+    fn tokenish_classifier_is_intentionally_simple() {
         assert!(looks_tokenish("prefix=A1b2C3d4E5f6G7h8I9j0K1l2;suffix"));
         assert!(looks_tokenish(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -335,8 +333,6 @@ mod tests {
         assert!(!looks_tokenish("ordinary-written-text-without-digits"));
         assert!(!looks_tokenish("123456789012345678901234567890"));
         assert!(!looks_tokenish("550e8400-e29b-41d4-a716-446655440000"));
-
-        Ok(())
     }
 
     #[test]

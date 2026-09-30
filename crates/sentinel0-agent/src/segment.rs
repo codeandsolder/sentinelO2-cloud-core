@@ -189,26 +189,22 @@ mod tests {
     use crate::test_support::TestResult;
 
     #[test]
-    fn quoted_separators_are_data_not_structure() -> TestResult {
+    fn quoted_separators_are_data_not_structure() {
         assert_eq!(
             split_top_level("printf ';|&&' && echo done"),
             vec!["printf ';|&&'", "echo done"]
         );
-
-        Ok(())
     }
 
     #[test]
-    fn substitution_ignores_single_quotes_but_not_double_quotes() -> TestResult {
+    fn substitution_ignores_single_quotes_but_not_double_quotes() {
         assert_eq!(has_substitution("echo '$(id)'"), None);
         assert_eq!(has_substitution("echo \"$(id)\""), Some("$("));
         assert_eq!(has_substitution("echo `id`"), Some("`"));
-
-        Ok(())
     }
 
     #[test]
-    fn strict_segments_match_official_concessions() -> TestResult {
+    fn strict_segments_match_official_concessions() {
         let policy = Policy {
             allowed_commands: vec!["make".into()],
             ..Policy::default()
@@ -221,7 +217,5 @@ mod tests {
             unauthorised_segment(&policy, "make; curl bad"),
             Some("curl bad".into())
         );
-
-        Ok(())
     }
 }

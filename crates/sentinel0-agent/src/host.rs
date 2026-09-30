@@ -164,24 +164,20 @@ mod tests {
     use crate::test_support::TestResult;
 
     #[test]
-    fn host_info_has_required_identity_fields() -> TestResult {
+    fn host_info_has_required_identity_fields() {
         let host = gather_host_info("fixture".into(), None);
         assert_eq!(host.id, "fixture");
         assert_ne!(host.hostname, "");
         assert_ne!(host.os, "");
-
-        Ok(())
     }
 
     #[test]
-    fn uptime_and_loadavg_are_sane_on_linux_ci() -> TestResult {
+    fn uptime_and_loadavg_are_sane_on_linux_ci() {
         if Path::new("/proc/uptime").exists() {
             assert!(uptime_seconds().is_some_and(|value| value >= 0.0));
         }
         if Path::new("/proc/loadavg").exists() {
             assert!(loadavg().is_some());
         }
-
-        Ok(())
     }
 }

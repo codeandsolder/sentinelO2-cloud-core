@@ -1461,7 +1461,7 @@ actions:
     }
 
     #[test]
-    fn projection_supports_dotted_paths_and_arrays() -> TestResult {
+    fn projection_supports_dotted_paths_and_arrays() {
         let value = json!([
             {"Config": {"Image": "a"}, "Name": "one"},
             {"Config": {"Image": "b"}, "Name": "two"}
@@ -1469,8 +1469,6 @@ actions:
         let projected = project(value, &["Config.Image".into(), "Name".into()]);
         assert_eq!(projected[0]["Config.Image"], "a");
         assert_eq!(projected[1]["Name"], "two");
-
-        Ok(())
     }
 
     #[test]

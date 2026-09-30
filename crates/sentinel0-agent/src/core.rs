@@ -1113,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn unusable_commands_reports_only_sudo_under_no_new_privileges() -> TestResult {
+    fn unusable_commands_reports_only_sudo_under_no_new_privileges() {
         let commands = vec![
             "sudo systemctl".to_owned(),
             "/usr/bin/sudo -n true".to_owned(),
@@ -1130,19 +1130,15 @@ mod tests {
             CoreDispatcher::unusable_commands_for(&commands, false),
             json!({})
         );
-
-        Ok(())
     }
 
     #[test]
-    fn unusable_commands_ignores_empty_and_whitespace_wildcards() -> TestResult {
+    fn unusable_commands_ignores_empty_and_whitespace_wildcards() {
         let commands = vec![String::new(), "   ".to_owned(), "echo".to_owned()];
         assert_eq!(
             CoreDispatcher::unusable_commands_for(&commands, true),
             json!({})
         );
-
-        Ok(())
     }
 
     #[test]

@@ -1,7 +1,7 @@
 mod common;
 
 use chrono::{TimeZone, Utc};
-use common::{TestError as _, TestResult, TestValue as _};
+use common::{TestResult, TestValue as _};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{
     Agent, AgentConfig, AgentError, AuthToken, DispatchResponse, Dispatcher, ReconnectPolicy,
@@ -213,13 +213,18 @@ async fn other_pre_welcome_error_is_fatal_and_does_not_retry() -> TestResult {
     });
 
     let agent = Agent::new(config(addr), UnsupportedDispatcher).test_value()?;
-    let error = tokio::time::timeout(
+    let error = match tokio::time::timeout(
         Duration::from_millis(100),
         agent.run(CancellationToken::new()),
     )
     .await
     .test_value()?
-    .test_error()?;
+    {
+        Err(error) => error,
+        Ok(()) => {
+            return Err(std::io::Error::other("expected protocol rejection").into());
+        }
+    };
 
     assert!(matches!(
         error,

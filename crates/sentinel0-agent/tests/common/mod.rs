@@ -23,16 +23,3 @@ impl<T> TestValue<T> for Option<T> {
         self.ok_or_else(|| io::Error::other("expected Some(..), got None").into())
     }
 }
-
-pub trait TestError<E> {
-    fn test_error(self) -> TestResult<E>;
-}
-
-impl<T, E> TestError<E> for Result<T, E> {
-    fn test_error(self) -> TestResult<E> {
-        match self {
-            Err(error) => Ok(error),
-            Ok(_) => Err(io::Error::other("expected Err(..), got Ok(..)").into()),
-        }
-    }
-}

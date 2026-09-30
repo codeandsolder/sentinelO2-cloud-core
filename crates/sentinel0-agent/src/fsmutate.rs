@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_our_timestamped_backup_names() -> TestResult {
+    fn recognizes_only_our_timestamped_backup_names() {
         for name in [
             "model.gguf.bak.20260924-142530.123456",
             "project.bak.20260924-142530.123456.tar.gz",
@@ -831,8 +831,6 @@ mod tests {
         ] {
             assert!(!is_own_backup(Path::new(name)), "{name}");
         }
-
-        Ok(())
     }
 
     #[test]

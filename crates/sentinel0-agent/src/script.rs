@@ -657,7 +657,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn staging_host_conditions_have_specific_error_codes() -> TestResult {
+    fn staging_host_conditions_have_specific_error_codes() {
         let path = Path::new("/var/lib/sentinelx/uploads/.sentinelx_uploads/script_job_x");
         assert_eq!(
             staging_oserror(&std::io::Error::from_raw_os_error(nix::libc::ENOSPC), path).code,
@@ -682,8 +682,6 @@ mod tests {
         assert!(message.contains("host condition"));
         assert!(message.contains("unstable"));
         assert!(message.contains(&path.display().to_string()));
-
-        Ok(())
     }
 
     #[tokio::test]

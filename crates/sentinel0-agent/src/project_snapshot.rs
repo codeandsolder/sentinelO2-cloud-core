@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn top_counts_streams_paths_without_materializing_the_inventory() -> TestResult {
+    fn top_counts_streams_paths_without_materializing_the_inventory() {
         let paths = ["src/lib.rs", "src/main.rs", "README", ".gitignore"];
         let (tracked, top, extensions, truncated) = top_counts(paths);
         assert_eq!(tracked, 4);
@@ -579,7 +579,5 @@ mod tests {
         assert_eq!(extensions["<none>"], 1);
         assert_eq!(extensions["<dotfile>"], 1);
         assert!(!truncated);
-
-        Ok(())
     }
 }

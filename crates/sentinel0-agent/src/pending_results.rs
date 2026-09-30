@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].1, event("job_abc"));
         clear(Some(&path));
-        assert!(drain(&upload).is_empty());
+        assert_eq!(drain(&upload), []);
 
         Ok(())
     }
@@ -397,7 +397,7 @@ mod tests {
         let bad = pending_dir(&upload).join("job_bad.json");
         fs::write(&bad, "{ not json").test_value()?;
 
-        assert!(drain(&upload).is_empty());
+        assert_eq!(drain(&upload), []);
         assert!(!expired.exists());
         assert!(!bad.exists());
 
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_record_is_non_fatal_and_clear_none_is_safe() -> TestResult {
+    fn failed_record_is_non_fatal_and_clear_none_is_safe() {
         assert!(
             record(
                 Path::new("/proc/nonexistent/deep"),
@@ -471,8 +471,6 @@ mod tests {
             .is_none()
         );
         clear(None);
-
-        Ok(())
     }
 
     #[test]
@@ -562,13 +560,13 @@ mod tests {
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
             .collect();
-        assert!(temps.is_empty());
+        assert_eq!(temps, []);
 
         Ok(())
     }
 
     #[test]
-    fn sanitized_job_ids_do_not_alias_pending_paths() -> TestResult {
+    fn sanitized_job_ids_do_not_alias_pending_paths() {
         assert_ne!(safe_name("job/a"), safe_name("joba"));
         assert_ne!(
             safe_name(&format!("{}x", "a".repeat(64))),
@@ -577,17 +575,13 @@ mod tests {
         assert_eq!(safe_name("job_0123-abcd"), "job_0123-abcd");
         let safe_64 = "a".repeat(64);
         assert_eq!(safe_name(&safe_64), safe_64);
-
-        Ok(())
     }
 
     #[test]
-    fn unicode_job_id_stays_within_safe_ascii_filename_shape() -> TestResult {
+    fn unicode_job_id_stays_within_safe_ascii_filename_shape() {
         let name = safe_name(&"ą".repeat(100));
         assert!(name.is_ascii());
         assert!(name.len() < 100);
         assert!(!name.contains('/'));
-
-        Ok(())
     }
 }

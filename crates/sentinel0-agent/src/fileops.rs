@@ -847,15 +847,13 @@ mod tests {
     }
 
     #[test]
-    fn permission_denied_is_not_reported_as_internal_io_error() -> TestResult {
+    fn permission_denied_is_not_reported_as_internal_io_error() {
         let error = access_error(
             "/restricted/tree",
             &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         assert_eq!(error.code, "permission_denied");
         assert!(error.message.contains("/restricted/tree"));
-
-        Ok(())
     }
 
     #[test]
