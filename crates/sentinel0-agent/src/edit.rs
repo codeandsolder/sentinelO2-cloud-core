@@ -380,7 +380,7 @@ fn validator_argv(
     Ok((!argv.is_empty()).then_some(argv))
 }
 
-fn timed_out_validator_error(child: &mut std::process::Child, pid: Option<u32>) -> HandlerError {
+fn timed_out_validator_error(child: &mut std::process::Child, pid: u32) -> HandlerError {
     let mut cleanup_error = None;
     #[cfg(unix)]
     {
