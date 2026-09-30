@@ -110,6 +110,12 @@ if [[ " $* " == *" build "* ]]; then
     fi
     mkdir -p "$src" "$CARGO_TARGET_DIR/debug/deps"
     printf 'registry source\n' >"$src/srcfile"
+    if [[ -n "${FAKE_CMAKE_C_PROBE:-}" ]]; then
+        printf '%s\n' "${CMAKE_C_COMPILER_LAUNCHER:-}" >"$FAKE_CMAKE_C_PROBE"
+    fi
+    if [[ -n "${FAKE_CMAKE_CXX_PROBE:-}" ]]; then
+        printf '%s\n' "${CMAKE_CXX_COMPILER_LAUNCHER:-}" >"$FAKE_CMAKE_CXX_PROBE"
+    fi
     if [[ "${FAKE_FAIL_BUILD:-0}" == 1 ]]; then
         printf 'failed-intermediate\n' >"$CARGO_TARGET_DIR/debug/deps/failed-intermediate"
         exit 23
@@ -144,6 +150,10 @@ printf '%s:%s\n' "$n" "$state" >>"$PROBE_LOG"
 EOF
 chmod +x "$probe"
 
+native_launcher="$tmp/fake-native-launcher"
+printf '#!/bin/sh\nexec "$@"\n' >"$native_launcher"
+chmod +x "$native_launcher"
+
 wrapper_conf="$tmp/wrapper.conf"
 cat >"$wrapper_conf" <<EOF
 SENTINELX_REAL_CARGO=$fake_cargo
@@ -158,15 +168,20 @@ SENTINELX_CARGO_TARGET_EPHEMERAL=1
 SENTINELX_CARGO_ARTIFACT_MIRROR=1
 SENTINELX_CARGO_INFRA_LOCK=$tmp/infra.lock
 SENTINELX_CARGO_MAINTENANCE_MARKER=$tmp/maintenance
+SENTINELX_CMAKE_COMPILER_LAUNCHER=$native_launcher
 EOF
 
 counter="$tmp/probe-counter"
 log="$tmp/probe-log"
 warm_probe="$tmp/warm-probe"
+cmake_c_probe="$tmp/cmake-c-probe"
+cmake_cxx_probe="$tmp/cmake-cxx-probe"
 (
     cd "$workspace"
     FAKE_WORKSPACE="$workspace" \
     FAKE_WARM_PROBE="$warm_probe" \
+    FAKE_CMAKE_C_PROBE="$cmake_c_probe" \
+    FAKE_CMAKE_CXX_PROBE="$cmake_cxx_probe" \
     PROBE_ROOT="$wrapper_root" \
     PROBE_LOCK_ROOT="$wrapper_locks" \
     PROBE_COUNTER="$counter" \
@@ -184,6 +199,8 @@ mapfile -t states <"$log"
 [[ ! -e "$workspace/target/debug/deps/intermediate" ]]
 [[ -f "$source_root/uid-$(id -u)/src/index.crates.io-test/fake-1.0/srcfile" ]]
 [[ -z "$(find "$wrapper_root" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]]
+[[ "$(cat "$cmake_c_probe")" == "$native_launcher" ]]
+[[ "$(cat "$cmake_cxx_probe")" == "$native_launcher" ]]
 
 # A second invocation must see the retained source pool as warm.
 : >"$log"
@@ -200,6 +217,24 @@ mapfile -t states <"$log"
     "$WRAPPER" build
 )
 [[ "$(cat "$warm_probe")" == "warm" ]]
+
+# Explicit project launchers must win over the site default.
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_CMAKE_C_PROBE="$cmake_c_probe" \
+    FAKE_CMAKE_CXX_PROBE="$cmake_cxx_probe" \
+    CMAKE_C_COMPILER_LAUNCHER=custom-c \
+    CMAKE_CXX_COMPILER_LAUNCHER=custom-cxx \
+    PROBE_ROOT="$wrapper_root" \
+    PROBE_LOCK_ROOT="$wrapper_locks" \
+    PROBE_COUNTER="$counter" \
+    PROBE_LOG="$log" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" build
+)
+[[ "$(cat "$cmake_c_probe")" == custom-c ]]
+[[ "$(cat "$cmake_cxx_probe")" == custom-cxx ]]
 
 # cargo clean remains user-visible: it operates on the normal workspace target
 # rather than an already-reclaimed scratch tree.
