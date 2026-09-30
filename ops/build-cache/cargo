@@ -150,6 +150,17 @@ if (( ! compile )); then
     exit "$rc"
 fi
 
+# Rust uses RUSTC_WRAPPER=sccache, but CMake-based build scripts otherwise
+# invoke cc/c++ directly and bypass the shared compiler cache. CMake 3.17+
+# initializes these variables from the environment on first configure. Keep
+# an explicit project/user launcher intact, and allow the site default to be
+# disabled by setting SENTINELX_CMAKE_COMPILER_LAUNCHER to an empty value.
+cmake_launcher="${SENTINELX_CMAKE_COMPILER_LAUNCHER-/usr/local/libexec/sccache-client}"
+if [[ -n "$cmake_launcher" && -x "$cmake_launcher" ]]; then
+    export CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-$cmake_launcher}"
+    export CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-$cmake_launcher}"
+fi
+
 mkdir -p "$TARGET_ROOT" "$TARGET_LOCK_ROOT"
 
 locate=("$REAL_CARGO" locate-project --workspace --message-format plain)
