@@ -110,6 +110,10 @@ if [[ " $* " == *" build "* ]]; then
     fi
     mkdir -p "$src" "$CARGO_TARGET_DIR/debug/deps"
     printf 'registry source\n' >"$src/srcfile"
+    if [[ "${FAKE_FAIL_BUILD:-0}" == 1 ]]; then
+        printf 'failed-intermediate\n' >"$CARGO_TARGET_DIR/debug/deps/failed-intermediate"
+        exit 23
+    fi
     printf '#!/bin/sh\necho final\n' >"$CARGO_TARGET_DIR/debug/fake-bin"
     chmod +x "$CARGO_TARGET_DIR/debug/fake-bin"
     printf 'library\n' >"$CARGO_TARGET_DIR/debug/libfake.rlib"
@@ -203,6 +207,25 @@ mapfile -t states <"$log"
     cd "$workspace"
     FAKE_WORKSPACE="$workspace" SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" "$WRAPPER" clean
 )
+[[ ! -e "$workspace/target" ]]
+
+# Failed builds must not strand intermediates on the NVMe scratch tier.
+set +e
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_FAIL_BUILD=1 \
+    PROBE_ROOT="$wrapper_root" \
+    PROBE_LOCK_ROOT="$wrapper_locks" \
+    PROBE_COUNTER="$counter" \
+    PROBE_LOG="$log" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" build
+)
+failed_rc=$?
+set -e
+[[ "$failed_rc" == 23 ]]
+[[ -z "$(find "$wrapper_root" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]]
 [[ ! -e "$workspace/target" ]]
 
 # Idle warm source is reclaimable on the next entrant.

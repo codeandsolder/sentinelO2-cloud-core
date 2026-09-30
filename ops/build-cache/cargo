@@ -250,11 +250,11 @@ cleanup() {
 
     flock -u 9 2>/dev/null || true
 
-    # Successful targets are scratch-only. The last Cargo using this workspace
+    # Targets are scratch-only even when Cargo fails. sccache retains useful
+    # compiler outputs, while leaving a failed multi-GiB target behind can pin
+    # scarce NVMe space indefinitely. The last Cargo using this workspace
     # upgrades to the external exclusive lock and reclaims all intermediates.
-    # If another same-workspace Cargo is still active, it will perform cleanup
-    # when it becomes the last successful user.
-    if (( rc == 0 )) && [[ "${SENTINELX_CARGO_TARGET_EPHEMERAL:-1}" == 1 ]]; then
+    if [[ "${SENTINELX_CARGO_TARGET_EPHEMERAL:-1}" == 1 ]]; then
         if flock -n -x 9; then
             rm -rf -- "$target" 2>/dev/null || true
             flock -u 9 2>/dev/null || true
