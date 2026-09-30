@@ -5,7 +5,7 @@ use sentinel0_proto::{
     is_binary_transfer_frame,
 };
 use serde_json::{Value, json};
-use std::{error::Error, fs, io, path::PathBuf};
+use std::{error::Error, io};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -14,11 +14,31 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 }
 
 fn fixture(name: &str) -> TestResult<Value> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/official-v1.13")
-        .join(name);
-    let contents = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&contents)?)
+    let contents = match name {
+        "hello_full.json" => include_str!("../../../fixtures/official-v1.13/hello_full.json"),
+        "hello_minimal.json" => include_str!("../../../fixtures/official-v1.13/hello_minimal.json"),
+        "welcome.json" => include_str!("../../../fixtures/official-v1.13/welcome.json"),
+        "response_ok.json" => include_str!("../../../fixtures/official-v1.13/response_ok.json"),
+        "response_error.json" => {
+            include_str!("../../../fixtures/official-v1.13/response_error.json")
+        }
+        "ping.json" => include_str!("../../../fixtures/official-v1.13/ping.json"),
+        "pong.json" => include_str!("../../../fixtures/official-v1.13/pong.json"),
+        "event.json" => include_str!("../../../fixtures/official-v1.13/event.json"),
+        "error.json" => include_str!("../../../fixtures/official-v1.13/error.json"),
+        "requests_all_ops.json" => {
+            include_str!("../../../fixtures/official-v1.13/requests_all_ops.json")
+        }
+        "constants.json" => include_str!("../../../fixtures/official-v1.13/constants.json"),
+        "binary_frame.json" => {
+            include_str!("../../../fixtures/official-v1.13/binary_frame.json")
+        }
+        "response_bounding.json" => {
+            include_str!("../../../fixtures/official-v1.13/response_bounding.json")
+        }
+        _ => return Err(invalid_data(format!("unknown fixture {name:?}")).into()),
+    };
+    Ok(serde_json::from_str(contents)?)
 }
 
 fn assert_semantic_roundtrip(name: &str) -> TestResult {
