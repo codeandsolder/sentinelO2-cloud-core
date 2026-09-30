@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.23.0 behavior at reviewed upstream commit
-  `9b7421bd791ed9ddf4b7f2118998f6fe93dacf80`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.23.1 behavior at reviewed upstream commit
+  `1edee15d9255c1a000e71536ee0d28433b760884`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -75,6 +75,12 @@ Reference surfaces:
   contention so a supervisor can retry. `--verify-enrollment` returns before
   lock acquisition, and absence of any writable state directory degrades with
   a warning rather than preventing the agent from starting.
+- Upstream 0.23.1 was reviewed and is Windows-only: the Python agent moved its
+  `msvcrt` locked byte 1 MiB past the PID text so a refused process can still
+  read the holder PID. SentinelO² currently has no Windows agent build and uses
+  POSIX `flock`, which does not hide the PID bytes, so there is no production
+  change to port. A future Windows lock implementation must preserve this
+  requirement and must not lock over the PID text at offset zero.
 - Linux host/OS/kernel/CPU/memory/uptime/load metadata used by hello/state.
 - Capabilities are derived from the dispatcher surface rather than maintained
   as a second drifting list. Full capabilities include upstream policy evidence
