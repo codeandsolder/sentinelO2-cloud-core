@@ -286,11 +286,11 @@ mod tests {
         assert!(should_rotate(&AuthToken::new(token(
             100 * 86_400,
             Some(-300 * 86_400)
-        ))));
+        )?)));
         assert!(!should_rotate(&AuthToken::new(token(
             300 * 86_400,
             Some(-60 * 86_400)
-        ))));
+        )?)));
 
         Ok(())
     }

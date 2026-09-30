@@ -152,7 +152,7 @@ mod tests {
         for token in ["", "one.two", "one..three", "one two.three.four", "ą.b.c"] {
             let (_dir, path) = write(&format!(
                 r#"{{"host_id":"h","token":"{token}","hub":"https://hub"}}"#
-            ));
+            ))?;
             assert!(load_identity(&path).is_err(), "{token:?}");
         }
 
