@@ -383,7 +383,7 @@ fn validator_argv(
 fn timed_out_validator_error(child: &mut std::process::Child, pid: Option<u32>) -> HandlerError {
     let mut cleanup_error = None;
     #[cfg(unix)]
-    if let Some(pid) = pid {
+    {
         let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
         if let Err(error) =
             nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)

@@ -752,10 +752,7 @@ async fn read_chunked_http_body(
             .read_exact(&mut crlf)
             .await
             .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-        if crlf
-            != *b"
-"
-        {
+        if crlf != *b"\r\n" {
             return Err(HandlerError::new(
                 "bad_response",
                 "chunk payload was not followed by CRLF",
