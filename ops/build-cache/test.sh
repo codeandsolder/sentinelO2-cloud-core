@@ -360,7 +360,8 @@ ready_workspace_probe="$tmp/ready-workspace-probe"
     "$WRAPPER" metadata --locked --manifest-path "$manifest_workspace/Cargo.toml"
 )
 [[ "$(cat "$offline_probe")" == "offline=true shared=1" ]]
-rg -F -- "--manifest-path $manifest_workspace/Cargo.toml" "$locate_args_probe" >/dev/null
+locate_args="$(cat "$locate_args_probe")"
+[[ "$locate_args" == *"--manifest-path $manifest_workspace/Cargo.toml"* ]]
 [[ "$(cat "$ready_workspace_probe")" == "$manifest_workspace" ]]
 
 # Explicit project launchers must win over the site default.
