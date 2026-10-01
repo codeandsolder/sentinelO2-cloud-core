@@ -126,7 +126,10 @@ if [[ " $* " == *" clean "* ]]; then
 fi
 if [[ " $* " == *" build "* ]]; then
     if [[ -n "${FAKE_OFFLINE_PROBE:-}" ]]; then
-        printf 'offline=%s shared=%s\n' "${CARGO_NET_OFFLINE:-}" "${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-}" >"$FAKE_OFFLINE_PROBE"
+        printf 'offline=%s shared=%s adaptive=%s\n' \
+            "${CARGO_NET_OFFLINE:-}" \
+            "${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-}" \
+            "${CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION:-}" >"$FAKE_OFFLINE_PROBE"
     fi
     src="$EPHEMERAL_CARGO_REGISTRY_SRC/index.crates.io-test/fake-1.0"
     if [[ -f "$src/srcfile" && -n "${FAKE_WARM_PROBE:-}" ]]; then
@@ -267,7 +270,7 @@ offline_probe="$tmp/offline-probe"
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked
 )
-[[ "$(cat "$offline_probe")" == "offline=true shared=1" ]]
+[[ "$(cat "$offline_probe")" == "offline=true shared= adaptive=1" ]]
 
 # Explicit site opt-out leaves a warm locked build on normal Cargo semantics.
 (
@@ -280,7 +283,7 @@ offline_probe="$tmp/offline-probe"
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked
 )
-[[ "$(cat "$offline_probe")" == "offline= shared=" ]]
+[[ "$(cat "$offline_probe")" == "offline= shared= adaptive=" ]]
 
 # Explicit --offline intent enables shared resolution without consulting cache readiness.
 (
@@ -293,7 +296,7 @@ offline_probe="$tmp/offline-probe"
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked --offline
 )
-[[ "$(cat "$offline_probe")" == "offline= shared=1" ]]
+[[ "$(cat "$offline_probe")" == "offline= shared= adaptive=1" ]]
 
 # Explicit project launchers must win over the site default.
 (
