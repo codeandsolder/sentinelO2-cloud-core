@@ -409,6 +409,7 @@ offline_home="$tmp/offline-home"
 offline_ws="$tmp/offline-workspace"
 mkdir -p "$offline_home/registry/cache/index.crates.io-test"
 mkdir -p "$offline_home/registry/index/index.crates.io-test/.cache/se/rd"
+mkdir -p "$offline_home/registry/src/index.crates.io-test/serde-1.0.228"
 mkdir -p "$offline_ws"
 cat >"$offline_home/registry/index/index.crates.io-test/config.json" <<'EOF'
 {}
@@ -424,12 +425,22 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
 EOF
 printf 'crate\n' >"$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
 printf 'index\n' >"$offline_home/registry/index/index.crates.io-test/.cache/se/rd/serde"
+printf '{"v":1}\n' >"$offline_home/registry/src/index.crates.io-test/serde-1.0.228/.cargo-ok"
 python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"
 
 # Missing archive is a conservative miss.
 rm "$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
 if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
     echo "offline readiness unexpectedly accepted a missing archive" >&2
+    exit 1
+fi
+
+# A present archive/index is still not adaptive-safe if the extracted source
+# tree has been pruned or has an invalid completion marker.
+printf 'crate\n' >"$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
+rm "$offline_home/registry/src/index.crates.io-test/serde-1.0.228/.cargo-ok"
+if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
+    echo "offline readiness unexpectedly accepted a missing source marker" >&2
     exit 1
 fi
 
