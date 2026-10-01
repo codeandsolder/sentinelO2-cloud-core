@@ -19,6 +19,20 @@ grep -F 'smoke_group="$(systemctl show -p Group --value "$LOCAL_SERVICE")"' "$HE
 grep -F 'chown "$smoke_user:$smoke_group" "$smoke"' "$HERE/sccache-release-update" >/dev/null
 grep -F '[[ -z "$smoke" ]] || rm -rf -- "$smoke"' "$HERE/sccache-release-update" >/dev/null
 
+# Rollback must restore the scheduler before the local daemon so a reverted
+# client does not enter reconnect backoff against a scheduler that is still down.
+awk '
+    /^rollback\(\) \{/ { in_rollback = 1; next }
+    in_rollback && /^}/ { exit }
+    in_rollback && /systemctl start "\$DIST_SERVICE"/ && !dist_start { dist_start = NR }
+    in_rollback && /nc -z -w1 "\$SCHEDULER_HOST" "\$SCHEDULER_PORT"/ && !scheduler_ready { scheduler_ready = NR }
+    in_rollback && /systemctl start "\$LOCAL_SERVICE"/ && !local_start { local_start = NR }
+    END {
+        if (!(dist_start && scheduler_ready && local_start &&
+              dist_start < scheduler_ready && scheduler_ready < local_start)) exit 1
+    }
+' "$HERE/sccache-release-update"
+
 tmp="$(mktemp -d)"
 
 cleanup() {
