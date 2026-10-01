@@ -8,7 +8,7 @@ WRAPPER="$HERE/cargo"
 
 # Keep all shipped shell helpers under the maintenance-scripts CI lane even
 # when a test below does not execute a root/systemd-only code path.
-bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$HERE/sccache-release-update"     "$HERE/install-sccache-autoupdate"
+bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$HERE/sccache-release-update"     "$HERE/sccache-dist-client-preflight"     "$HERE/install-sccache-autoupdate"
 
 tmp="$(mktemp -d)"
 
@@ -26,6 +26,28 @@ cleanup() {
     rm -rf -- "$tmp" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# A stale dist-client toolchain_tmp is disposable, but neighboring cached
+# toolchains and the weak map are durable and must remain untouched.
+dist_cache="$tmp/dist-client-cache"
+mkdir -p "$dist_cache/client/toolchain_tmp" "$dist_cache/client/tc"
+printf 'stale\n' >"$dist_cache/client/toolchain_tmp/stale"
+printf '{"keep":"yes"}\n' >"$dist_cache/client/weak_map.json"
+printf 'cached\n' >"$dist_cache/client/tc/keep"
+SCCACHE_DIST_CLIENT_CACHE_DIR="$dist_cache" bash "$HERE/sccache-dist-client-preflight"
+[[ ! -e "$dist_cache/client/toolchain_tmp" ]]
+[[ "$(cat "$dist_cache/client/weak_map.json")" == '{"keep":"yes"}' ]]
+[[ "$(cat "$dist_cache/client/tc/keep")" == cached ]]
+
+# Refuse a substituted path rather than following/removing a symlink.
+mkdir -p "$dist_cache/elsewhere"
+ln -s "$dist_cache/elsewhere" "$dist_cache/client/toolchain_tmp"
+if SCCACHE_DIST_CLIENT_CACHE_DIR="$dist_cache" bash "$HERE/sccache-dist-client-preflight" 2>/dev/null; then
+    echo "dist-client preflight unexpectedly accepted a symlink" >&2
+    exit 1
+fi
+[[ -d "$dist_cache/elsewhere" ]]
+rm "$dist_cache/client/toolchain_tmp"
 
 make_target() {
     local dir="$1"

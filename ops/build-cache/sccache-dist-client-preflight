@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CACHE_ROOT="${SCCACHE_DIST_CLIENT_CACHE_DIR:-/var/cache/sccache-dist-client}"
+tmp="$CACHE_ROOT/client/toolchain_tmp"
+
+# sccache's distributed client treats toolchain_tmp as disposable startup
+# scratch: ClientToolchains::new() removes and recreates it. A root-owned stale
+# directory therefore prevents an otherwise unprivileged sccache daemon from
+# initializing distributed compilation. Remove only this documented temporary
+# subtree before the service drops to its configured User=/Group=.
+if [[ ! -e "$tmp" ]]; then
+    exit 0
+fi
+
+if [[ -L "$tmp" || ! -d "$tmp" ]]; then
+    echo "sccache-dist-client-preflight: refusing unexpected path: $tmp" >&2
+    exit 1
+fi
+
+rm -rf -- "$tmp"
