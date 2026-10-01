@@ -116,6 +116,12 @@ fake_cargo="$tmp/fake-cargo"
 cat >"$fake_cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n "${FAKE_OFFLINE_PROBE:-}" ]]; then
+    printf 'offline=%s shared=%s adaptive=%s\n' \
+        "${CARGO_NET_OFFLINE:-}" \
+        "${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-}" \
+        "${CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION:-}" >"$FAKE_OFFLINE_PROBE"
+fi
 if [[ " $* " == *" locate-project "* ]]; then
     printf '%s\n' "$FAKE_WORKSPACE/Cargo.toml"
     exit 0
@@ -125,12 +131,6 @@ if [[ " $* " == *" clean "* ]]; then
     exit 0
 fi
 if [[ " $* " == *" build "* ]]; then
-    if [[ -n "${FAKE_OFFLINE_PROBE:-}" ]]; then
-        printf 'offline=%s shared=%s adaptive=%s\n' \
-            "${CARGO_NET_OFFLINE:-}" \
-            "${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-}" \
-            "${CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION:-}" >"$FAKE_OFFLINE_PROBE"
-    fi
     src="$EPHEMERAL_CARGO_REGISTRY_SRC/index.crates.io-test/fake-1.0"
     if [[ -f "$src/srcfile" && -n "${FAKE_WARM_PROBE:-}" ]]; then
         printf 'warm\n' >"$FAKE_WARM_PROBE"
@@ -272,6 +272,17 @@ offline_probe="$tmp/offline-probe"
 )
 [[ "$(cat "$offline_probe")" == "offline=true shared= adaptive=1" ]]
 
+# Warm metadata --locked is lock-sensitive too and must take the same adaptive
+# path even though it does not need a scratch target.
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_OFFLINE_PROBE="$offline_probe" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" metadata --locked
+)
+[[ "$(cat "$offline_probe")" == "offline=true shared= adaptive=1" ]]
+
 # Explicit site opt-out leaves a warm locked build on normal Cargo semantics.
 (
     cd "$workspace"
@@ -285,12 +296,27 @@ offline_probe="$tmp/offline-probe"
 )
 [[ "$(cat "$offline_probe")" == "offline= shared= adaptive=" ]]
 
-# Explicit --offline intent enables shared resolution without consulting cache readiness.
+# Explicit --offline with an incomplete cache stays on normal exclusive Cargo
+# so local archive/source repair remains available.
 (
     cd "$workspace"
     FAKE_WORKSPACE="$workspace" \
     FAKE_OFFLINE_PROBE="$offline_probe" \
     FAKE_OFFLINE_READY_RC=1 \
+    PROBE_ROOT="$wrapper_root" \
+    PROBE_LOCK_ROOT="$wrapper_locks" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" build --locked --offline
+)
+[[ "$(cat "$offline_probe")" == "offline= shared= adaptive=" ]]
+
+# Explicit --offline with a complete cache enables adaptive locking without
+# changing the caller's offline setting.
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_OFFLINE_PROBE="$offline_probe" \
+    FAKE_OFFLINE_READY_RC=0 \
     PROBE_ROOT="$wrapper_root" \
     PROBE_LOCK_ROOT="$wrapper_locks" \
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
