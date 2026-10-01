@@ -364,6 +364,26 @@ locate_args="$(cat "$locate_args_probe")"
 [[ "$locate_args" == *"--manifest-path $manifest_workspace/Cargo.toml"* ]]
 [[ "$(cat "$ready_workspace_probe")" == "$manifest_workspace" ]]
 
+# Cargo also accepts the short -m alias, with either a separate value or =.
+for manifest_args in "-m $manifest_workspace/Cargo.toml" "-m=$manifest_workspace/Cargo.toml"; do
+    # Word splitting is intentional here: the fixture exercises both CLI forms.
+    read -r -a manifest_argv <<<"$manifest_args"
+    (
+        cd "$workspace"
+        FAKE_WORKSPACE="$workspace" \
+        FAKE_LOCATE_WORKSPACE="$manifest_workspace" \
+        FAKE_LOCATE_ARGS_PROBE="$locate_args_probe" \
+        FAKE_OFFLINE_READY_WORKSPACE_PROBE="$ready_workspace_probe" \
+        FAKE_OFFLINE_PROBE="$offline_probe" \
+        SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+        "$WRAPPER" metadata --locked "${manifest_argv[@]}"
+    )
+    [[ "$(cat "$offline_probe")" == "offline=true shared=1" ]]
+    locate_args="$(cat "$locate_args_probe")"
+    [[ "$locate_args" == *"--manifest-path $manifest_workspace/Cargo.toml"* ]]
+    [[ "$(cat "$ready_workspace_probe")" == "$manifest_workspace" ]]
+done
+
 # Explicit project launchers must win over the site default.
 (
     cd "$workspace"

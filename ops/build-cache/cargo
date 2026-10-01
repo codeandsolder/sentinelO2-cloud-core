@@ -140,14 +140,14 @@ locate=("$REAL_CARGO" locate-project --workspace --message-format plain)
 for (( i = 0; i < ${#cargo_args[@]}; i++ )); do
     arg="${cargo_args[i]}"
     case "$arg" in
-        --manifest-path)
+        -m|--manifest-path)
             if (( i + 1 < ${#cargo_args[@]} )); then
                 locate+=(--manifest-path "${cargo_args[i + 1]}")
                 ((i += 1))
             fi
             ;;
-        --manifest-path=*)
-            locate+=(--manifest-path "${arg#--manifest-path=}")
+        -m=*|--manifest-path=*)
+            locate+=(--manifest-path "${arg#*=}")
             ;;
     esac
 done
