@@ -9,8 +9,14 @@ if (( EUID != 0 )); then
 fi
 
 install -o root -g root -m 0755 "$HERE/sccache-release-update" /usr/local/libexec/sccache-release-update
+install -o root -g root -m 0755 "$HERE/sccache-dist-client-preflight" /usr/local/libexec/sccache-dist-client-preflight
 install -o root -g root -m 0644 "$HERE/sccache-release-update.service" /etc/systemd/system/sccache-release-update.service
 install -o root -g root -m 0644 "$HERE/sccache-release-update.timer" /etc/systemd/system/sccache-release-update.timer
+mkdir -p /etc/systemd/system/sccache-local.service.d
+cat >/etc/systemd/system/sccache-local.service.d/40-dist-client-temp-preflight.conf <<'EOF'
+[Service]
+ExecStartPre=+/usr/local/libexec/sccache-dist-client-preflight
+EOF
 mkdir -p /var/lib/sccache-autoupdate /var/cache/sccache-autoupdate
 chown root:root /var/lib/sccache-autoupdate /var/cache/sccache-autoupdate
 chmod 0755 /var/lib/sccache-autoupdate /var/cache/sccache-autoupdate
