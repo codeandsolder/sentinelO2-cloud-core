@@ -264,8 +264,6 @@ offline_probe="$tmp/offline-probe"
     FAKE_OFFLINE_PROBE="$offline_probe" \
     PROBE_ROOT="$wrapper_root" \
     PROBE_LOCK_ROOT="$wrapper_locks" \
-    PROBE_COUNTER="$counter" \
-    PROBE_LOG="$log" \
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked
 )
@@ -279,8 +277,6 @@ offline_probe="$tmp/offline-probe"
     SENTINELX_CARGO_SHARED_OFFLINE_AUTO=0 \
     PROBE_ROOT="$wrapper_root" \
     PROBE_LOCK_ROOT="$wrapper_locks" \
-    PROBE_COUNTER="$counter" \
-    PROBE_LOG="$log" \
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked
 )
@@ -294,8 +290,6 @@ offline_probe="$tmp/offline-probe"
     FAKE_OFFLINE_READY_RC=1 \
     PROBE_ROOT="$wrapper_root" \
     PROBE_LOCK_ROOT="$wrapper_locks" \
-    PROBE_COUNTER="$counter" \
-    PROBE_LOG="$log" \
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked --offline
 )
@@ -461,4 +455,3 @@ fi
 
 
 printf 'ok: Cargo scratch target + detached pruning + artifact mirror + warm registry source\n'
-
