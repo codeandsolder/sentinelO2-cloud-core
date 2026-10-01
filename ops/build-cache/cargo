@@ -111,14 +111,77 @@ finish_source_pool() {
 }
 
 compile=0
+shared_offline_candidate=0
 for arg in "${cargo_args[@]}"; do
     case "$arg" in
         build|check|test|run|bench|rustc|rustdoc|doc|clippy|fix|install|package|publish)
             compile=1
+            shared_offline_candidate=1
+            break
+            ;;
+        metadata)
+            shared_offline_candidate=1
             break
             ;;
     esac
 done
+
+maybe_enable_shared_offline() {
+    [[ "${SENTINELX_CARGO_SHARED_OFFLINE_AUTO:-1}" != 0 ]] || return 0
+    # An explicitly forced shared mode is a caller/debugging choice; do not
+    # layer the site adaptive policy on top of it.
+    [[ -z "${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION+x}" ]] || return 0
+
+    local locked=0 offline=0 arg
+    for arg in "${cargo_args[@]}"; do
+        case "$arg" in
+            --locked)
+                locked=1
+                ;;
+            --offline)
+                offline=1
+                ;;
+            --frozen)
+                locked=1
+                offline=1
+                ;;
+        esac
+    done
+    (( locked )) || return 0
+
+    [[ -x "$OFFLINE_READY_HELPER" ]] || return 0
+
+    # Adaptive shared mode is only useful when all package/git state is already
+    # local. If explicit offline/frozen has an incomplete cache, keep ordinary
+    # exclusive Cargo semantics so it can repair/unpack from local archives.
+    if (( offline )) || [[ "${CARGO_NET_OFFLINE:-}" == true || "${CARGO_NET_OFFLINE:-}" == 1 ]]; then
+        if "$OFFLINE_READY_HELPER" "$workspace" "${CARGO_HOME:-$HOME/.cargo}"; then
+            export CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION="${CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION:-1}"
+        fi
+        return 0
+    fi
+
+    # Respect an explicit online choice. Otherwise, a fully warm locked graph
+    # can be made offline and use adaptive locking. First-time/incomplete-cache
+    # builds stay online and retain upstream exclusive behavior.
+    [[ -z "${CARGO_NET_OFFLINE+x}" ]] || return 0
+    if "$OFFLINE_READY_HELPER" "$workspace" "${CARGO_HOME:-$HOME/.cargo}"; then
+        export CARGO_NET_OFFLINE=true
+        export CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION="${CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION:-1}"
+    fi
+}
+
+workspace=""
+if (( shared_offline_candidate )); then
+    locate=("$REAL_CARGO" locate-project --workspace --message-format plain)
+    manifest="$("${locate[@]}" 2>/dev/null || true)"
+    if [[ -n "$manifest" ]]; then
+        workspace="$(dirname "$(readlink -f "$manifest")")"
+    else
+        workspace="$(pwd -P)"
+    fi
+    maybe_enable_shared_offline
+fi
 
 if (( ! compile )); then
     "$REAL_CARGO" "${cargo_args[@]}"
@@ -139,56 +202,6 @@ if [[ -n "$cmake_launcher" && -x "$cmake_launcher" ]]; then
 fi
 
 mkdir -p "$TARGET_ROOT" "$TARGET_LOCK_ROOT"
-
-locate=("$REAL_CARGO" locate-project --workspace --message-format plain)
-manifest="$("${locate[@]}" 2>/dev/null || true)"
-
-if [[ -n "$manifest" ]]; then
-    workspace="$(dirname "$(readlink -f "$manifest")")"
-else
-    workspace="$(pwd -P)"
-fi
-
-maybe_enable_shared_offline() {
-    [[ "${SENTINELX_CARGO_SHARED_OFFLINE_AUTO:-1}" != 0 ]] || return 0
-
-    local locked=0 offline=0 arg
-    for arg in "${cargo_args[@]}"; do
-        case "$arg" in
-            --locked)
-                locked=1
-                ;;
-            --offline)
-                offline=1
-                ;;
-            --frozen)
-                locked=1
-                offline=1
-                ;;
-        esac
-    done
-    (( locked )) || return 0
-
-    # Explicit offline/frozen intent can use Cargo's adaptive read-mostly lock
-    # mode. Cargo keeps DownloadExclusive when it is immediately available and
-    # only falls back to ResolveShared under actual contention.
-    if (( offline )) || [[ "${CARGO_NET_OFFLINE:-}" == true || "${CARGO_NET_OFFLINE:-}" == 1 ]]; then
-        export CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION="${CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION:-1}"
-        return 0
-    fi
-
-    # Respect an explicit online choice. Otherwise, only auto-offline a locked
-    # build when the readiness helper proves all registry/git state is local.
-    # First-time/incomplete-cache builds stay online.
-    [[ -z "${CARGO_NET_OFFLINE+x}" ]] || return 0
-    [[ -x "$OFFLINE_READY_HELPER" ]] || return 0
-    if "$OFFLINE_READY_HELPER" "$workspace" "${CARGO_HOME:-$HOME/.cargo}"; then
-        export CARGO_NET_OFFLINE=true
-        export CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION="${CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION:-1}"
-    fi
-}
-
-maybe_enable_shared_offline
 
 hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
 name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
