@@ -116,6 +116,12 @@ fake_cargo="$tmp/fake-cargo"
 cat >"$fake_cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n "${FAKE_OFFLINE_PROBE:-}" ]]; then
+    printf 'offline=%s shared=%s adaptive=%s\n' \
+        "${CARGO_NET_OFFLINE:-}" \
+        "${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-}" \
+        "${CARGO_ADAPTIVE_LOCKED_OFFLINE_RESOLUTION:-}" >"$FAKE_OFFLINE_PROBE"
+fi
 if [[ " $* " == *" locate-project "* ]]; then
     printf '%s\n' "$FAKE_WORKSPACE/Cargo.toml"
     exit 0
@@ -125,9 +131,6 @@ if [[ " $* " == *" clean "* ]]; then
     exit 0
 fi
 if [[ " $* " == *" build "* ]]; then
-    if [[ -n "${FAKE_OFFLINE_PROBE:-}" ]]; then
-        printf 'offline=%s shared=%s\n' "${CARGO_NET_OFFLINE:-}" "${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-}" >"$FAKE_OFFLINE_PROBE"
-    fi
     src="$EPHEMERAL_CARGO_REGISTRY_SRC/index.crates.io-test/fake-1.0"
     if [[ -f "$src/srcfile" && -n "${FAKE_WARM_PROBE:-}" ]]; then
         printf 'warm\n' >"$FAKE_WARM_PROBE"
@@ -267,7 +270,18 @@ offline_probe="$tmp/offline-probe"
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked
 )
-[[ "$(cat "$offline_probe")" == "offline=true shared=1" ]]
+[[ "$(cat "$offline_probe")" == "offline=true shared= adaptive=1" ]]
+
+# Warm metadata --locked is lock-sensitive too and must take the same adaptive
+# path even though it does not need a scratch target.
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_OFFLINE_PROBE="$offline_probe" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" metadata --locked
+)
+[[ "$(cat "$offline_probe")" == "offline=true shared= adaptive=1" ]]
 
 # Explicit site opt-out leaves a warm locked build on normal Cargo semantics.
 (
@@ -280,9 +294,10 @@ offline_probe="$tmp/offline-probe"
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked
 )
-[[ "$(cat "$offline_probe")" == "offline= shared=" ]]
+[[ "$(cat "$offline_probe")" == "offline= shared= adaptive=" ]]
 
-# Explicit --offline intent enables shared resolution without consulting cache readiness.
+# Explicit --offline with an incomplete cache stays on normal exclusive Cargo
+# so local archive/source repair remains available.
 (
     cd "$workspace"
     FAKE_WORKSPACE="$workspace" \
@@ -293,7 +308,21 @@ offline_probe="$tmp/offline-probe"
     SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
     "$WRAPPER" build --locked --offline
 )
-[[ "$(cat "$offline_probe")" == "offline= shared=1" ]]
+[[ "$(cat "$offline_probe")" == "offline= shared= adaptive=" ]]
+
+# Explicit --offline with a complete cache enables adaptive locking without
+# changing the caller's offline setting.
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_OFFLINE_PROBE="$offline_probe" \
+    FAKE_OFFLINE_READY_RC=0 \
+    PROBE_ROOT="$wrapper_root" \
+    PROBE_LOCK_ROOT="$wrapper_locks" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" build --locked --offline
+)
+[[ "$(cat "$offline_probe")" == "offline= shared= adaptive=1" ]]
 
 # Explicit project launchers must win over the site default.
 (
@@ -380,6 +409,7 @@ offline_home="$tmp/offline-home"
 offline_ws="$tmp/offline-workspace"
 mkdir -p "$offline_home/registry/cache/index.crates.io-test"
 mkdir -p "$offline_home/registry/index/index.crates.io-test/.cache/se/rd"
+mkdir -p "$offline_home/registry/src/index.crates.io-test/serde-1.0.228"
 mkdir -p "$offline_ws"
 cat >"$offline_home/registry/index/index.crates.io-test/config.json" <<'EOF'
 {}
@@ -395,12 +425,22 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
 EOF
 printf 'crate\n' >"$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
 printf 'index\n' >"$offline_home/registry/index/index.crates.io-test/.cache/se/rd/serde"
+printf '{"v":1}\n' >"$offline_home/registry/src/index.crates.io-test/serde-1.0.228/.cargo-ok"
 python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"
 
 # Missing archive is a conservative miss.
 rm "$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
 if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
     echo "offline readiness unexpectedly accepted a missing archive" >&2
+    exit 1
+fi
+
+# A present archive/index is still not adaptive-safe if the extracted source
+# tree has been pruned or has an invalid completion marker.
+printf 'crate\n' >"$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
+rm "$offline_home/registry/src/index.crates.io-test/serde-1.0.228/.cargo-ok"
+if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
+    echo "offline readiness unexpectedly accepted a missing source marker" >&2
     exit 1
 fi
 
