@@ -111,34 +111,30 @@ finish_source_pool() {
 }
 
 compile=0
+resolver_managed=0
 for arg in "${cargo_args[@]}"; do
     case "$arg" in
         build|check|test|run|bench|rustc|rustdoc|doc|clippy|fix|install|package|publish)
             compile=1
+            resolver_managed=1
             break
+            ;;
+        metadata)
+            # Metadata is read-only with --locked, and can otherwise reproduce
+            # the same package-cache resolver serialization as a build. Let it
+            # use the conservative offline/shared gate without putting it on
+            # the managed target/artifact path.
+            resolver_managed=1
             ;;
     esac
 done
 
-if (( ! compile )); then
+if (( ! resolver_managed )); then
     "$REAL_CARGO" "${cargo_args[@]}"
     rc=$?
     finish_source_pool
     exit "$rc"
 fi
-
-# Rust uses RUSTC_WRAPPER=sccache, but CMake-based build scripts otherwise
-# invoke cc/c++ directly and bypass the shared compiler cache. CMake 3.17+
-# initializes these variables from the environment on first configure. Keep
-# an explicit project/user launcher intact, and allow the site default to be
-# disabled by setting SENTINELX_CMAKE_COMPILER_LAUNCHER to an empty value.
-cmake_launcher="${SENTINELX_CMAKE_COMPILER_LAUNCHER-/usr/local/libexec/sccache-client}"
-if [[ -n "$cmake_launcher" && -x "$cmake_launcher" ]]; then
-    export CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-$cmake_launcher}"
-    export CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-$cmake_launcher}"
-fi
-
-mkdir -p "$TARGET_ROOT" "$TARGET_LOCK_ROOT"
 
 locate=("$REAL_CARGO" locate-project --workspace --message-format plain)
 manifest="$("${locate[@]}" 2>/dev/null || true)"
@@ -188,6 +184,26 @@ maybe_enable_shared_offline() {
 }
 
 maybe_enable_shared_offline
+
+if (( ! compile )); then
+    "$REAL_CARGO" "${cargo_args[@]}"
+    rc=$?
+    finish_source_pool
+    exit "$rc"
+fi
+
+# Rust uses RUSTC_WRAPPER=sccache, but CMake-based build scripts otherwise
+# invoke cc/c++ directly and bypass the shared compiler cache. CMake 3.17+
+# initializes these variables from the environment on first configure. Keep
+# an explicit project/user launcher intact, and allow the site default to be
+# disabled by setting SENTINELX_CMAKE_COMPILER_LAUNCHER to an empty value.
+cmake_launcher="${SENTINELX_CMAKE_COMPILER_LAUNCHER-/usr/local/libexec/sccache-client}"
+if [[ -n "$cmake_launcher" && -x "$cmake_launcher" ]]; then
+    export CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-$cmake_launcher}"
+    export CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-$cmake_launcher}"
+fi
+
+mkdir -p "$TARGET_ROOT" "$TARGET_LOCK_ROOT"
 
 hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
 name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
