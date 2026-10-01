@@ -111,36 +111,46 @@ finish_source_pool() {
 }
 
 compile=0
+resolver_managed=0
 for arg in "${cargo_args[@]}"; do
     case "$arg" in
         build|check|test|run|bench|rustc|rustdoc|doc|clippy|fix|install|package|publish)
             compile=1
+            resolver_managed=1
             break
+            ;;
+        metadata)
+            # Metadata is read-only with --locked, and can otherwise reproduce
+            # the same package-cache resolver serialization as a build. Let it
+            # use the conservative offline/shared gate without putting it on
+            # the managed target/artifact path.
+            resolver_managed=1
             ;;
     esac
 done
 
-if (( ! compile )); then
+if (( ! resolver_managed )); then
     "$REAL_CARGO" "${cargo_args[@]}"
     rc=$?
     finish_source_pool
     exit "$rc"
 fi
 
-# Rust uses RUSTC_WRAPPER=sccache, but CMake-based build scripts otherwise
-# invoke cc/c++ directly and bypass the shared compiler cache. CMake 3.17+
-# initializes these variables from the environment on first configure. Keep
-# an explicit project/user launcher intact, and allow the site default to be
-# disabled by setting SENTINELX_CMAKE_COMPILER_LAUNCHER to an empty value.
-cmake_launcher="${SENTINELX_CMAKE_COMPILER_LAUNCHER-/usr/local/libexec/sccache-client}"
-if [[ -n "$cmake_launcher" && -x "$cmake_launcher" ]]; then
-    export CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-$cmake_launcher}"
-    export CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-$cmake_launcher}"
-fi
-
-mkdir -p "$TARGET_ROOT" "$TARGET_LOCK_ROOT"
-
 locate=("$REAL_CARGO" locate-project --workspace --message-format plain)
+for (( i = 0; i < ${#cargo_args[@]}; i++ )); do
+    arg="${cargo_args[i]}"
+    case "$arg" in
+        --manifest-path)
+            if (( i + 1 < ${#cargo_args[@]} )); then
+                locate+=(--manifest-path "${cargo_args[i + 1]}")
+                ((i += 1))
+            fi
+            ;;
+        --manifest-path=*)
+            locate+=(--manifest-path "${arg#--manifest-path=}")
+            ;;
+    esac
+done
 manifest="$("${locate[@]}" 2>/dev/null || true)"
 
 if [[ -n "$manifest" ]]; then
@@ -170,15 +180,17 @@ maybe_enable_shared_offline() {
     (( locked )) || return 0
 
     # Explicit offline/frozen intent is always eligible. The Cargo fork still
-    # performs its own safety checks (existing resolve, no git sources, etc.).
+    # enforces its read-only shared-mode invariants and fails closed if required
+    # registry or git cache state is missing or mutable.
     if (( offline )) || [[ "${CARGO_NET_OFFLINE:-}" == true || "${CARGO_NET_OFFLINE:-}" == 1 ]]; then
         export CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION="${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-1}"
         return 0
     fi
 
     # Respect an explicit online choice. Otherwise, only auto-offline a locked
-    # build when the lockfile checker proves every crates.io index entry and
-    # archive is already local. First-time/incomplete-cache builds stay online.
+    # resolver-managed command when the lockfile checker proves all required
+    # registry/git state is already local. First-time/incomplete-cache commands
+    # stay online.
     [[ -z "${CARGO_NET_OFFLINE+x}" ]] || return 0
     [[ -x "$OFFLINE_READY_HELPER" ]] || return 0
     if "$OFFLINE_READY_HELPER" "$workspace" "${CARGO_HOME:-$HOME/.cargo}"; then
@@ -188,6 +200,26 @@ maybe_enable_shared_offline() {
 }
 
 maybe_enable_shared_offline
+
+if (( ! compile )); then
+    "$REAL_CARGO" "${cargo_args[@]}"
+    rc=$?
+    finish_source_pool
+    exit "$rc"
+fi
+
+# Rust uses RUSTC_WRAPPER=sccache, but CMake-based build scripts otherwise
+# invoke cc/c++ directly and bypass the shared compiler cache. CMake 3.17+
+# initializes these variables from the environment on first configure. Keep
+# an explicit project/user launcher intact, and allow the site default to be
+# disabled by setting SENTINELX_CMAKE_COMPILER_LAUNCHER to an empty value.
+cmake_launcher="${SENTINELX_CMAKE_COMPILER_LAUNCHER-/usr/local/libexec/sccache-client}"
+if [[ -n "$cmake_launcher" && -x "$cmake_launcher" ]]; then
+    export CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-$cmake_launcher}"
+    export CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-$cmake_launcher}"
+fi
+
+mkdir -p "$TARGET_ROOT" "$TARGET_LOCK_ROOT"
 
 hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
 name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
