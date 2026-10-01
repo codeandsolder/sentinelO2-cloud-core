@@ -34,7 +34,7 @@ mkdir -p "$dist_cache/client/toolchain_tmp" "$dist_cache/client/tc"
 printf 'stale\n' >"$dist_cache/client/toolchain_tmp/stale"
 printf '{"keep":"yes"}\n' >"$dist_cache/client/weak_map.json"
 printf 'cached\n' >"$dist_cache/client/tc/keep"
-SCCACHE_DIST_CLIENT_CACHE_DIR="$dist_cache" "$HERE/sccache-dist-client-preflight"
+SCCACHE_DIST_CLIENT_CACHE_DIR="$dist_cache" bash "$HERE/sccache-dist-client-preflight"
 [[ ! -e "$dist_cache/client/toolchain_tmp" ]]
 [[ "$(cat "$dist_cache/client/weak_map.json")" == '{"keep":"yes"}' ]]
 [[ "$(cat "$dist_cache/client/tc/keep")" == cached ]]
@@ -42,7 +42,7 @@ SCCACHE_DIST_CLIENT_CACHE_DIR="$dist_cache" "$HERE/sccache-dist-client-preflight
 # Refuse a substituted path rather than following/removing a symlink.
 mkdir -p "$dist_cache/elsewhere"
 ln -s "$dist_cache/elsewhere" "$dist_cache/client/toolchain_tmp"
-if SCCACHE_DIST_CLIENT_CACHE_DIR="$dist_cache" "$HERE/sccache-dist-client-preflight" 2>/dev/null; then
+if SCCACHE_DIST_CLIENT_CACHE_DIR="$dist_cache" bash "$HERE/sccache-dist-client-preflight" 2>/dev/null; then
     echo "dist-client preflight unexpectedly accepted a symlink" >&2
     exit 1
 fi
