@@ -125,6 +125,9 @@ if [[ " $* " == *" clean "* ]]; then
     exit 0
 fi
 if [[ " $* " == *" build "* ]]; then
+    if [[ -n "${FAKE_OFFLINE_PROBE:-}" ]]; then
+        printf 'offline=%s shared=%s\n' "${CARGO_NET_OFFLINE:-}" "${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-}" >"$FAKE_OFFLINE_PROBE"
+    fi
     src="$EPHEMERAL_CARGO_REGISTRY_SRC/index.crates.io-test/fake-1.0"
     if [[ -f "$src/srcfile" && -n "${FAKE_WARM_PROBE:-}" ]]; then
         printf 'warm\n' >"$FAKE_WARM_PROBE"
@@ -178,6 +181,13 @@ native_launcher="$tmp/fake-native-launcher"
 printf '#!/bin/sh\nexec "$@"\n' >"$native_launcher"
 chmod +x "$native_launcher"
 
+offline_ready="$tmp/fake-offline-ready"
+cat >"$offline_ready" <<'EOF'
+#!/bin/sh
+exit "${FAKE_OFFLINE_READY_RC:-0}"
+EOF
+chmod +x "$offline_ready"
+
 wrapper_conf="$tmp/wrapper.conf"
 cat >"$wrapper_conf" <<EOF
 SENTINELX_REAL_CARGO=$fake_cargo
@@ -195,6 +205,7 @@ SENTINELX_CARGO_ARTIFACT_MIRROR=1
 SENTINELX_CARGO_INFRA_LOCK=$tmp/infra.lock
 SENTINELX_CARGO_MAINTENANCE_MARKER=$tmp/maintenance
 SENTINELX_CMAKE_COMPILER_LAUNCHER=$native_launcher
+SENTINELX_CARGO_OFFLINE_READY_HELPER=$offline_ready
 EOF
 
 probe_started="$tmp/probe-started"
@@ -243,6 +254,46 @@ wait_for_file "$probe_done"
     "$WRAPPER" build
 )
 [[ "$(cat "$warm_probe")" == "warm" ]]
+
+offline_probe="$tmp/offline-probe"
+
+# A warm --locked build auto-selects the offline/shared resolver path.
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_OFFLINE_PROBE="$offline_probe" \
+    PROBE_ROOT="$wrapper_root" \
+    PROBE_LOCK_ROOT="$wrapper_locks" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" build --locked
+)
+[[ "$(cat "$offline_probe")" == "offline=true shared=1" ]]
+
+# Explicit site opt-out leaves a warm locked build on normal Cargo semantics.
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_OFFLINE_PROBE="$offline_probe" \
+    SENTINELX_CARGO_SHARED_OFFLINE_AUTO=0 \
+    PROBE_ROOT="$wrapper_root" \
+    PROBE_LOCK_ROOT="$wrapper_locks" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" build --locked
+)
+[[ "$(cat "$offline_probe")" == "offline= shared=" ]]
+
+# Explicit --offline intent enables shared resolution without consulting cache readiness.
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_OFFLINE_PROBE="$offline_probe" \
+    FAKE_OFFLINE_READY_RC=1 \
+    PROBE_ROOT="$wrapper_root" \
+    PROBE_LOCK_ROOT="$wrapper_locks" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" build --locked --offline
+)
+[[ "$(cat "$offline_probe")" == "offline= shared=1" ]]
 
 # Explicit project launchers must win over the site default.
 (
@@ -322,5 +373,85 @@ flock -u 10
 exec 10>&-
 SENTINELX_BUILD_SCRATCH_CONF="$source_cap_conf" "$SOURCE_PRUNER"
 [[ ! -e "$slot/src/oversized" ]]
+
+
+# Real offline-readiness helper: complete crates.io cache succeeds.
+offline_home="$tmp/offline-home"
+offline_ws="$tmp/offline-workspace"
+mkdir -p "$offline_home/registry/cache/index.crates.io-test"
+mkdir -p "$offline_home/registry/index/index.crates.io-test/.cache/se/rd"
+mkdir -p "$offline_ws"
+cat >"$offline_home/registry/index/index.crates.io-test/config.json" <<'EOF'
+{}
+EOF
+cat >"$offline_ws/Cargo.lock" <<'EOF'
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+EOF
+printf 'crate\n' >"$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
+printf 'index\n' >"$offline_home/registry/index/index.crates.io-test/.cache/se/rd/serde"
+python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"
+
+# Missing archive is a conservative miss.
+rm "$offline_home/registry/cache/index.crates.io-test/serde-1.0.228.crate"
+if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
+    echo "offline readiness unexpectedly accepted a missing archive" >&2
+    exit 1
+fi
+
+# A locked git dependency is ready only when Cargo has both the exact object
+# in its git DB and a completed checkout at that OID.
+git_src="$tmp/offline-git-src"
+git_db="$offline_home/git/db/example-ident"
+git_checkout_root="$offline_home/git/checkouts/example-ident"
+mkdir -p "$git_src" "$(dirname "$git_db")" "$git_checkout_root"
+git -C "$git_src" init -q
+git -C "$git_src" config user.name test
+git -C "$git_src" config user.email test@example.invalid
+printf 'cached git\n' >"$git_src/lib.rs"
+git -C "$git_src" add lib.rs
+git -C "$git_src" commit -qm initial
+git_oid="$(git -C "$git_src" rev-parse HEAD)"
+git clone -q --bare "$git_src" "$git_db"
+git_checkout="$git_checkout_root/${git_oid:0:7}"
+git clone -q "$git_db" "$git_checkout"
+git -C "$git_checkout" config remote.origin.url "file://$git_db"
+touch "$git_checkout/.cargo-ok"
+
+cat >"$offline_ws/Cargo.lock" <<EOF
+version = 4
+
+[[package]]
+name = "example"
+version = "1.0.0"
+source = "git+https://example.invalid/repo#$git_oid"
+EOF
+python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"
+
+rm "$git_checkout/.cargo-ok"
+if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
+    echo "offline readiness unexpectedly accepted a stale git checkout" >&2
+    exit 1
+fi
+
+# Alternate registries remain conservative misses.
+cat >"$offline_ws/Cargo.lock" <<'EOF'
+version = 4
+
+[[package]]
+name = "example"
+version = "1.0.0"
+source = "registry+https://example.invalid/index"
+EOF
+if python3 "$HERE/cargo-offline-ready" "$offline_ws" "$offline_home"; then
+    echo "offline readiness unexpectedly accepted an alternate registry" >&2
+    exit 1
+fi
+
 
 printf 'ok: Cargo scratch target + detached pruning + artifact mirror + warm registry source\n'

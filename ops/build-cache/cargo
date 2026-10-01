@@ -9,6 +9,7 @@ TARGET_ROOT="${SENTINELX_CARGO_TARGET_ROOT:-/var/cache/sentinelx/cargo-target}"
 TARGET_LOCK_ROOT="${SENTINELX_CARGO_TARGET_LOCK_ROOT:-$TARGET_ROOT/../cargo-target-locks}"
 PRUNER="${SENTINELX_CARGO_TARGET_PRUNER:-/usr/local/libexec/sentinelx-bin/cargo-target-prune}"
 SOURCE_PRUNER="${SENTINELX_CARGO_SOURCE_PRUNER:-/usr/local/libexec/sentinelx-bin/cargo-source-prune}"
+OFFLINE_READY_HELPER="${SENTINELX_CARGO_OFFLINE_READY_HELPER:-/usr/local/libexec/sentinelx-bin/cargo-offline-ready}"
 SOURCE_TMP_ROOT="${SENTINELX_CARGO_SOURCE_TMP_ROOT:-/var/cache/sentinelx/cargo-source-tmp}"
 INFRA_LOCK="${SENTINELX_CARGO_INFRA_LOCK:-/var/cache/sentinelx/.cargo-infra.lock}"
 MAINTENANCE_MARKER="${SENTINELX_CARGO_MAINTENANCE_MARKER:-/var/cache/sentinelx/.cargo-maintenance}"
@@ -147,6 +148,46 @@ if [[ -n "$manifest" ]]; then
 else
     workspace="$(pwd -P)"
 fi
+
+maybe_enable_shared_offline() {
+    [[ "${SENTINELX_CARGO_SHARED_OFFLINE_AUTO:-1}" != 0 ]] || return 0
+
+    local locked=0 offline=0 arg
+    for arg in "${cargo_args[@]}"; do
+        case "$arg" in
+            --locked)
+                locked=1
+                ;;
+            --offline)
+                offline=1
+                ;;
+            --frozen)
+                locked=1
+                offline=1
+                ;;
+        esac
+    done
+    (( locked )) || return 0
+
+    # Explicit offline/frozen intent is always eligible. The Cargo fork still
+    # performs its own safety checks (existing resolve, no git sources, etc.).
+    if (( offline )) || [[ "${CARGO_NET_OFFLINE:-}" == true || "${CARGO_NET_OFFLINE:-}" == 1 ]]; then
+        export CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION="${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-1}"
+        return 0
+    fi
+
+    # Respect an explicit online choice. Otherwise, only auto-offline a locked
+    # build when the lockfile checker proves every crates.io index entry and
+    # archive is already local. First-time/incomplete-cache builds stay online.
+    [[ -z "${CARGO_NET_OFFLINE+x}" ]] || return 0
+    [[ -x "$OFFLINE_READY_HELPER" ]] || return 0
+    if "$OFFLINE_READY_HELPER" "$workspace" "${CARGO_HOME:-$HOME/.cargo}"; then
+        export CARGO_NET_OFFLINE=true
+        export CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION="${CARGO_SHARED_LOCKED_OFFLINE_RESOLUTION:-1}"
+    fi
+}
+
+maybe_enable_shared_offline
 
 hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
 name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
