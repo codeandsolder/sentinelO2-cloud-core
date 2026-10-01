@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import tomllib
@@ -100,6 +102,14 @@ def main() -> int:
     cache_dirs = sorted((cargo_home / "registry" / "cache").glob("index.crates.io-*"))
     index_dirs = sorted((cargo_home / "registry" / "index").glob("index.crates.io-*"))
     usable_index_dirs = [d for d in index_dirs if (d / "config.json").is_file()]
+
+    source_root = Path(
+        os.environ.get(
+            "EPHEMERAL_CARGO_REGISTRY_SRC",
+            cargo_home / "registry" / "src",
+        )
+    )
+    source_dirs = sorted(source_root.glob("index.crates.io-*"))
     checked_git: dict[str, bool] = {}
 
     for pkg in data.get("package", []):
@@ -132,6 +142,20 @@ def main() -> int:
 
         rel = index_rel(name)
         if not any((d / ".cache" / rel).is_file() for d in usable_index_dirs):
+            return 1
+
+        package_dir = f"{name}-{version}"
+        source_ready = False
+        for d in source_dirs:
+            marker = d / package_dir / ".cargo-ok"
+            try:
+                metadata = json.loads(marker.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if metadata == {"v": 1}:
+                source_ready = True
+                break
+        if not source_ready:
             return 1
 
     return 0
