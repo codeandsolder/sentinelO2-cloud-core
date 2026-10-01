@@ -117,7 +117,10 @@ cat >"$fake_cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ " $* " == *" locate-project "* ]]; then
-    printf '%s\n' "$FAKE_WORKSPACE/Cargo.toml"
+    if [[ -n "${FAKE_LOCATE_ARGS_PROBE:-}" ]]; then
+        printf '%s\n' "$*" >"$FAKE_LOCATE_ARGS_PROBE"
+    fi
+    printf '%s\n' "${FAKE_LOCATE_WORKSPACE:-$FAKE_WORKSPACE}/Cargo.toml"
     exit 0
 fi
 if [[ " $* " == *" clean "* ]]; then
@@ -190,6 +193,9 @@ chmod +x "$native_launcher"
 offline_ready="$tmp/fake-offline-ready"
 cat >"$offline_ready" <<'EOF'
 #!/bin/sh
+if [ -n "${FAKE_OFFLINE_READY_WORKSPACE_PROBE:-}" ]; then
+    printf '%s\n' "$1" >"$FAKE_OFFLINE_READY_WORKSPACE_PROBE"
+fi
 exit "${FAKE_OFFLINE_READY_RC:-0}"
 EOF
 chmod +x "$offline_ready"
@@ -335,6 +341,27 @@ offline_probe="$tmp/offline-probe"
     "$WRAPPER" metadata
 )
 [[ "$(cat "$offline_probe")" == "offline= shared=" ]]
+
+# --manifest-path must drive workspace discovery/readiness rather than the
+# caller's cwd workspace.
+manifest_workspace="$tmp/manifest-workspace"
+mkdir -p "$manifest_workspace"
+: >"$manifest_workspace/Cargo.toml"
+locate_args_probe="$tmp/locate-args-probe"
+ready_workspace_probe="$tmp/ready-workspace-probe"
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_LOCATE_WORKSPACE="$manifest_workspace" \
+    FAKE_LOCATE_ARGS_PROBE="$locate_args_probe" \
+    FAKE_OFFLINE_READY_WORKSPACE_PROBE="$ready_workspace_probe" \
+    FAKE_OFFLINE_PROBE="$offline_probe" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" metadata --locked --manifest-path "$manifest_workspace/Cargo.toml"
+)
+[[ "$(cat "$offline_probe")" == "offline=true shared=1" ]]
+rg -F -- "--manifest-path $manifest_workspace/Cargo.toml" "$locate_args_probe" >/dev/null
+[[ "$(cat "$ready_workspace_probe")" == "$manifest_workspace" ]]
 
 # Explicit project launchers must win over the site default.
 (
