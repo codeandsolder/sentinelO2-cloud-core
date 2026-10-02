@@ -253,6 +253,7 @@ if active_clients; then
 fi
 
 backup_dir="$STATE_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ)-${live_sha:-none}"
+smoke=""
 mkdir -p "$backup_dir"
 [[ -e "$LIVE" ]] && cp -a "$LIVE" "$backup_dir/sccache"
 [[ -e "$DIST_LIVE" ]] && cp -a "$DIST_LIVE" "$backup_dir/sccache-dist"
@@ -273,6 +274,7 @@ rollback() {
     if (( dist_was_active )); then
         systemctl start "$DIST_SERVICE" >/dev/null 2>&1 || true
     fi
+    [[ -z "$smoke" ]] || rm -rf -- "$smoke"
     rm -f "$DRAIN"
     exit "$rc"
 }
@@ -343,6 +345,12 @@ systemctl is-active --quiet "$LOCAL_SERVICE"
 nc -z -w1 127.0.0.1 "$CLIENT_PORT"
 
 smoke="$(mktemp -d "$CACHE_DIR/smoke.XXXXXX")"
+smoke_user="$(systemctl show -p User --value "$LOCAL_SERVICE")"
+smoke_group="$(systemctl show -p Group --value "$LOCAL_SERVICE")"
+[[ -n "$smoke_user" ]] || smoke_user=root
+[[ -n "$smoke_group" ]] || smoke_group="$(id -gn "$smoke_user")"
+chown "$smoke_user:$smoke_group" "$smoke"
+chmod 0750 "$smoke"
 cat >"$smoke/smoke.rs" <<'RS'
 pub fn smoke(x: u64) -> u64 { x.rotate_left(7) ^ 0x5cca_c4e0 }
 RS
