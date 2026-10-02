@@ -10,6 +10,14 @@ WRAPPER="$HERE/cargo"
 # when a test below does not execute a root/systemd-only code path.
 bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$HERE/sccache-release-update"     "$HERE/sccache-dist-client-preflight"     "$HERE/install-sccache-autoupdate"
 
+# The updater runs as root while the shared compiler daemon runs as the service
+# user. Its post-swap smoke directory must therefore be handed to the daemon,
+# and rollback must remove it if the smoke compile fails.
+grep -F 'smoke_user="$(systemctl show -p User --value "$LOCAL_SERVICE")"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'smoke_group="$(systemctl show -p Group --value "$LOCAL_SERVICE")"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'chown "$smoke_user:$smoke_group" "$smoke"' "$HERE/sccache-release-update" >/dev/null
+grep -F '[[ -z "$smoke" ]] || rm -rf -- "$smoke"' "$HERE/sccache-release-update" >/dev/null
+
 tmp="$(mktemp -d)"
 
 cleanup() {
