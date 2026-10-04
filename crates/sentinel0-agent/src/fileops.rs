@@ -1153,20 +1153,22 @@ mod tests {
     fn expired_search_budget_returns_partial_contract() -> TestResult {
         let dir = tempdir().test_value()?;
         fs::write(dir.path().join("big.txt"), "x\n".repeat(200_000)).test_value()?;
-        let result = search_with_budget(
+        let result = search_until(
             &policy(dir.path()),
             &search_payload(dir.path(), "needle"),
+            Instant::now(),
             Duration::ZERO,
         )
         .test_value()?;
 
         assert_eq!(result["truncated"], true);
         assert_eq!(result["truncated_reason"], "time_budget");
+        assert_eq!(result["not_started"], true);
         assert!(
             result["note"]
                 .as_str()
                 .test_value()?
-                .contains("Narrow the path")
+                .contains("did not start")
         );
         Ok(())
     }
@@ -1194,16 +1196,22 @@ mod tests {
             "path".into(),
             Value::String(dir.path().display().to_string()),
         )]);
-        let result =
-            list_with_budget(&policy(dir.path()), &payload, Duration::ZERO).test_value()?;
+        let result = list_until(
+            &policy(dir.path()),
+            &payload,
+            Instant::now(),
+            Duration::ZERO,
+        )
+        .test_value()?;
 
         assert_eq!(result["truncated"], true);
         assert_eq!(result["truncated_reason"], "time_budget");
+        assert_eq!(result["not_started"], true);
         assert!(
             result["note"]
                 .as_str()
                 .test_value()?
-                .contains("Narrow the path")
+                .contains("did not start")
         );
         Ok(())
     }
