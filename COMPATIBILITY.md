@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.23.4 behavior at reviewed upstream commit
-  `0758f9464f42407bc96547badba1f45f94081555`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.23.5 behavior at reviewed upstream commit
+  `564345cee9a4a48db54b478d33c7f77e6d92e253`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream

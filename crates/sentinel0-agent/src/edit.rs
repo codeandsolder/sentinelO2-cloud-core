@@ -28,6 +28,20 @@ const MODES: &[&str] = &[
 const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(30);
 const VALIDATOR_CAPTURE_BYTES: usize = 256 * 1024;
 const PRESETS: &[&str] = &["nginx", "json", "python", "sh", "yaml", "systemd", "toml"];
+const SYSTEMD_UNIT_SUFFIXES: &[&str] = &[
+    "service",
+    "socket",
+    "device",
+    "mount",
+    "automount",
+    "swap",
+    "target",
+    "path",
+    "timer",
+    "slice",
+    "scope",
+];
+const SYSTEMD_UNSUPPORTED_MESSAGE: &str = "validator_preset=systemd verifies unit files (.service, .socket, .timer and the other unit types) with systemd-analyze, which cannot check a drop-in or other file on its own. Nothing was changed. Apply the edit without the validator, then run systemctl daemon-reload and check the unit with systemctl cat and systemctl show.";
 
 fn now_stamp() -> String {
     let now = SystemTime::now()
@@ -481,18 +495,55 @@ fn execute_validator(policy: &Policy, argv: &[String]) -> Result<(), HandlerErro
 
 fn run_validator(
     policy: &Policy,
-    path: &Path,
+    staged_path: &Path,
+    target_path: &Path,
     payload: &Map<String, Value>,
 ) -> Result<Option<Vec<String>>, HandlerError> {
     let preset = payload.get("validator_preset").and_then(Value::as_str);
-    if let Some(result) = internal_validator(preset, path)? {
+    if let Some(result) = internal_validator(preset, staged_path)? {
         return Ok(Some(result));
     }
+
+    let mut systemd_verify_dir = None;
+    let validate_path = if preset == Some("systemd") {
+        let suffix = target_path.extension().and_then(|value| value.to_str());
+        if suffix.is_none_or(|value| !SYSTEMD_UNIT_SUFFIXES.contains(&value)) {
+            return Err(HandlerError::new(
+                "validator_unsupported",
+                SYSTEMD_UNSUPPORTED_MESSAGE,
+            ));
+        }
+        let verify_dir = tempfile::Builder::new()
+            .prefix("sx-verify-")
+            .tempdir()
+            .map_err(|error| {
+                HandlerError::new(
+                    "validation_failed",
+                    format!("failed creating systemd verification directory: {error}"),
+                )
+            })?;
+        let filename = target_path.file_name().ok_or_else(|| {
+            HandlerError::new("validator_unsupported", SYSTEMD_UNSUPPORTED_MESSAGE)
+        })?;
+        let verify_path = verify_dir.path().join(filename);
+        fs::copy(staged_path, &verify_path).map_err(|error| {
+            HandlerError::new(
+                "validation_failed",
+                format!("failed staging systemd verification copy: {error}"),
+            )
+        })?;
+        systemd_verify_dir = Some(verify_dir);
+        verify_path
+    } else {
+        staged_path.to_owned()
+    };
+
     let custom = payload.get("validator").and_then(Value::as_str);
-    let Some(argv) = validator_argv(policy, path, preset, custom)? else {
+    let Some(argv) = validator_argv(policy, &validate_path, preset, custom)? else {
         return Ok(None);
     };
     execute_validator(policy, &argv)?;
+    drop(systemd_verify_dir);
     Ok(Some(argv))
 }
 
@@ -868,7 +919,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 
     let staged = stage_edit(policy, &target.path, &updated)?;
     let _staged_cleanup = RemoveFileOnDrop(staged.clone());
-    let validator = run_validator(policy, &staged, payload)?;
+    let validator = run_validator(policy, &staged, &target.path, payload)?;
     let diff = payload
         .get("diff")
         .and_then(Value::as_bool)
@@ -1052,6 +1103,83 @@ mod tests {
             "failed edit leaked staged files: {leftovers:?}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn systemd_drop_in_is_refused_before_the_target_changes() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let dropin_dir = dir.path().join("demo.service.d");
+        fs::create_dir(&dropin_dir).test_value()?;
+        let path = dropin_dir.join("20-demo.conf");
+        fs::write(&path, "[Service]\nTasksMax=128\n").test_value()?;
+
+        let error = edit(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(path.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                (
+                    "new_text".into(),
+                    Value::String("[Service]\nTasksMax=256\n".into()),
+                ),
+                ("validator_preset".into(), Value::String("systemd".into())),
+            ]),
+        )
+        .test_error()?;
+
+        assert_eq!(error.code, "validator_unsupported");
+        assert!(error.message.contains("daemon-reload"));
+        assert_eq!(
+            fs::read_to_string(&path).test_value()?,
+            "[Service]\nTasksMax=128\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn systemd_unit_is_verified_under_its_real_filename() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = policy(dir.path());
+        if !policy.tooling.command("systemd-analyze").exists() {
+            return Ok(());
+        }
+        let path = dir.path().join("sxtest.service");
+        fs::write(
+            &path,
+            "[Unit]\nDescription=old\n[Service]\nType=oneshot\nExecStart=/bin/true\n",
+        )
+        .test_value()?;
+
+        let result = edit(
+            &policy,
+            &Map::from_iter([
+                ("path".into(), Value::String(path.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                (
+                    "new_text".into(),
+                    Value::String(
+                        "[Unit]\nDescription=new\n[Service]\nType=oneshot\nExecStart=/bin/true\n"
+                            .into(),
+                    ),
+                ),
+                ("validator_preset".into(), Value::String("systemd".into())),
+                ("dry_run".into(), Value::Bool(true)),
+            ]),
+        )
+        .test_value()?;
+
+        let validator = result["validator"].as_array().test_value()?;
+        assert!(
+            validator
+                .last()
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.ends_with("/sxtest.service"))
+        );
+        assert_eq!(
+            fs::read_to_string(&path).test_value()?,
+            "[Unit]\nDescription=old\n[Service]\nType=oneshot\nExecStart=/bin/true\n"
+        );
         Ok(())
     }
 }

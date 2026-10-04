@@ -73,8 +73,23 @@ fn checked_entry_exists(
     code: &'static str,
     context: &str,
 ) -> Result<bool, HandlerError> {
-    entry_exists(path)
-        .map_err(|error| HandlerError::new(code, format!("{context} {}: {error}", path.display())))
+    entry_exists(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            HandlerError::with_details(
+                "permission_denied",
+                format!(
+                    "permission denied: {}: the agent's OS user cannot access this path even though policy allows it; check the path and parent-directory permissions",
+                    path.display()
+                ),
+                Map::from_iter([(
+                    "path".into(),
+                    Value::String(path.display().to_string()),
+                )]),
+            )
+        } else {
+            HandlerError::new(code, format!("{context} {}: {error}", path.display()))
+        }
+    })
 }
 
 fn backup_file(path: &Path) -> Result<PathBuf, HandlerError> {
@@ -650,7 +665,7 @@ pub fn chmod(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         )
     })?;
     let target = resolve_rw(policy, raw, "path")?;
-    if !target.exists() {
+    if !checked_entry_exists(&target, "chmod_failed", "cannot inspect target")? {
         return Err(HandlerError::new(
             "not_found",
             format!("path does not exist: {raw:?}"),
@@ -687,7 +702,7 @@ pub fn chown(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         ));
     }
     let target = resolve_rw(policy, raw, "path")?;
-    if !target.exists() {
+    if !checked_entry_exists(&target, "chown_failed", "cannot inspect target")? {
         return Err(HandlerError::new(
             "not_found",
             format!("path does not exist: {raw:?}"),
