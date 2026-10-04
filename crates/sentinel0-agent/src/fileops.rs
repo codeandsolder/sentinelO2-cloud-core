@@ -502,6 +502,58 @@ pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     )
 }
 
+fn list_not_started(root: &Path) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("path".into(), Value::String(root.display().to_string())),
+        ("entries".into(), Value::Array(Vec::new())),
+        ("total".into(), Value::from(0_u64)),
+        ("truncated".into(), Value::Bool(true)),
+        (
+            "truncated_reason".into(),
+            Value::String("time_budget".into()),
+        ),
+        ("not_started".into(), Value::Bool(true)),
+        ("note".into(), Value::String(NOT_STARTED_NOTE.into())),
+    ])
+}
+
+fn finish_list_result(
+    root: &Path,
+    entries: Vec<Value>,
+    truncated: bool,
+    timed_out: bool,
+    budget: Duration,
+) -> BTreeMap<String, Value> {
+    let total = entries.len();
+    let mut result = BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("path".into(), Value::String(root.display().to_string())),
+        ("entries".into(), Value::Array(entries)),
+        ("total".into(), Value::from(total as u64)),
+        ("truncated".into(), Value::Bool(truncated || timed_out)),
+    ]);
+    if timed_out {
+        result.insert(
+            "truncated_reason".into(),
+            Value::String("time_budget".into()),
+        );
+        result.insert(
+            "note".into(),
+            Value::String(format!(
+                "Stopped after {:.0} s; these are the entries found so far. Narrow the path, depth or glob for the rest.",
+                budget.as_secs_f64()
+            )),
+        );
+    } else if truncated {
+        result.insert(
+            "truncated_reason".into(),
+            Value::String("max_entries".into()),
+        );
+    }
+    result
+}
+
 pub(crate) fn list_until(
     policy: &Policy,
     payload: &Map<String, Value>,
@@ -546,19 +598,7 @@ pub(crate) fn list_until(
     let mut truncated = false;
     let mut timed_out = false;
     if Instant::now() > deadline {
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("path".into(), Value::String(root.display().to_string())),
-            ("entries".into(), Value::Array(Vec::new())),
-            ("total".into(), Value::from(0_u64)),
-            ("truncated".into(), Value::Bool(true)),
-            (
-                "truncated_reason".into(),
-                Value::String("time_budget".into()),
-            ),
-            ("not_started".into(), Value::Bool(true)),
-            ("note".into(), Value::String(NOT_STARTED_NOTE.into())),
-        ]));
+        return Ok(list_not_started(&root));
     }
     for entry in WalkDir::new(&root)
         .min_depth(1)
@@ -598,33 +638,9 @@ pub(crate) fn list_until(
         }
     }
 
-    let total = entries.len();
-    let mut result = BTreeMap::from([
-        ("ok".into(), Value::Bool(true)),
-        ("path".into(), Value::String(root.display().to_string())),
-        ("entries".into(), Value::Array(entries)),
-        ("total".into(), Value::from(total as u64)),
-        ("truncated".into(), Value::Bool(truncated || timed_out)),
-    ]);
-    if timed_out {
-        result.insert(
-            "truncated_reason".into(),
-            Value::String("time_budget".into()),
-        );
-        result.insert(
-            "note".into(),
-            Value::String(format!(
-                "Stopped after {:.0} s; these are the entries found so far. Narrow the path, depth or glob for the rest.",
-                budget.as_secs_f64()
-            )),
-        );
-    } else if truncated {
-        result.insert(
-            "truncated_reason".into(),
-            Value::String("max_entries".into()),
-        );
-    }
-    Ok(result)
+    Ok(finish_list_result(
+        &root, entries, truncated, timed_out, budget,
+    ))
 }
 
 fn skip_search_file(path: &Path) -> bool {
@@ -899,6 +915,25 @@ pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     )
 }
 
+fn search_not_started(root: &Path, needle: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("path".into(), Value::String(root.display().to_string())),
+        ("pattern".into(), Value::String(needle.into())),
+        ("matches".into(), Value::Array(Vec::new())),
+        ("files_searched".into(), Value::from(0_u64)),
+        ("search_error_count".into(), Value::from(0_u64)),
+        ("search_errors".into(), Value::Array(Vec::new())),
+        ("truncated".into(), Value::Bool(true)),
+        (
+            "truncated_reason".into(),
+            Value::String("time_budget".into()),
+        ),
+        ("not_started".into(), Value::Bool(true)),
+        ("note".into(), Value::String(NOT_STARTED_NOTE.into())),
+    ])
+}
+
 pub(crate) fn search_until(
     policy: &Policy,
     payload: &Map<String, Value>,
@@ -934,22 +969,7 @@ pub(crate) fn search_until(
         timed_out: false,
     };
     if Instant::now() > deadline {
-        return Ok(BTreeMap::from([
-            ("ok".into(), Value::Bool(true)),
-            ("path".into(), Value::String(root.display().to_string())),
-            ("pattern".into(), Value::String(needle.into())),
-            ("matches".into(), Value::Array(Vec::new())),
-            ("files_searched".into(), Value::from(0_u64)),
-            ("search_error_count".into(), Value::from(0_u64)),
-            ("search_errors".into(), Value::Array(Vec::new())),
-            ("truncated".into(), Value::Bool(true)),
-            (
-                "truncated_reason".into(),
-                Value::String("time_budget".into()),
-            ),
-            ("not_started".into(), Value::Bool(true)),
-            ("note".into(), Value::String(NOT_STARTED_NOTE.into())),
-        ]));
+        return Ok(search_not_started(&root, needle));
     }
     let mut walker = WalkBuilder::new(&root);
     walker
