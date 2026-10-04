@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.23.2 behavior at reviewed upstream commit
-  `3c84e50ad4f2a40f5f7e683d33841dbc36b75fd7`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.23.3 behavior at reviewed upstream commit
+  `ebd55c12dce183187d1a46805ceb6f1f7801a9e0`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -54,6 +54,12 @@ Reference surfaces:
   result mapping.
 - Completion is persisted before delivery, replayed after reconnect and removed
   only after successful send.
+- Upstream 0.23.3 late-completion ordering is matched without copying the Python
+  replay lock/in-flight set: persisted background completions are transmitted only
+  by the active session. Persistence wakes that session even when its opening replay
+  already ran, and heartbeat replay provides a second drain path. Worker tasks never
+  directly send a persisted completion, so the duplicate-send race is absent by
+  construction.
 - Pending result store uses atomic replacement, a 24 h TTL, 500-file cap, safe
   job IDs, corrupt-file cleanup and duplicate replacement.
 - Handler panics are converted to structured `internal_error` responses rather
