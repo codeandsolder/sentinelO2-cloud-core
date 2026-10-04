@@ -600,7 +600,7 @@ fn atomic_replace(
     target: &Path,
     content: &str,
     original_meta: Option<&fs::Metadata>,
-) -> Result<(), HandlerError> {
+) -> Result<bool, HandlerError> {
     let parent = target
         .parent()
         .ok_or_else(|| HandlerError::new("write_failed", "target has no parent directory"))?;
@@ -650,24 +650,70 @@ fn atomic_replace(
             )
         })?;
         if candidate_meta.uid() != meta.uid() || candidate_meta.gid() != meta.gid() {
-            nix::unistd::chown(
+            match nix::unistd::chown(
                 &temp,
                 Some(nix::unistd::Uid::from_raw(meta.uid())),
                 Some(nix::unistd::Gid::from_raw(meta.gid())),
-            )
-            .map_err(|e| {
-                HandlerError::new(
-                    "write_failed",
-                    format!("failed preserving owner/group: {e}"),
-                )
-            })?;
+            ) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::EPERM | nix::errno::Errno::EACCES)
+                    if target.exists() && !target.is_symlink() =>
+                {
+                    // Replacing the inode here would hand the file to the agent.
+                    // The backup already exists, so preserve the original inode
+                    // (and therefore owner/group/mode/ACLs) and write through it.
+                    let mut destination = OpenOptions::new()
+                        .write(true)
+                        .open(target)
+                        .map_err(|error| {
+                            HandlerError::new(
+                                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                                    "not_writable"
+                                } else {
+                                    "write_failed"
+                                },
+                                format!(
+                                    "cannot write target in place while preserving ownership: {error}"
+                                ),
+                            )
+                        })?;
+                    destination.write_all(content.as_bytes()).map_err(|error| {
+                        HandlerError::new(
+                            "write_failed",
+                            format!("failed writing target in place: {error}"),
+                        )
+                    })?;
+                    destination
+                        .set_len(u64::try_from(content.len()).unwrap_or(u64::MAX))
+                        .map_err(|error| {
+                            HandlerError::new(
+                                "write_failed",
+                                format!("failed truncating in-place edit: {error}"),
+                            )
+                        })?;
+                    destination.sync_all().map_err(|error| {
+                        HandlerError::new(
+                            "write_failed",
+                            format!("failed syncing in-place edit: {error}"),
+                        )
+                    })?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    return Err(HandlerError::new(
+                        "write_failed",
+                        format!("failed preserving owner/group: {error}"),
+                    ));
+                }
+            }
         }
     }
     file.sync_all()
         .map_err(|e| HandlerError::new("write_failed", format!("failed syncing temp file: {e}")))?;
     drop(file);
     fs::rename(&temp, target)
-        .map_err(|e| HandlerError::new("write_failed", format!("atomic replace failed: {e}")))
+        .map_err(|e| HandlerError::new("write_failed", format!("atomic replace failed: {e}")))?;
+    Ok(false)
 }
 
 fn sudo_replace(
@@ -813,13 +859,13 @@ fn apply_edit(
     staged: &Path,
     updated: &str,
     payload: &Map<String, Value>,
-) -> Result<Option<PathBuf>, HandlerError> {
+) -> Result<(Option<PathBuf>, bool), HandlerError> {
     if payload
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return Ok(None);
+        return Ok((None, false));
     }
     let backup = if target.existed {
         let backup = backup_path(
@@ -841,12 +887,13 @@ fn apply_edit(
         .get("sudo")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if sudo {
+    let in_place = if sudo {
         sudo_replace(policy, &target.path, staged, target.metadata.as_ref())?;
+        false
     } else {
-        atomic_replace(&target.path, updated, target.metadata.as_ref())?;
-    }
-    Ok(backup)
+        atomic_replace(&target.path, updated, target.metadata.as_ref())?
+    };
+    Ok((backup, in_place))
 }
 
 struct EditOutcome<'a> {
@@ -858,6 +905,7 @@ struct EditOutcome<'a> {
     diff: Option<String>,
     validator: Option<Vec<String>>,
     sudo: bool,
+    in_place: bool,
     duration: f64,
 }
 
@@ -880,6 +928,15 @@ fn edit_result(outcome: EditOutcome<'_>) -> BTreeMap<String, Value> {
     ]);
     if outcome.dry_run {
         result.insert("dry_run".into(), Value::Bool(true));
+    }
+    if outcome.in_place {
+        result.insert("in_place".into(), Value::Bool(true));
+        result.insert(
+            "metadata".into(),
+            Value::String(
+                "written in place to keep the file's owner, group and permissions".into(),
+            ),
+        );
     }
     if let Some(path) = outcome.backup {
         result.insert("backup".into(), Value::String(path.display().to_string()));
@@ -929,7 +986,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let backup = apply_edit(policy, &target, &staged, &updated, payload)?;
+    let (backup, in_place) = apply_edit(policy, &target, &staged, &updated, payload)?;
     let sudo = payload
         .get("sudo")
         .and_then(Value::as_bool)
@@ -944,6 +1001,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         diff,
         validator,
         sudo,
+        in_place,
         duration,
     }))
 }
