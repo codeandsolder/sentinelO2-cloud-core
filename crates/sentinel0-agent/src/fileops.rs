@@ -21,7 +21,8 @@ use walkdir::WalkDir;
 const PROBE: usize = 8192;
 const PREVIEW_CHARS: usize = 200;
 const MAX_SEARCH_ERRORS: usize = 32;
-const FILEOPS_TIME_BUDGET: Duration = Duration::from_secs(50);
+pub(crate) const FILEOPS_TIME_BUDGET: Duration = Duration::from_secs(50);
+const NOT_STARTED_NOTE: &str = "Other scans kept every scan worker busy until the time budget ran out, so this one did not start. Retry it, or narrow the path or glob.";
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "__pycache__",
@@ -493,12 +494,18 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 /// # Errors
 /// Returns an error when the directory request is invalid, disallowed, or cannot be read.
 pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    list_with_budget(policy, payload, FILEOPS_TIME_BUDGET)
+    list_until(
+        policy,
+        payload,
+        Instant::now() + FILEOPS_TIME_BUDGET,
+        FILEOPS_TIME_BUDGET,
+    )
 }
 
-fn list_with_budget(
+pub(crate) fn list_until(
     policy: &Policy,
     payload: &Map<String, Value>,
+    deadline: Instant,
     budget: Duration,
 ) -> HandlerResult {
     let raw = require_str(payload, "path")?;
@@ -538,7 +545,21 @@ fn list_with_budget(
     let mut entries = Vec::new();
     let mut truncated = false;
     let mut timed_out = false;
-    let deadline = Instant::now() + budget;
+    if Instant::now() > deadline {
+        return Ok(BTreeMap::from([
+            ("ok".into(), Value::Bool(true)),
+            ("path".into(), Value::String(root.display().to_string())),
+            ("entries".into(), Value::Array(Vec::new())),
+            ("total".into(), Value::from(0_u64)),
+            ("truncated".into(), Value::Bool(true)),
+            (
+                "truncated_reason".into(),
+                Value::String("time_budget".into()),
+            ),
+            ("not_started".into(), Value::Bool(true)),
+            ("note".into(), Value::String(NOT_STARTED_NOTE.into())),
+        ]));
+    }
     for entry in WalkDir::new(&root)
         .min_depth(1)
         .max_depth(depth)
@@ -870,12 +891,18 @@ fn finish_search_result(
 /// # Errors
 /// Returns an error when the search request is invalid, disallowed, or cannot be executed.
 pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    search_with_budget(policy, payload, FILEOPS_TIME_BUDGET)
+    search_until(
+        policy,
+        payload,
+        Instant::now() + FILEOPS_TIME_BUDGET,
+        FILEOPS_TIME_BUDGET,
+    )
 }
 
-fn search_with_budget(
+pub(crate) fn search_until(
     policy: &Policy,
     payload: &Map<String, Value>,
+    deadline: Instant,
     budget: Duration,
 ) -> HandlerResult {
     let raw = require_str(payload, "path")?;
@@ -906,7 +933,24 @@ fn search_with_budget(
         cap,
         timed_out: false,
     };
-    let deadline = Instant::now() + budget;
+    if Instant::now() > deadline {
+        return Ok(BTreeMap::from([
+            ("ok".into(), Value::Bool(true)),
+            ("path".into(), Value::String(root.display().to_string())),
+            ("pattern".into(), Value::String(needle.into())),
+            ("matches".into(), Value::Array(Vec::new())),
+            ("files_searched".into(), Value::from(0_u64)),
+            ("search_error_count".into(), Value::from(0_u64)),
+            ("search_errors".into(), Value::Array(Vec::new())),
+            ("truncated".into(), Value::Bool(true)),
+            (
+                "truncated_reason".into(),
+                Value::String("time_budget".into()),
+            ),
+            ("not_started".into(), Value::Bool(true)),
+            ("note".into(), Value::String(NOT_STARTED_NOTE.into())),
+        ]));
+    }
     let mut walker = WalkBuilder::new(&root);
     walker
         .hidden(false)
