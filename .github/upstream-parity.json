@@ -2,8 +2,8 @@
   "core": {
     "repo": "pensados/sentinelx-cloud-core",
     "branch": "main",
-    "reviewed_sha": "ebd55c12dce183187d1a46805ceb6f1f7801a9e0",
-    "reviewed_version": "0.23.3"
+    "reviewed_sha": "9a42a250b45b14c62b7d536897382354f6ccccf9",
+    "reviewed_version": "0.23.7"
   },
   "protocol": {
     "repo": "pensados/sentinelx-cloud-protocol",

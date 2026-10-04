@@ -21,7 +21,8 @@ use walkdir::WalkDir;
 const PROBE: usize = 8192;
 const PREVIEW_CHARS: usize = 200;
 const MAX_SEARCH_ERRORS: usize = 32;
-const FILEOPS_TIME_BUDGET: Duration = Duration::from_secs(50);
+pub(crate) const FILEOPS_TIME_BUDGET: Duration = Duration::from_secs(50);
+const NOT_STARTED_NOTE: &str = "Other scans kept every scan worker busy until the time budget ran out, so this one did not start. Retry it, or narrow the path or glob.";
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "__pycache__",
@@ -493,12 +494,70 @@ pub fn read(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 /// # Errors
 /// Returns an error when the directory request is invalid, disallowed, or cannot be read.
 pub fn list(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    list_with_budget(policy, payload, FILEOPS_TIME_BUDGET)
+    list_until(
+        policy,
+        payload,
+        Instant::now() + FILEOPS_TIME_BUDGET,
+        FILEOPS_TIME_BUDGET,
+    )
 }
 
-fn list_with_budget(
+fn list_not_started(root: &Path) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("path".into(), Value::String(root.display().to_string())),
+        ("entries".into(), Value::Array(Vec::new())),
+        ("total".into(), Value::from(0_u64)),
+        ("truncated".into(), Value::Bool(true)),
+        (
+            "truncated_reason".into(),
+            Value::String("time_budget".into()),
+        ),
+        ("not_started".into(), Value::Bool(true)),
+        ("note".into(), Value::String(NOT_STARTED_NOTE.into())),
+    ])
+}
+
+fn finish_list_result(
+    root: &Path,
+    entries: Vec<Value>,
+    truncated: bool,
+    timed_out: bool,
+    budget: Duration,
+) -> BTreeMap<String, Value> {
+    let total = entries.len();
+    let mut result = BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("path".into(), Value::String(root.display().to_string())),
+        ("entries".into(), Value::Array(entries)),
+        ("total".into(), Value::from(total as u64)),
+        ("truncated".into(), Value::Bool(truncated || timed_out)),
+    ]);
+    if timed_out {
+        result.insert(
+            "truncated_reason".into(),
+            Value::String("time_budget".into()),
+        );
+        result.insert(
+            "note".into(),
+            Value::String(format!(
+                "Stopped after {:.0} s; these are the entries found so far. Narrow the path, depth or glob for the rest.",
+                budget.as_secs_f64()
+            )),
+        );
+    } else if truncated {
+        result.insert(
+            "truncated_reason".into(),
+            Value::String("max_entries".into()),
+        );
+    }
+    result
+}
+
+pub(crate) fn list_until(
     policy: &Policy,
     payload: &Map<String, Value>,
+    deadline: Instant,
     budget: Duration,
 ) -> HandlerResult {
     let raw = require_str(payload, "path")?;
@@ -538,7 +597,9 @@ fn list_with_budget(
     let mut entries = Vec::new();
     let mut truncated = false;
     let mut timed_out = false;
-    let deadline = Instant::now() + budget;
+    if Instant::now() > deadline {
+        return Ok(list_not_started(&root));
+    }
     for entry in WalkDir::new(&root)
         .min_depth(1)
         .max_depth(depth)
@@ -577,33 +638,9 @@ fn list_with_budget(
         }
     }
 
-    let total = entries.len();
-    let mut result = BTreeMap::from([
-        ("ok".into(), Value::Bool(true)),
-        ("path".into(), Value::String(root.display().to_string())),
-        ("entries".into(), Value::Array(entries)),
-        ("total".into(), Value::from(total as u64)),
-        ("truncated".into(), Value::Bool(truncated || timed_out)),
-    ]);
-    if timed_out {
-        result.insert(
-            "truncated_reason".into(),
-            Value::String("time_budget".into()),
-        );
-        result.insert(
-            "note".into(),
-            Value::String(format!(
-                "Stopped after {:.0} s; these are the entries found so far. Narrow the path, depth or glob for the rest.",
-                budget.as_secs_f64()
-            )),
-        );
-    } else if truncated {
-        result.insert(
-            "truncated_reason".into(),
-            Value::String("max_entries".into()),
-        );
-    }
-    Ok(result)
+    Ok(finish_list_result(
+        &root, entries, truncated, timed_out, budget,
+    ))
 }
 
 fn skip_search_file(path: &Path) -> bool {
@@ -870,12 +907,37 @@ fn finish_search_result(
 /// # Errors
 /// Returns an error when the search request is invalid, disallowed, or cannot be executed.
 pub fn search(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    search_with_budget(policy, payload, FILEOPS_TIME_BUDGET)
+    search_until(
+        policy,
+        payload,
+        Instant::now() + FILEOPS_TIME_BUDGET,
+        FILEOPS_TIME_BUDGET,
+    )
 }
 
-fn search_with_budget(
+fn search_not_started(root: &Path, needle: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("path".into(), Value::String(root.display().to_string())),
+        ("pattern".into(), Value::String(needle.into())),
+        ("matches".into(), Value::Array(Vec::new())),
+        ("files_searched".into(), Value::from(0_u64)),
+        ("search_error_count".into(), Value::from(0_u64)),
+        ("search_errors".into(), Value::Array(Vec::new())),
+        ("truncated".into(), Value::Bool(true)),
+        (
+            "truncated_reason".into(),
+            Value::String("time_budget".into()),
+        ),
+        ("not_started".into(), Value::Bool(true)),
+        ("note".into(), Value::String(NOT_STARTED_NOTE.into())),
+    ])
+}
+
+pub(crate) fn search_until(
     policy: &Policy,
     payload: &Map<String, Value>,
+    deadline: Instant,
     budget: Duration,
 ) -> HandlerResult {
     let raw = require_str(payload, "path")?;
@@ -906,7 +968,9 @@ fn search_with_budget(
         cap,
         timed_out: false,
     };
-    let deadline = Instant::now() + budget;
+    if Instant::now() > deadline {
+        return Ok(search_not_started(&root, needle));
+    }
     let mut walker = WalkBuilder::new(&root);
     walker
         .hidden(false)
@@ -1109,20 +1173,22 @@ mod tests {
     fn expired_search_budget_returns_partial_contract() -> TestResult {
         let dir = tempdir().test_value()?;
         fs::write(dir.path().join("big.txt"), "x\n".repeat(200_000)).test_value()?;
-        let result = search_with_budget(
+        let result = search_until(
             &policy(dir.path()),
             &search_payload(dir.path(), "needle"),
+            Instant::now(),
             Duration::ZERO,
         )
         .test_value()?;
 
         assert_eq!(result["truncated"], true);
         assert_eq!(result["truncated_reason"], "time_budget");
+        assert_eq!(result["not_started"], true);
         assert!(
             result["note"]
                 .as_str()
                 .test_value()?
-                .contains("Narrow the path")
+                .contains("did not start")
         );
         Ok(())
     }
@@ -1150,16 +1216,22 @@ mod tests {
             "path".into(),
             Value::String(dir.path().display().to_string()),
         )]);
-        let result =
-            list_with_budget(&policy(dir.path()), &payload, Duration::ZERO).test_value()?;
+        let result = list_until(
+            &policy(dir.path()),
+            &payload,
+            Instant::now(),
+            Duration::ZERO,
+        )
+        .test_value()?;
 
         assert_eq!(result["truncated"], true);
         assert_eq!(result["truncated_reason"], "time_budget");
+        assert_eq!(result["not_started"], true);
         assert!(
             result["note"]
                 .as_str()
                 .test_value()?
-                .contains("Narrow the path")
+                .contains("did not start")
         );
         Ok(())
     }

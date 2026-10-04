@@ -959,7 +959,19 @@ impl CoreDispatcher {
     }
 
     async fn blocking_file_op(&self, op: Op, payload: Map<String, Value>) -> HandlerResult {
+        self.blocking_file_op_with_scan_budget(op, payload, fileops::FILEOPS_TIME_BUDGET)
+            .await
+    }
+
+    async fn blocking_file_op_with_scan_budget(
+        &self,
+        op: Op,
+        payload: Map<String, Value>,
+        scan_budget: Duration,
+    ) -> HandlerResult {
         let policy = Arc::clone(&self.policy);
+        let scan_deadline =
+            matches!(op, Op::List | Op::Search).then(|| Instant::now() + scan_budget);
         let scan_permit = if matches!(op, Op::List | Op::Search) {
             Some(
                 Arc::clone(&SCAN_PERMITS)
@@ -979,8 +991,18 @@ impl CoreDispatcher {
             let _scan_permit = scan_permit;
             match op {
                 Op::Read => fileops::read(&policy, &payload),
-                Op::List => fileops::list(&policy, &payload),
-                Op::Search => fileops::search(&policy, &payload),
+                Op::List => fileops::list_until(
+                    &policy,
+                    &payload,
+                    scan_deadline.unwrap_or_else(Instant::now),
+                    scan_budget,
+                ),
+                Op::Search => fileops::search_until(
+                    &policy,
+                    &payload,
+                    scan_deadline.unwrap_or_else(Instant::now),
+                    scan_budget,
+                ),
                 Op::Edit => edit::edit(&policy, &payload),
                 Op::EditUploadInit => crate::edit_upload::init(&policy),
                 Op::EditUploadFile => crate::edit_upload::file(&policy, &payload),
@@ -1146,6 +1168,53 @@ mod tests {
         .test_value()?;
 
         assert_eq!(result["content"], "hello\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_budget_includes_waiting_for_a_worker() -> TestResult {
+        let dir = tempdir().test_value()?;
+        std::fs::write(dir.path().join("a.txt"), "needle\n").test_value()?;
+        let policy = Policy {
+            file_ops_paths: vec![FileOpsPath {
+                path: dir.path().to_owned(),
+                access: FileAccess::Read,
+            }],
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
+        let all_scan_permits = Arc::clone(&SCAN_PERMITS)
+            .acquire_many_owned(u32::try_from(MAX_CONCURRENT_SCANS).test_value()?)
+            .await
+            .test_value()?;
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(all_scan_permits);
+        });
+        let payload = Map::from_iter([
+            (
+                "path".into(),
+                Value::String(dir.path().display().to_string()),
+            ),
+            ("pattern".into(), Value::String("needle".into())),
+        ]);
+
+        let result = dispatcher
+            .blocking_file_op_with_scan_budget(Op::Search, payload, Duration::from_millis(10))
+            .await
+            .test_value()?;
+        releaser.await.test_value()?;
+
+        assert_eq!(result["truncated"], Value::Bool(true));
+        assert_eq!(result["truncated_reason"], "time_budget");
+        assert_eq!(result["not_started"], Value::Bool(true));
+        assert_eq!(result["files_searched"], 0);
+        assert!(
+            result["note"]
+                .as_str()
+                .test_value()?
+                .contains("did not start")
+        );
         Ok(())
     }
 

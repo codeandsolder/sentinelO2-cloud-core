@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.23.3 behavior at reviewed upstream commit
-  `ebd55c12dce183187d1a46805ceb6f1f7801a9e0`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.23.7 behavior at reviewed upstream commit
+  `9a42a250b45b14c62b7d536897382354f6ccccf9`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -91,6 +91,13 @@ Reference surfaces:
   POSIX `flock`, which does not hide the PID bytes, so there is no production
   change to port. A future Windows lock implementation must preserve this
   requirement and must not lock over the PID text at offset zero.
+- Upstream 0.23.7 was explicitly reviewed. Its child-priority reset compensates
+  for the official installer's `Nice=-5` and `OOMScoreAdjust=-500`. SentinelO²
+  does not configure raised agent priority in this repository, and the current
+  production unit runs at `Nice=0`, `OOMScoreAdjust=0` with `KillMode=process`,
+  so child processes are already neutral and no Rust spawn hook is required.
+  If future packaging raises either priority value, it must add a safe child
+  neutralization mechanism at the same time rather than relying on inheritance.
 - Linux host/OS/kernel/CPU/memory/uptime/load metadata used by hello/state.
 - Capabilities are derived from the dispatcher surface rather than maintained
   as a second drifting list. Full capabilities include upstream policy evidence
@@ -121,6 +128,16 @@ Reference surfaces:
   query surface while retaining concise fork-specific project prose.
 - Native edit is atomic, keeps permissions where appropriate, backs up the old
   file and deliberately advances mtime.
+- Upstream 0.23.5 systemd validation is matched: unit candidates are copied to
+  a private verification directory under the target's real unit basename before
+  `systemd-analyze verify`; drop-ins and other unsupported files are refused
+  before mutation. Permission-denied path inspection is reported as a structured
+  refusal instead of surfacing as an internal worker failure.
+- Upstream 0.23.6 ownership preservation is matched without handing a file to
+  the agent user: if an unprivileged atomic replacement cannot chown its temp
+  inode back to the target owner/group, a writable existing regular file is
+  updated in place after backup, preserving its inode, owner, group, mode and
+  ACLs; a non-writable target is refused instead.
 - Upstream 0.22.0 dry-run edit semantics were already satisfied by the Rust
   architecture: edit candidates and validation live under the private SentinelX
   staging root rather than beside the target, and target parents/files are
@@ -163,6 +180,11 @@ Reference surfaces:
   blocking task itself, so a caller timeout cannot free the slot while an
   abandoned scan is still running, while ordinary reads never consume a scan
   permit and remain responsive behind scan load.
+- Upstream 0.23.4 queue-inclusive scan budgeting is matched: the deadline is
+  captured when the request reaches the dispatcher, before waiting for one of
+  the four scan permits. A scan whose budget is exhausted in that queue returns
+  `truncated_reason=time_budget` and `not_started=true` without traversing the
+  target tree.
 - Trusted `file_url` connections are pinned to the exact public DNS answers
   vetted by the SSRF check, closing the check/connect second-lookup race.
 - Local audit stores request key names and approximate size, not request values;

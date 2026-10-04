@@ -28,6 +28,20 @@ const MODES: &[&str] = &[
 const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(30);
 const VALIDATOR_CAPTURE_BYTES: usize = 256 * 1024;
 const PRESETS: &[&str] = &["nginx", "json", "python", "sh", "yaml", "systemd", "toml"];
+const SYSTEMD_UNIT_SUFFIXES: &[&str] = &[
+    "service",
+    "socket",
+    "device",
+    "mount",
+    "automount",
+    "swap",
+    "target",
+    "path",
+    "timer",
+    "slice",
+    "scope",
+];
+const SYSTEMD_UNSUPPORTED_MESSAGE: &str = "validator_preset=systemd verifies unit files (.service, .socket, .timer and the other unit types) with systemd-analyze, which cannot check a drop-in or other file on its own. Nothing was changed. Apply the edit without the validator, then run systemctl daemon-reload and check the unit with systemctl cat and systemctl show.";
 
 fn now_stamp() -> String {
     let now = SystemTime::now()
@@ -481,18 +495,55 @@ fn execute_validator(policy: &Policy, argv: &[String]) -> Result<(), HandlerErro
 
 fn run_validator(
     policy: &Policy,
-    path: &Path,
+    staged_path: &Path,
+    target_path: &Path,
     payload: &Map<String, Value>,
 ) -> Result<Option<Vec<String>>, HandlerError> {
     let preset = payload.get("validator_preset").and_then(Value::as_str);
-    if let Some(result) = internal_validator(preset, path)? {
+    if let Some(result) = internal_validator(preset, staged_path)? {
         return Ok(Some(result));
     }
+
+    let mut systemd_verify_dir = None;
+    let validate_path = if preset == Some("systemd") {
+        let suffix = target_path.extension().and_then(|value| value.to_str());
+        if suffix.is_none_or(|value| !SYSTEMD_UNIT_SUFFIXES.contains(&value)) {
+            return Err(HandlerError::new(
+                "validator_unsupported",
+                SYSTEMD_UNSUPPORTED_MESSAGE,
+            ));
+        }
+        let verify_dir = tempfile::Builder::new()
+            .prefix("sx-verify-")
+            .tempdir()
+            .map_err(|error| {
+                HandlerError::new(
+                    "validation_failed",
+                    format!("failed creating systemd verification directory: {error}"),
+                )
+            })?;
+        let filename = target_path.file_name().ok_or_else(|| {
+            HandlerError::new("validator_unsupported", SYSTEMD_UNSUPPORTED_MESSAGE)
+        })?;
+        let verify_path = verify_dir.path().join(filename);
+        fs::copy(staged_path, &verify_path).map_err(|error| {
+            HandlerError::new(
+                "validation_failed",
+                format!("failed staging systemd verification copy: {error}"),
+            )
+        })?;
+        systemd_verify_dir = Some(verify_dir);
+        verify_path
+    } else {
+        staged_path.to_owned()
+    };
+
     let custom = payload.get("validator").and_then(Value::as_str);
-    let Some(argv) = validator_argv(policy, path, preset, custom)? else {
+    let Some(argv) = validator_argv(policy, &validate_path, preset, custom)? else {
         return Ok(None);
     };
     execute_validator(policy, &argv)?;
+    drop(systemd_verify_dir);
     Ok(Some(argv))
 }
 
@@ -545,11 +596,48 @@ fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
     ))
 }
 
+fn write_in_place_preserving_metadata(target: &Path, content: &str) -> Result<(), HandlerError> {
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .open(target)
+        .map_err(|error| {
+            HandlerError::new(
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "not_writable"
+                } else {
+                    "write_failed"
+                },
+                format!("cannot write target in place while preserving ownership: {error}"),
+            )
+        })?;
+    destination.write_all(content.as_bytes()).map_err(|error| {
+        HandlerError::new(
+            "write_failed",
+            format!("failed writing target in place: {error}"),
+        )
+    })?;
+    destination
+        .set_len(u64::try_from(content.len()).unwrap_or(u64::MAX))
+        .map_err(|error| {
+            HandlerError::new(
+                "write_failed",
+                format!("failed truncating in-place edit: {error}"),
+            )
+        })?;
+    destination.sync_all().map_err(|error| {
+        HandlerError::new(
+            "write_failed",
+            format!("failed syncing in-place edit: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
 fn atomic_replace(
     target: &Path,
     content: &str,
     original_meta: Option<&fs::Metadata>,
-) -> Result<(), HandlerError> {
+) -> Result<bool, HandlerError> {
     let parent = target
         .parent()
         .ok_or_else(|| HandlerError::new("write_failed", "target has no parent directory"))?;
@@ -599,24 +687,36 @@ fn atomic_replace(
             )
         })?;
         if candidate_meta.uid() != meta.uid() || candidate_meta.gid() != meta.gid() {
-            nix::unistd::chown(
+            match nix::unistd::chown(
                 &temp,
                 Some(nix::unistd::Uid::from_raw(meta.uid())),
                 Some(nix::unistd::Gid::from_raw(meta.gid())),
-            )
-            .map_err(|e| {
-                HandlerError::new(
-                    "write_failed",
-                    format!("failed preserving owner/group: {e}"),
-                )
-            })?;
+            ) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::EPERM | nix::errno::Errno::EACCES)
+                    if target.exists() && !target.is_symlink() =>
+                {
+                    // Replacing the inode here would hand the file to the agent.
+                    // The backup already exists, so preserve the original inode
+                    // (and therefore owner/group/mode/ACLs) and write through it.
+                    write_in_place_preserving_metadata(target, content)?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    return Err(HandlerError::new(
+                        "write_failed",
+                        format!("failed preserving owner/group: {error}"),
+                    ));
+                }
+            }
         }
     }
     file.sync_all()
         .map_err(|e| HandlerError::new("write_failed", format!("failed syncing temp file: {e}")))?;
     drop(file);
     fs::rename(&temp, target)
-        .map_err(|e| HandlerError::new("write_failed", format!("atomic replace failed: {e}")))
+        .map_err(|e| HandlerError::new("write_failed", format!("atomic replace failed: {e}")))?;
+    Ok(false)
 }
 
 fn sudo_replace(
@@ -762,13 +862,13 @@ fn apply_edit(
     staged: &Path,
     updated: &str,
     payload: &Map<String, Value>,
-) -> Result<Option<PathBuf>, HandlerError> {
+) -> Result<(Option<PathBuf>, bool), HandlerError> {
     if payload
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return Ok(None);
+        return Ok((None, false));
     }
     let backup = if target.existed {
         let backup = backup_path(
@@ -790,12 +890,13 @@ fn apply_edit(
         .get("sudo")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if sudo {
+    let in_place = if sudo {
         sudo_replace(policy, &target.path, staged, target.metadata.as_ref())?;
+        false
     } else {
-        atomic_replace(&target.path, updated, target.metadata.as_ref())?;
-    }
-    Ok(backup)
+        atomic_replace(&target.path, updated, target.metadata.as_ref())?
+    };
+    Ok((backup, in_place))
 }
 
 struct EditOutcome<'a> {
@@ -807,6 +908,7 @@ struct EditOutcome<'a> {
     diff: Option<String>,
     validator: Option<Vec<String>>,
     sudo: bool,
+    in_place: bool,
     duration: f64,
 }
 
@@ -829,6 +931,15 @@ fn edit_result(outcome: EditOutcome<'_>) -> BTreeMap<String, Value> {
     ]);
     if outcome.dry_run {
         result.insert("dry_run".into(), Value::Bool(true));
+    }
+    if outcome.in_place {
+        result.insert("in_place".into(), Value::Bool(true));
+        result.insert(
+            "metadata".into(),
+            Value::String(
+                "written in place to keep the file's owner, group and permissions".into(),
+            ),
+        );
     }
     if let Some(path) = outcome.backup {
         result.insert("backup".into(), Value::String(path.display().to_string()));
@@ -868,7 +979,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 
     let staged = stage_edit(policy, &target.path, &updated)?;
     let _staged_cleanup = RemoveFileOnDrop(staged.clone());
-    let validator = run_validator(policy, &staged, payload)?;
+    let validator = run_validator(policy, &staged, &target.path, payload)?;
     let diff = payload
         .get("diff")
         .and_then(Value::as_bool)
@@ -878,7 +989,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let backup = apply_edit(policy, &target, &staged, &updated, payload)?;
+    let (backup, in_place) = apply_edit(policy, &target, &staged, &updated, payload)?;
     let sudo = payload
         .get("sudo")
         .and_then(Value::as_bool)
@@ -893,6 +1004,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         diff,
         validator,
         sudo,
+        in_place,
         duration,
     }))
 }
@@ -1052,6 +1164,102 @@ mod tests {
             "failed edit leaked staged files: {leftovers:?}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn in_place_fallback_keeps_inode_and_metadata() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let path = dir.path().join("owned.txt");
+        fs::write(&path, "old content that is longer\n").test_value()?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).test_value()?;
+        let before = fs::metadata(&path).test_value()?;
+
+        write_in_place_preserving_metadata(&path, "new\n").test_value()?;
+
+        let after = fs::metadata(&path).test_value()?;
+        assert_eq!(fs::read_to_string(&path).test_value()?, "new\n");
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(after.mode() & 0o7777, before.mode() & 0o7777);
+        Ok(())
+    }
+
+    #[test]
+    fn systemd_drop_in_is_refused_before_the_target_changes() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let dropin_dir = dir.path().join("demo.service.d");
+        fs::create_dir(&dropin_dir).test_value()?;
+        let path = dropin_dir.join("20-demo.conf");
+        fs::write(&path, "[Service]\nTasksMax=128\n").test_value()?;
+
+        let error = edit(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(path.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                (
+                    "new_text".into(),
+                    Value::String("[Service]\nTasksMax=256\n".into()),
+                ),
+                ("validator_preset".into(), Value::String("systemd".into())),
+            ]),
+        )
+        .test_error()?;
+
+        assert_eq!(error.code, "validator_unsupported");
+        assert!(error.message.contains("daemon-reload"));
+        assert_eq!(
+            fs::read_to_string(&path).test_value()?,
+            "[Service]\nTasksMax=128\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn systemd_unit_is_verified_under_its_real_filename() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = policy(dir.path());
+        if !policy.tooling.command("systemd-analyze").exists() {
+            return Ok(());
+        }
+        let path = dir.path().join("sxtest.service");
+        fs::write(
+            &path,
+            "[Unit]\nDescription=old\n[Service]\nType=oneshot\nExecStart=/bin/true\n",
+        )
+        .test_value()?;
+
+        let result = edit(
+            &policy,
+            &Map::from_iter([
+                ("path".into(), Value::String(path.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                (
+                    "new_text".into(),
+                    Value::String(
+                        "[Unit]\nDescription=new\n[Service]\nType=oneshot\nExecStart=/bin/true\n"
+                            .into(),
+                    ),
+                ),
+                ("validator_preset".into(), Value::String("systemd".into())),
+                ("dry_run".into(), Value::Bool(true)),
+            ]),
+        )
+        .test_value()?;
+
+        let validator = result["validator"].as_array().test_value()?;
+        assert!(
+            validator
+                .last()
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.ends_with("/sxtest.service"))
+        );
+        assert_eq!(
+            fs::read_to_string(&path).test_value()?,
+            "[Unit]\nDescription=old\n[Service]\nType=oneshot\nExecStart=/bin/true\n"
+        );
         Ok(())
     }
 }
