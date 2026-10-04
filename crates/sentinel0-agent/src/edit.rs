@@ -596,6 +596,43 @@ fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
     ))
 }
 
+fn write_in_place_preserving_metadata(target: &Path, content: &str) -> Result<(), HandlerError> {
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .open(target)
+        .map_err(|error| {
+            HandlerError::new(
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "not_writable"
+                } else {
+                    "write_failed"
+                },
+                format!("cannot write target in place while preserving ownership: {error}"),
+            )
+        })?;
+    destination.write_all(content.as_bytes()).map_err(|error| {
+        HandlerError::new(
+            "write_failed",
+            format!("failed writing target in place: {error}"),
+        )
+    })?;
+    destination
+        .set_len(u64::try_from(content.len()).unwrap_or(u64::MAX))
+        .map_err(|error| {
+            HandlerError::new(
+                "write_failed",
+                format!("failed truncating in-place edit: {error}"),
+            )
+        })?;
+    destination.sync_all().map_err(|error| {
+        HandlerError::new(
+            "write_failed",
+            format!("failed syncing in-place edit: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
 fn atomic_replace(
     target: &Path,
     content: &str,
@@ -662,41 +699,7 @@ fn atomic_replace(
                     // Replacing the inode here would hand the file to the agent.
                     // The backup already exists, so preserve the original inode
                     // (and therefore owner/group/mode/ACLs) and write through it.
-                    let mut destination = OpenOptions::new()
-                        .write(true)
-                        .open(target)
-                        .map_err(|error| {
-                            HandlerError::new(
-                                if error.kind() == std::io::ErrorKind::PermissionDenied {
-                                    "not_writable"
-                                } else {
-                                    "write_failed"
-                                },
-                                format!(
-                                    "cannot write target in place while preserving ownership: {error}"
-                                ),
-                            )
-                        })?;
-                    destination.write_all(content.as_bytes()).map_err(|error| {
-                        HandlerError::new(
-                            "write_failed",
-                            format!("failed writing target in place: {error}"),
-                        )
-                    })?;
-                    destination
-                        .set_len(u64::try_from(content.len()).unwrap_or(u64::MAX))
-                        .map_err(|error| {
-                            HandlerError::new(
-                                "write_failed",
-                                format!("failed truncating in-place edit: {error}"),
-                            )
-                        })?;
-                    destination.sync_all().map_err(|error| {
-                        HandlerError::new(
-                            "write_failed",
-                            format!("failed syncing in-place edit: {error}"),
-                        )
-                    })?;
+                    write_in_place_preserving_metadata(target, content)?;
                     return Ok(true);
                 }
                 Err(error) => {
@@ -1161,6 +1164,25 @@ mod tests {
             "failed edit leaked staged files: {leftovers:?}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn in_place_fallback_keeps_inode_and_metadata() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let path = dir.path().join("owned.txt");
+        fs::write(&path, "old content that is longer\n").test_value()?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).test_value()?;
+        let before = fs::metadata(&path).test_value()?;
+
+        write_in_place_preserving_metadata(&path, "new\n").test_value()?;
+
+        let after = fs::metadata(&path).test_value()?;
+        assert_eq!(fs::read_to_string(&path).test_value()?, "new\n");
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(after.mode() & 0o7777, before.mode() & 0o7777);
         Ok(())
     }
 
