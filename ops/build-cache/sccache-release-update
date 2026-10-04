@@ -270,10 +270,17 @@ rollback() {
     fi
     [[ -e "$backup_dir/sccache" ]] && install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE"
     [[ -e "$backup_dir/sccache-dist" ]] && install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE"
-    systemctl start "$LOCAL_SERVICE" >/dev/null 2>&1 || true
+    # Restore the scheduler before the local daemon, matching normal activation.
+    # Rollback is best-effort, so bound the readiness wait but do not let a
+    # broken scheduler prevent the old local daemon from being restored.
     if (( dist_was_active )); then
         systemctl start "$DIST_SERVICE" >/dev/null 2>&1 || true
+        for _ in $(seq 1 100); do
+            nc -z -w1 "$SCHEDULER_HOST" "$SCHEDULER_PORT" >/dev/null 2>&1 && break
+            sleep 0.05
+        done
     fi
+    systemctl start "$LOCAL_SERVICE" >/dev/null 2>&1 || true
     [[ -z "$smoke" ]] || rm -rf -- "$smoke"
     rm -f "$DRAIN"
     exit "$rc"
