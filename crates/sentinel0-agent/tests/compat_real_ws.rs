@@ -14,7 +14,7 @@ use sentinel0_proto::{
     HostInfo, Message, Op, PreferredProfile, decode_binary_frame, encode_binary_frame,
 };
 use serde_json::{Map, Value, json};
-use std::{collections::BTreeMap, fs, time::Duration};
+use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -668,9 +668,52 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
     Ok(())
 }
 
+#[derive(Debug)]
+struct ControlledJobDispatcher {
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl Dispatcher for ControlledJobDispatcher {
+    async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> DispatchResponse {
+        self.release.notified().await;
+        DispatchResponse::message(Message::Response {
+            id: id.into(),
+            ok: true,
+            result: Some(BTreeMap::from([
+                ("returncode".into(), Value::from(0)),
+                ("output".into(), Value::String("job done".into())),
+            ])),
+            error: None,
+        })
+    }
+}
+
+async fn expect_surviving_job_completion(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) -> TestResult {
+    let replay = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .test_value()?
+        .test_value()?
+        .test_value()?;
+    let WsMessage::Text(replay) = replay else {
+        return Err(std::io::Error::other("expected replayed event text").into());
+    };
+    let Message::Event { kind, data, .. } =
+        serde_json::from_str::<Message>(&replay).test_value()?
+    else {
+        return Err(std::io::Error::other("expected replayed job_completed event").into());
+    };
+    assert_eq!(kind, "job_completed");
+    assert_eq!(data["job_id"], "job_survives");
+    assert_eq!(data["status"], "succeeded");
+    assert_eq!(data["output"], "job done");
+    Ok(())
+}
+
 #[tokio::test]
-async fn background_completion_survives_dead_request_socket_and_replays_next_connection()
--> TestResult {
+async fn background_completion_finishing_after_reconnect_opening_replay_is_delivered() -> TestResult
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
     let addr = listener.local_addr().test_value()?;
     let temp = tempfile::tempdir().test_value()?;
@@ -679,6 +722,8 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
 
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server_release = Arc::clone(&release);
 
     let server = tokio::spawn(async move {
         let mut first = accept_agent(&listener).await?;
@@ -715,9 +760,10 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
         ));
 
         // The operation has started. Kill exactly the socket its completion
-        // would have used. Accept the replacement connection promptly so the
-        // client's connect deadline is not what we are testing, but delay its
-        // welcome until the old job has finished and persisted.
+        // would have used. The replacement session completes welcome immediately,
+        // so its opening replay runs while the old job is still executing. This is
+        // upstream #38's ordering: the completion must be delivered on this already
+        // healthy session instead of waiting for another reconnect.
         drop(first);
 
         let mut second = accept_agent(&listener).await?;
@@ -728,7 +774,6 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
             serde_json::from_str::<Message>(&hello).test_value()?,
             Message::Hello { .. }
         ));
-        tokio::time::sleep(Duration::from_millis(650)).await;
         second
             .send(WsMessage::Text(
                 json!({
@@ -743,23 +788,16 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
             .await
             .test_value()?;
 
-        let replay = tokio::time::timeout(Duration::from_millis(100), second.next())
-            .await
-            .test_value()?
-            .test_value()?
-            .test_value()?;
-        let WsMessage::Text(replay) = replay else {
-            return Err(std::io::Error::other("expected replayed event text").into());
-        };
-        let Message::Event { kind, data, .. } =
-            serde_json::from_str::<Message>(&replay).test_value()?
-        else {
-            return Err(std::io::Error::other("expected replayed job_completed event").into());
-        };
-        assert_eq!(kind, "job_completed");
-        assert_eq!(data["job_id"], "job_survives");
-        assert_eq!(data["status"], "succeeded");
-        assert_eq!(data["output"], "job done");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), second.next())
+                .await
+                .is_err(),
+            "replacement session should finish its opening replay before the job completes"
+        );
+
+        server_release.notify_one();
+
+        expect_surviving_job_completion(&mut second).await?;
 
         server_cancel.cancel();
         let _ = second.close(None).await;
@@ -769,8 +807,8 @@ async fn background_completion_survives_dead_request_socket_and_replays_next_con
     let mut cfg = config(addr);
     cfg.upload_base = upload_base.clone();
     cfg.welcome_timeout = Duration::from_millis(900);
-    let agent = Agent::new(cfg, JobDispatcher).test_value()?;
-    tokio::time::timeout(Duration::from_millis(1800), agent.run(cancel.clone()))
+    let agent = Agent::new(cfg, ControlledJobDispatcher { release }).test_value()?;
+    tokio::time::timeout(Duration::from_secs(6), agent.run(cancel.clone()))
         .await
         .test_value()?
         .test_value()?;

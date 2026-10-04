@@ -91,7 +91,7 @@ use std::{
     collections::BTreeMap, panic::AssertUnwindSafe, path::PathBuf, sync::Arc, time::Duration,
 };
 use tokio::{
-    sync::mpsc,
+    sync::{Notify, mpsc},
     task::JoinSet,
     time::{Instant, interval, sleep, timeout},
 };
@@ -355,13 +355,13 @@ enum SessionEnd {
 struct Outbound {
     message: Message,
     binary_frame: Option<Vec<u8>>,
-    clear_after_send: Option<PathBuf>,
 }
 
 pub struct Agent<D> {
     config: AgentConfig,
     dispatcher: Arc<D>,
     rotation: Option<rotation::RotationConfig>,
+    pending_ready: Arc<Notify>,
 }
 
 impl<D: Dispatcher> Agent<D> {
@@ -373,6 +373,7 @@ impl<D: Dispatcher> Agent<D> {
             config,
             dispatcher: Arc::new(dispatcher),
             rotation: None,
+            pending_ready: Arc::new(Notify::new()),
         })
     }
 
@@ -499,7 +500,21 @@ impl<D: Dispatcher> Agent<D> {
         }
     }
 
-    async fn post_welcome(&self, ws: &mut AgentWebSocket) -> Result<(), AgentError> {
+    async fn replay_pending_results(&self, ws: &mut AgentWebSocket) -> Result<bool, AgentError> {
+        for (path, event) in drain_pending(self.config.upload_base.clone()).await {
+            if let Err(error) = ws
+                .send(WsMessage::Text(serde_json::to_string(&event)?.into()))
+                .await
+            {
+                debug!(?error, path = %path.display(), "pending-result replay interrupted by session loss");
+                return Ok(false);
+            }
+            clear_pending(Some(path)).await;
+        }
+        Ok(true)
+    }
+
+    async fn post_welcome(&self) -> Result<(), AgentError> {
         if let Some(rotation_config) = self.rotation.as_ref() {
             match rotation::maybe_rotate(rotation_config, &self.config.token).await {
                 Ok(true) => {
@@ -510,16 +525,6 @@ impl<D: Dispatcher> Agent<D> {
                 Ok(false) => {}
                 Err(error) => warn!(%error, "credential rotation skipped"),
             }
-        }
-        for (path, event) in drain_pending(self.config.upload_base.clone()).await {
-            if let Err(error) = ws
-                .send(WsMessage::Text(serde_json::to_string(&event)?.into()))
-                .await
-            {
-                debug!(?error, path = %path.display(), "pending-result replay interrupted by session loss");
-                break;
-            }
-            clear_pending(Some(path)).await;
         }
         Ok(())
     }
@@ -540,15 +545,10 @@ impl<D: Dispatcher> Agent<D> {
         if is_response {
             let _truncation = bound_response_default(&mut wire);
         }
-        if ws
+        Ok(ws
             .send(WsMessage::Text(serde_json::to_string(&wire)?.into()))
             .await
-            .is_err()
-        {
-            return Ok(false);
-        }
-        clear_pending(outbound.clear_after_send).await;
-        Ok(true)
+            .is_ok())
     }
 
     fn spawn_foreground_request(
@@ -580,7 +580,6 @@ impl<D: Dispatcher> Agent<D> {
                 .send(Outbound {
                     message: dispatch_response.message,
                     binary_frame: dispatch_response.binary_frame,
-                    clear_after_send: None,
                 })
                 .await
             {
@@ -648,6 +647,7 @@ impl<D: Dispatcher> Agent<D> {
         let started_at = Utc::now();
         let host_id = self.config.host.id.clone();
         let upload_base = self.config.upload_base.clone();
+        let pending_ready = Arc::clone(&self.pending_ready);
         tasks.spawn(async move {
             let dispatch_response = dispatch_safely(dispatcher, id.clone(), op, payload).await;
             let mut response = if dispatch_response.binary_frame.is_some() {
@@ -703,15 +703,24 @@ impl<D: Dispatcher> Agent<D> {
                     None
                 }
             };
-            if let Err(error) = response_tx
+            if pending_path.is_some() {
+                // Durable completions are transmitted only by the active session.
+                // Notify stores a permit when no session is currently waiting, so
+                // a completion that lands just after reconnect's opening replay is
+                // replayed as soon as the new session loop starts.
+                pending_ready.notify_one();
+            } else if let Err(error) = response_tx
                 .send(Outbound {
                     message: event,
                     binary_frame: None,
-                    clear_after_send: pending_path,
                 })
                 .await
             {
-                debug!(?error, %job_id, "session ended before background completion could be queued");
+                debug!(
+                    ?error,
+                    %job_id,
+                    "background completion could neither be persisted nor queued"
+                );
             }
         });
         Ok(true)
@@ -864,7 +873,6 @@ impl<D: Dispatcher> Agent<D> {
                         timestamp: Utc::now(),
                     },
                     binary_frame: None,
-                    clear_after_send: None,
                 })
                 .await
             {
@@ -938,6 +946,17 @@ impl<D: Dispatcher> Agent<D> {
         let mut last_pong = Instant::now();
         let (response_tx, mut response_rx) = mpsc::channel::<Outbound>(64);
 
+        // Arm the notification before the opening replay. A completion that is
+        // persisted while that replay is enumerating the store then either lands
+        // in the replay itself or completes this future for an immediate second
+        // drain. Keep the same future alive across select iterations so another
+        // ready branch cannot cancel away a granted notification.
+        let pending_ready = Arc::clone(&self.pending_ready);
+        let mut pending_notification = Box::pin(Arc::clone(&pending_ready).notified_owned());
+        if !self.replay_pending_results(ws).await? {
+            return Ok(SessionEnd::Lost(None));
+        }
+
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
@@ -950,10 +969,20 @@ impl<D: Dispatcher> Agent<D> {
                     if last_pong.elapsed() >= self.config.heartbeat_timeout {
                         return Ok(SessionEnd::Lost(None));
                     }
+                    if !self.replay_pending_results(ws).await? {
+                        return Ok(SessionEnd::Lost(None));
+                    }
                     let ping = Message::Ping { timestamp: Utc::now() };
                     if ws.send(WsMessage::Text(serde_json::to_string(&ping)?.into())).await.is_err() {
                         return Ok(SessionEnd::Lost(None));
                     }
+                }
+                () = &mut pending_notification => {
+                    if !self.replay_pending_results(ws).await? {
+                        return Ok(SessionEnd::Lost(None));
+                    }
+                    pending_notification =
+                        Box::pin(Arc::clone(&pending_ready).notified_owned());
                 }
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(Err(error)) = completed
@@ -1025,7 +1054,7 @@ impl<D: Dispatcher> Agent<D> {
         if let Some(end) = self.exchange_welcome(&mut ws, cancel).await? {
             return Ok(end);
         }
-        self.post_welcome(&mut ws).await?;
+        self.post_welcome().await?;
         self.session_loop(&mut ws, cancel, tasks).await
     }
 }
