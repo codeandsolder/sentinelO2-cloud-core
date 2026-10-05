@@ -461,9 +461,12 @@ pub fn smoke(x: u64) -> u64 { x.rotate_left(7) ^ 0x5cca_c4e0 }
 RS
 [[ -x "$SMOKE_RUSTC" ]] || { echo "sccache-release-update: smoke rustc not executable: $SMOKE_RUSTC" >&2; false; }
 smoke_crate="sccache_autoupdate_smoke_$(date +%s)_$$"
-SCCACHE_RECACHE=1 "$LIVE" "$SMOKE_RUSTC" \
-    "$smoke/smoke.rs" --crate-name "$smoke_crate" --crate-type rlib \
-    --edition=2024 --emit=metadata,link --out-dir "$smoke"
+(
+    cd "$smoke"
+    SCCACHE_RECACHE=1 "$LIVE" "$SMOKE_RUSTC" \
+        "$smoke/smoke.rs" --crate-name "$smoke_crate" --crate-type rlib \
+        --edition=2024 --emit=metadata,link --out-dir "$smoke"
+)
 test -s "$smoke/lib${smoke_crate}.rlib"
 if [[ "$VERIFY_DIST_SMOKE" == 1 && $dist_was_active -eq 1 ]]; then
     dist_smoke_after="$(dist_success_total)"
