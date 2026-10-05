@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync loaded sccache scheduler client credential to laptop
+Requires=sccache-dist-scheduler.service
+After=network-online.target sccache-dist-scheduler.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sentinelx
+Group=sentinelx
+ExecStart=/usr/local/sbin/sccache-client-token-sync sync
