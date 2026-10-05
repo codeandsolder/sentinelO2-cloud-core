@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG=${SCCACHE_CLIENT_CONFIG:-/etc/sccache/client.conf}
+SERVICE=${SCCACHE_LOCAL_SERVICE:-sccache-local.service}
+
+[[ $EUID -eq 0 ]] || {
+    echo "sccache-client-token-receive: must run as root" >&2
+    exit 2
+}
+
+result=$(
+    /usr/bin/uv run --no-project python -c '
+from pathlib import Path
+import os
+import re
+import stat
+import sys
+import tempfile
+
+config = Path(sys.argv[1])
+token = sys.stdin.read().rstrip("\n")
+if not token or any(c in token for c in "\r\n\""):
+    raise SystemExit("invalid token on stdin")
+
+text = config.read_text()
+section = re.search(r"(?ms)^\[dist\.auth\]\s*$.*?(?=^\[|\Z)", text)
+if section is None:
+    raise SystemExit("missing [dist.auth] section")
+block = section.group(0)
+matches = list(re.finditer(
+    r"(?m)^(\s*token\s*=\s*)\"([^\"\n]*)\"(\s*(?:#.*)?)$",
+    block,
+))
+if len(matches) != 1:
+    raise SystemExit("expected exactly one quoted token in [dist.auth]")
+m = matches[0]
+if m.group(2) == token:
+    print("unchanged")
+    raise SystemExit(0)
+
+new_block = block[:m.start(2)] + token + block[m.end(2):]
+updated = text[:section.start()] + new_block + text[section.end():]
+st = config.stat()
+fd, tmp_name = tempfile.mkstemp(prefix=f".{config.name}.", dir=config.parent)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(updated)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chown(tmp_name, st.st_uid, st.st_gid)
+    os.chmod(tmp_name, stat.S_IMODE(st.st_mode))
+    os.replace(tmp_name, config)
+    dfd = os.open(config.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+except BaseException:
+    try:
+        os.unlink(tmp_name)
+    except FileNotFoundError:
+        pass
+    raise
+print("updated")
+' "$CONFIG"
+)
+
+case "$result" in
+    unchanged)
+        echo unchanged
+        ;;
+    updated)
+        systemctl restart "$SERVICE"
+        systemctl is-active --quiet "$SERVICE"
+        echo updated
+        ;;
+    *)
+        echo "sccache-client-token-receive: unexpected result: $result" >&2
+        exit 1
+        ;;
+esac
