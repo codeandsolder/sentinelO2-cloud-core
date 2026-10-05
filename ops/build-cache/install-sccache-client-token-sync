@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || {
+    echo "install-sccache-client-token-sync: must run as root" >&2
+    exit 2
+}
+
+BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SSH_KEY=${SCCACHE_LAPTOP_SSH_KEY:-/opt/sentinelx-cloud-core/.ssh/sf314-42_ed25519}
+KNOWN_HOSTS=${SCCACHE_LAPTOP_KNOWN_HOSTS:-/opt/sentinelx-cloud-core/.ssh/known_hosts}
+LAPTOP=${SCCACHE_LAPTOP_SSH_TARGET:-root@100.118.45.4}
+SCHEDULER=${SCCACHE_SCHEDULER_SERVICE:-sccache-dist-scheduler.service}
+STATUS_URL=${SCCACHE_SCHEDULER_STATUS_URL:-http://100.65.0.2:10600/api/v1/scheduler/status}
+RECEIVER=/usr/local/sbin/sccache-client-token-receive
+SYNC=/usr/local/sbin/sccache-client-token-sync
+DROPIN_DIR=/etc/systemd/system/sccache-dist-scheduler.service.d
+
+for file in \
+    sccache-client-token-receive \
+    sccache-client-token-sync \
+    sccache-client-token-sync.service \
+    sccache-client-token-sync.timer \
+    sccache-client-token-sync.scheduler-dropin.conf; do
+    [[ -r "$BASE/$file" ]] || {
+        echo "install-sccache-client-token-sync: missing $BASE/$file" >&2
+        exit 1
+    }
+done
+
+ssh_opts=(
+    -i "$SSH_KEY"
+    -o IdentitiesOnly=yes
+    -o BatchMode=yes
+    -o ConnectTimeout=5
+    -o UserKnownHostsFile="$KNOWN_HOSTS"
+    -o StrictHostKeyChecking=yes
+)
+
+ssh "${ssh_opts[@]}" "$LAPTOP" true
+scp -q "${ssh_opts[@]}" "$BASE/sccache-client-token-receive" "$LAPTOP:$RECEIVER"
+ssh "${ssh_opts[@]}" "$LAPTOP" \
+    "chown root:root '$RECEIVER' && chmod 0755 '$RECEIVER'"
+
+install -o root -g root -m 0755 "$BASE/sccache-client-token-sync" "$SYNC"
+install -o root -g root -m 0644 \
+    "$BASE/sccache-client-token-sync.service" \
+    /etc/systemd/system/sccache-client-token-sync.service
+install -o root -g root -m 0644 \
+    "$BASE/sccache-client-token-sync.timer" \
+    /etc/systemd/system/sccache-client-token-sync.timer
+install -d -o root -g root -m 0755 "$DROPIN_DIR"
+install -o root -g root -m 0644 \
+    "$BASE/sccache-client-token-sync.scheduler-dropin.conf" \
+    "$DROPIN_DIR/50-client-token-sync.conf"
+
+systemctl daemon-reload
+systemctl enable sccache-client-token-sync.timer
+
+busy=$(
+    curl -fsS --connect-timeout 3 --max-time 5 "$STATUS_URL" |
+        /usr/local/bin/uv run --no-project python -c '
+import struct
+import sys
+
+data = sys.stdin.buffer.read()
+if len(data) != 24:
+    raise SystemExit(1)
+print(struct.unpack("<QQQ", data)[2])
+'
+) || busy=unknown
+
+if [[ "$busy" == 0 ]]; then
+    systemctl restart "$SCHEDULER"
+    systemctl is-active --quiet "$SCHEDULER"
+    systemctl start sccache-client-token-sync.timer
+    systemctl start sccache-client-token-sync.service
+    echo "install-sccache-client-token-sync: installed and activated"
+else
+    echo "install-sccache-client-token-sync: installed; scheduler restart deferred (in_progress=$busy)"
+    echo "restart $SCHEDULER when idle; its ExecStartPost will snapshot and sync the loaded credential"
+fi
