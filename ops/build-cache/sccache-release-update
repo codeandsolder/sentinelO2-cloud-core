@@ -15,6 +15,9 @@ SCHEDULER_HOST="${SCCACHE_AUTOUPDATE_SCHEDULER_HOST:-100.65.0.2}"
 SCHEDULER_PORT="${SCCACHE_AUTOUPDATE_SCHEDULER_PORT:-10600}"
 LOCK="${SCCACHE_AUTOUPDATE_LOCK:-/run/lock/sccache-autoupdate.lock}"
 MODE=apply
+EXPECTED_RUST_TOOLCHAIN="${SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN:-1.98.1}"
+SMOKE_RUSTC="${SCCACHE_AUTOUPDATE_SMOKE_RUSTC:-/opt/toolchains/rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc}"
+VERIFY_DIST_SMOKE="${SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE:-0}"
 
 case "${1:-}" in
     "") ;;
@@ -102,19 +105,37 @@ fi
 release_dir="$CACHE_DIR/$tag"
 mkdir -p "$release_dir"
 base="https://github.com/$REPO/releases/download/$tag"
+download_asset() {
+    local asset="$1"
+    local final="$release_dir/$asset"
+    local partial="$release_dir/.$asset.partial"
+    [[ -s "$final" ]] && return 0
+
+    # Persist partial downloads across timer invocations so slow GitHub release
+    # assets resume instead of restarting after an arbitrary wall-clock cap.
+    curl -fL --retry 5 --retry-all-errors --connect-timeout 10 \
+        --speed-limit 1024 --speed-time 60 --continue-at - \
+        -H "User-Agent: $ua" "$base/$asset" -o "$partial"
+    mv -f "$partial" "$final"
+}
+
 for asset in sccache-linux-x86_64-v2 sccache-dist-linux-x86_64-v2 SHA256SUMS build.txt; do
-    [[ -s "$release_dir/$asset" ]] && continue
-    tmp="$release_dir/.$asset.tmp.$$"
-    curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
-        -H "User-Agent: $ua" "$base/$asset" -o "$tmp"
-    mv -f "$tmp" "$release_dir/$asset"
+    download_asset "$asset"
 done
 
-(
+if ! (
     cd "$release_dir"
     sed 's#  dist/#  #' SHA256SUMS > SHA256SUMS.local
     sha256sum -c SHA256SUMS.local
-)
+); then
+    rm -f "$release_dir"/sccache-linux-x86_64-v2 \
+        "$release_dir"/sccache-dist-linux-x86_64-v2 \
+        "$release_dir"/SHA256SUMS "$release_dir"/build.txt \
+        "$release_dir"/.sccache-linux-x86_64-v2.partial \
+        "$release_dir"/.sccache-dist-linux-x86_64-v2.partial \
+        "$release_dir"/.SHA256SUMS.partial "$release_dir"/.build.txt.partial
+    exit 1
+fi
 
 source_sha="$(sed -n 's/^source_sha=//p' "$release_dir/build.txt")"
 rust_toolchain="$(sed -n 's/^rust_toolchain=//p' "$release_dir/build.txt")"
@@ -129,8 +150,8 @@ tag_sha="${tag#"$TAG_PREFIX"}"
     echo "sccache-release-update: release tag/source SHA mismatch" >&2
     exit 1
 }
-[[ "$rust_toolchain" == "1.98.1" ]] || {
-    echo "sccache-release-update: unexpected Rust toolchain: $rust_toolchain" >&2
+[[ "$rust_toolchain" == "$EXPECTED_RUST_TOOLCHAIN" ]] || {
+    echo "sccache-release-update: unexpected Rust toolchain: $rust_toolchain (expected $EXPECTED_RUST_TOOLCHAIN)" >&2
     exit 1
 }
 [[ "$rustflags" == *"target-cpu=x86-64-v2"* ]] || {
@@ -200,14 +221,63 @@ running_dist_sha() {
     sha256sum "/proc/$pid/exe" 2>/dev/null | awk '{print $1}'
 }
 
-dist_in_progress() {
-    "$LIVE" --dist-status 2>/dev/null |
-        python3 -c 'import json,sys
+tcp_ready() {
+    local host="$1"
+    local port="$2"
+    timeout 2 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" \
+        >/dev/null 2>&1
+}
+
+local_dist_status_value() {
+    local field="$1"
+    local status
+    systemctl is-active --quiet "$LOCAL_SERVICE" || return 1
+    status="$("$LIVE" --dist-status 2>/dev/null)" || return 1
+    printf '%s' "$status" | python3 -c 'import json,sys
+field=sys.argv[1]
 d=json.load(sys.stdin)
 s=d.get("SchedulerStatus")
 if not isinstance(s,list) or len(s)<2 or not isinstance(s[1],dict):
     raise SystemExit(1)
-print(int(s[1].get("in_progress",0)))'
+print(int(s[1][field]))' "$field"
+}
+
+dist_status_value() {
+    local field="$1"
+    local value
+
+    # Never invoke the CLI while the managed local daemon is down: sccache
+    # would autostart an unmanaged daemon that can steal the systemd socket.
+    if value="$(local_dist_status_value "$field" 2>/dev/null)"; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    curl -fsS --connect-timeout 3 --max-time 5 \
+        "http://$SCHEDULER_HOST:$SCHEDULER_PORT/api/v1/scheduler/status" |
+        python3 -c 'import struct,sys
+field=sys.argv[1]
+data=sys.stdin.buffer.read()
+if len(data) != 24:
+    raise SystemExit(1)
+num_servers,num_cpus,in_progress=struct.unpack("<QQQ", data)
+values={"num_servers":num_servers,"num_cpus":num_cpus,"in_progress":in_progress}
+print(values[field])' "$field"
+}
+
+dist_in_progress() {
+    dist_status_value in_progress
+}
+
+dist_num_servers() {
+    dist_status_value num_servers
+}
+
+dist_success_total() {
+    "$LIVE" --show-stats --stats-format=json 2>/dev/null |
+        python3 -c 'import json,sys
+d=json.load(sys.stdin).get("stats",{})
+print(sum(int(v) for v in d.get("dist_compiles",{}).values()))'
 }
 
 if [[ "$candidate_sha" == "$live_sha" && "$candidate_dist_sha" == "$live_dist_sha" ]]; then
@@ -246,6 +316,16 @@ if systemctl is-active --quiet "$DIST_SERVICE"; then
         echo "sccache-release-update: $dist_busy distributed compile(s) active; deferring update"
         exit 0
     fi
+    if [[ "$VERIFY_DIST_SMOKE" == 1 ]]; then
+        if ! dist_servers="$(dist_num_servers)"; then
+            echo "sccache-release-update: cannot verify scheduler workers; deferring update" >&2
+            exit 0
+        fi
+        if (( dist_servers < 1 )); then
+            echo "sccache-release-update: no distributed workers available for post-update smoke; deferring update"
+            exit 0
+        fi
+    fi
 fi
 if active_clients; then
     echo "sccache-release-update: active compiler clients; deferring update"
@@ -270,13 +350,12 @@ rollback() {
     fi
     [[ -e "$backup_dir/sccache" ]] && install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE"
     [[ -e "$backup_dir/sccache-dist" ]] && install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE"
-    # Restore the scheduler before the local daemon, matching normal activation.
-    # Rollback is best-effort, so bound the readiness wait but do not let a
-    # broken scheduler prevent the old local daemon from being restored.
+    # Restore the scheduler before the local daemon so the reverted client
+    # does not enter reconnect backoff against a scheduler that is still down.
     if (( dist_was_active )); then
         systemctl start "$DIST_SERVICE" >/dev/null 2>&1 || true
         for _ in $(seq 1 100); do
-            nc -z -w1 "$SCHEDULER_HOST" "$SCHEDULER_PORT" >/dev/null 2>&1 && break
+            tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT" && break
             sleep 0.05
         done
     fi
@@ -325,11 +404,11 @@ mv -f "$DIST_LIVE.new" "$DIST_LIVE"
 if (( dist_was_active )); then
     systemctl start "$DIST_SERVICE"
     for _ in $(seq 1 100); do
-        nc -z -w1 "$SCHEDULER_HOST" "$SCHEDULER_PORT" >/dev/null 2>&1 && break
+        tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT" >/dev/null 2>&1 && break
         sleep 0.05
     done
     systemctl is-active --quiet "$DIST_SERVICE"
-    nc -z -w1 "$SCHEDULER_HOST" "$SCHEDULER_PORT"
+    tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT"
 fi
 
 # The pre-managed local daemon predates deterministic background-task draining.
@@ -345,11 +424,30 @@ mv -f "$LIVE.new" "$LIVE"
 
 systemctl start "$LOCAL_SERVICE"
 for _ in $(seq 1 100); do
-    nc -z -w1 127.0.0.1 "$CLIENT_PORT" >/dev/null 2>&1 && break
+    tcp_ready 127.0.0.1 "$CLIENT_PORT" >/dev/null 2>&1 && break
     sleep 0.05
 done
 systemctl is-active --quiet "$LOCAL_SERVICE"
-nc -z -w1 127.0.0.1 "$CLIENT_PORT"
+tcp_ready 127.0.0.1 "$CLIENT_PORT"
+
+dist_smoke_before=""
+if [[ "$VERIFY_DIST_SMOKE" == 1 && $dist_was_active -eq 1 ]]; then
+    dist_servers=0
+    for _ in $(seq 1 240); do
+        # This check must come from the freshly restarted local daemon itself;
+        # the direct scheduler fallback only proves the scheduler is healthy,
+        # not that the new client has authenticated and connected.
+        if dist_servers="$(local_dist_status_value num_servers 2>/dev/null)" && (( dist_servers > 0 )); then
+            break
+        fi
+        sleep 0.25
+    done
+    (( dist_servers > 0 )) || {
+        echo "sccache-release-update: updated local client did not connect to a scheduler with workers" >&2
+        false
+    }
+    dist_smoke_before="$(dist_success_total)"
+fi
 
 smoke="$(mktemp -d "$CACHE_DIR/smoke.XXXXXX")"
 smoke_user="$(systemctl show -p User --value "$LOCAL_SERVICE")"
@@ -361,10 +459,27 @@ chmod 0750 "$smoke"
 cat >"$smoke/smoke.rs" <<'RS'
 pub fn smoke(x: u64) -> u64 { x.rotate_left(7) ^ 0x5cca_c4e0 }
 RS
-"$LIVE" /opt/toolchains/rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc \
-    "$smoke/smoke.rs" --crate-name sccache_autoupdate_smoke --crate-type rlib \
-    --edition=2024 --emit=metadata,link --out-dir "$smoke"
-test -s "$smoke/libsccache_autoupdate_smoke.rlib"
+[[ -x "$SMOKE_RUSTC" ]] || { echo "sccache-release-update: smoke rustc not executable: $SMOKE_RUSTC" >&2; false; }
+smoke_crate="sccache_autoupdate_smoke_$(date +%s)_$$"
+(
+    cd "$smoke"
+    SCCACHE_RECACHE=1 "$LIVE" "$SMOKE_RUSTC" \
+        "$smoke/smoke.rs" --crate-name "$smoke_crate" --crate-type rlib \
+        --edition=2024 --emit=metadata,link --out-dir "$smoke"
+)
+test -s "$smoke/lib${smoke_crate}.rlib"
+if [[ "$VERIFY_DIST_SMOKE" == 1 && $dist_was_active -eq 1 ]]; then
+    dist_smoke_after="$(dist_success_total)"
+    (( dist_smoke_after > dist_smoke_before )) || {
+        echo "sccache-release-update: forced smoke did not complete on a distributed worker" >&2
+        "$LIVE" --show-adv-stats >&2 || true
+        false
+    }
+    dist_num_servers >/dev/null || {
+        echo "sccache-release-update: scheduler unhealthy after distributed smoke" >&2
+        false
+    }
+fi
 rm -rf "$smoke"
 
 printf '%s\n' "$tag" > "$STATE_DIR/release_tag"

@@ -18,6 +18,15 @@ grep -F 'smoke_user="$(systemctl show -p User --value "$LOCAL_SERVICE")"' "$HERE
 grep -F 'smoke_group="$(systemctl show -p Group --value "$LOCAL_SERVICE")"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'chown "$smoke_user:$smoke_group" "$smoke"' "$HERE/sccache-release-update" >/dev/null
 grep -F '[[ -z "$smoke" ]] || rm -rf -- "$smoke"' "$HERE/sccache-release-update" >/dev/null
+grep -F -- '--continue-at -' "$HERE/sccache-release-update" >/dev/null
+grep -F '/api/v1/scheduler/status' "$HERE/sccache-release-update" >/dev/null
+grep -F 'systemctl is-active --quiet "$LOCAL_SERVICE"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE' "$HERE/sccache-release-update" >/dev/null
+if rg -n '(^|[[:space:]])nc -z' "$HERE/sccache-release-update" >/dev/null; then
+    echo "sccache updater must not require netcat" >&2
+    exit 1
+fi
 
 # Rollback must restore the scheduler before the local daemon so a reverted
 # client does not enter reconnect backoff against a scheduler that is still down.
@@ -25,7 +34,7 @@ awk '
     /^rollback\(\) \{/ { in_rollback = 1; next }
     in_rollback && /^}/ { exit }
     in_rollback && /systemctl start "\$DIST_SERVICE"/ && !dist_start { dist_start = NR }
-    in_rollback && /nc -z -w1 "\$SCHEDULER_HOST" "\$SCHEDULER_PORT"/ && !scheduler_ready { scheduler_ready = NR }
+    in_rollback && /tcp_ready "\$SCHEDULER_HOST" "\$SCHEDULER_PORT"/ && !scheduler_ready { scheduler_ready = NR }
     in_rollback && /systemctl start "\$LOCAL_SERVICE"/ && !local_start { local_start = NR }
     END {
         if (!(dist_start && scheduler_ready && local_start &&

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE=${1:-sync}
+CONFIG=${SCCACHE_SCHEDULER_CONFIG:-/etc/sccache-dist/scheduler.conf}
+STATE=${SCCACHE_CLIENT_TOKEN_STATE:-/run/sccache-dist/client-token.loaded}
+LOCK=${SCCACHE_CLIENT_TOKEN_LOCK:-/run/sccache-dist/client-token-sync.lock}
+SSH_KEY=${SCCACHE_LAPTOP_SSH_KEY:-/opt/sentinelx-cloud-core/.ssh/sf314-42_ed25519}
+KNOWN_HOSTS=${SCCACHE_LAPTOP_KNOWN_HOSTS:-/opt/sentinelx-cloud-core/.ssh/known_hosts}
+LAPTOP=${SCCACHE_LAPTOP_SSH_TARGET:-root@100.118.45.4}
+RECEIVER=${SCCACHE_LAPTOP_RECEIVER:-/usr/local/sbin/sccache-client-token-receive}
+
+case "$MODE" in
+    scheduler-start|sync) ;;
+    *)
+        echo "usage: sccache-client-token-sync [scheduler-start|sync]" >&2
+        exit 2
+        ;;
+esac
+
+exec 9>"$LOCK"
+flock -n 9 || exit 0
+
+if [[ "$MODE" == scheduler-start ]]; then
+    tmp="$STATE.tmp.$$"
+    trap 'rm -f "$tmp"' EXIT
+    umask 077
+    /usr/local/bin/uv run --no-project python -c '
+import sys
+import tomllib
+with open(sys.argv[1], "rb") as f:
+    cfg = tomllib.load(f)
+token = cfg["client_auth"]["token"]
+if not isinstance(token, str) or not token or any(c in token for c in "\r\n"):
+    raise SystemExit("invalid scheduler client token")
+sys.stdout.write(token + "\n")
+' "$CONFIG" >"$tmp"
+    mv -f "$tmp" "$STATE"
+    trap - EXIT
+fi
+
+if [[ ! -s "$STATE" ]]; then
+    echo "sccache-client-token-sync: no loaded scheduler credential snapshot yet; deferring"
+    exit 0
+fi
+
+result=$(
+    ssh \
+        -i "$SSH_KEY" \
+        -o IdentitiesOnly=yes \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o StrictHostKeyChecking=yes \
+        "$LAPTOP" "$RECEIVER" <"$STATE"
+)
+echo "sccache-client-token-sync: laptop ${result:-completed}"

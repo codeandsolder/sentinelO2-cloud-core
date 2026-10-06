@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry laptop sccache client-credential synchronization
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=sccache-client-token-sync.service
+
+[Install]
+WantedBy=timers.target
