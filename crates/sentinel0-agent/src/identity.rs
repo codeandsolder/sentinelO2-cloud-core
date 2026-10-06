@@ -39,10 +39,6 @@ pub enum IdentityError {
         "enrollment token in {path} contains whitespace — copy the token as one unbroken string"
     )]
     WhitespaceToken { path: PathBuf },
-    #[error(
-        "enrollment token in {path} is not a well-formed token (expected three dot-separated parts)"
-    )]
-    MalformedToken { path: PathBuf },
 }
 
 #[derive(Deserialize)]
@@ -69,14 +65,6 @@ fn validate_token(token: &str, path: &Path) -> Result<String, IdentityError> {
     }
     if token.chars().any(char::is_whitespace) {
         return Err(IdentityError::WhitespaceToken { path: path.into() });
-    }
-    let mut parts = token.split('.');
-    let shape_ok = matches!(
-        (parts.next(), parts.next(), parts.next(), parts.next()),
-        (Some(a), Some(b), Some(c), None) if !a.is_empty() && !b.is_empty() && !c.is_empty()
-    );
-    if !shape_ok {
-        return Err(IdentityError::MalformedToken { path: path.into() });
     }
     Ok(token)
 }
@@ -137,7 +125,7 @@ mod tests {
     #[test]
     fn valid_identity_trims_scalar_fields() -> TestResult {
         let (_dir, path) = write(
-            r#"{"host_id":" host_1 ","token":" aaa.bbb.ccc \n","hub":" https://hub.example "}"#,
+            r#"{"host_id":" host_1 ","token":" opaque-enrollment-token \n","hub":" https://hub.example "}"#,
         )?;
         let identity = load_identity(&path).test_value()?;
         assert_eq!(identity.host_id, "host_1");
@@ -148,8 +136,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tokens_fail_before_network_use() -> TestResult {
-        for token in ["", "one.two", "one..three", "one two.three.four", "ą.b.c"] {
+    fn unsafe_tokens_fail_before_network_use() -> TestResult {
+        for token in ["", "one two", "ą"] {
             let (_dir, path) = write(&format!(
                 r#"{{"host_id":"h","token":"{token}","hub":"https://hub"}}"#
             ))?;
