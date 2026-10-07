@@ -147,15 +147,24 @@ fn maybe_trim(path: &Path) -> std::io::Result<()> {
     replace
 }
 
-pub fn record(
-    op: &str,
-    payload: &Map<String, Value>,
-    dispatch_ok: bool,
-    error: Option<&str>,
-    duration_ms: u64,
-    result_ok: Option<bool>,
-    result_returncode: Option<i64>,
-) {
+pub(crate) struct RecordMeta<'a> {
+    pub opaque_ref: Option<&'a str>,
+    pub dispatch_ok: bool,
+    pub error: Option<&'a str>,
+    pub duration_ms: u64,
+    pub result_ok: Option<bool>,
+    pub result_returncode: Option<i64>,
+}
+
+pub(crate) fn record(op: &str, payload: &Map<String, Value>, meta: RecordMeta<'_>) {
+    let RecordMeta {
+        opaque_ref,
+        dispatch_ok,
+        error,
+        duration_ms,
+        result_ok,
+        result_returncode,
+    } = meta;
     if matches!(op, "read_audit" | "ping") {
         return;
     }
@@ -181,6 +190,9 @@ pub fn record(
             "duration_ms": duration_ms,
         });
         if let Some(map) = entry.as_object_mut() {
+            if let Some(opaque_ref) = opaque_ref {
+                map.insert("opaque_ref".into(), Value::String(opaque_ref.to_owned()));
+            }
             if let Some(value) = result_ok {
                 map.insert("result_ok".into(), Value::Bool(value));
             }

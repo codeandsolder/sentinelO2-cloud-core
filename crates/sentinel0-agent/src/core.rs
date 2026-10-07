@@ -1,5 +1,5 @@
 use crate::{
-    DispatchResponse, Dispatcher, edit, fileops,
+    DispatchContext, DispatchResponse, Dispatcher, edit, fileops,
     handler_error::{HandlerError, HandlerResult, require_str},
     host,
     policy::Policy,
@@ -1028,8 +1028,14 @@ impl CoreDispatcher {
     }
 }
 
-impl Dispatcher for CoreDispatcher {
-    async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> DispatchResponse {
+impl CoreDispatcher {
+    async fn dispatch_inner(
+        &self,
+        id: &str,
+        op: Op,
+        payload: Map<String, Value>,
+        context: DispatchContext,
+    ) -> DispatchResponse {
         if !self.op_enabled(op) {
             return DispatchResponse::message(Self::response(
                 id,
@@ -1116,11 +1122,14 @@ impl Dispatcher for CoreDispatcher {
             crate::local_audit::record(
                 &op_name,
                 &audit_payload,
-                dispatch_ok,
-                error.as_deref(),
-                duration_ms,
-                result_ok,
-                result_returncode,
+                crate::local_audit::RecordMeta {
+                    opaque_ref: context.opaque_ref.as_deref(),
+                    dispatch_ok,
+                    error: error.as_deref(),
+                    duration_ms,
+                    result_ok,
+                    result_returncode,
+                },
             );
         });
         if let Err(error) = audit_task.await {
@@ -1130,6 +1139,23 @@ impl Dispatcher for CoreDispatcher {
             Some(frame) => DispatchResponse::with_binary(message, frame),
             None => DispatchResponse::message(message),
         }
+    }
+}
+
+impl Dispatcher for CoreDispatcher {
+    async fn dispatch(&self, id: &str, op: Op, payload: Map<String, Value>) -> DispatchResponse {
+        self.dispatch_inner(id, op, payload, DispatchContext::default())
+            .await
+    }
+
+    async fn dispatch_with_context(
+        &self,
+        id: &str,
+        op: Op,
+        payload: Map<String, Value>,
+        context: DispatchContext,
+    ) -> DispatchResponse {
+        self.dispatch_inner(id, op, payload, context).await
     }
 }
 

@@ -247,6 +247,11 @@ impl DispatchResponse {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchContext {
+    pub opaque_ref: Option<String>,
+}
+
 pub trait Dispatcher: Send + Sync + 'static {
     fn dispatch(
         &self,
@@ -254,6 +259,24 @@ pub trait Dispatcher: Send + Sync + 'static {
         op: Op,
         payload: serde_json::Map<String, serde_json::Value>,
     ) -> impl std::future::Future<Output = DispatchResponse> + Send;
+
+    fn dispatch_with_context(
+        &self,
+        id: &str,
+        op: Op,
+        payload: serde_json::Map<String, serde_json::Value>,
+        _context: DispatchContext,
+    ) -> impl std::future::Future<Output = DispatchResponse> + Send {
+        self.dispatch(id, op, payload)
+    }
+}
+
+struct RequestWork {
+    id: String,
+    op: Op,
+    payload: serde_json::Map<String, serde_json::Value>,
+    context: DispatchContext,
+    received_at: f64,
 }
 
 #[derive(Debug, Default)]
@@ -555,14 +578,19 @@ impl<D: Dispatcher> Agent<D> {
         &self,
         tasks: &mut JoinSet<()>,
         response_tx: mpsc::Sender<Outbound>,
-        id: String,
-        op: Op,
-        payload: serde_json::Map<String, serde_json::Value>,
-        received_at: f64,
+        request: RequestWork,
     ) {
         let dispatcher = Arc::clone(&self.dispatcher);
         tasks.spawn(async move {
-            let mut dispatch_response = dispatch_safely(dispatcher, id.clone(), op, payload).await;
+            let RequestWork {
+                id,
+                op,
+                payload,
+                context,
+                received_at,
+            } = request;
+            let mut dispatch_response =
+                dispatch_safely(dispatcher, id.clone(), op, payload, context).await;
             if let Message::Response {
                 result: Some(result),
                 ..
@@ -628,12 +656,10 @@ impl<D: Dispatcher> Agent<D> {
         ws: &mut AgentWebSocket,
         tasks: &mut JoinSet<()>,
         response_tx: mpsc::Sender<Outbound>,
-        id: String,
-        op: Op,
-        payload: serde_json::Map<String, serde_json::Value>,
+        request: RequestWork,
     ) -> Result<bool, AgentError> {
-        let job_id = Self::background_job_id(&payload);
-        let mut ack = self.background_ack(id.clone(), op, &job_id);
+        let job_id = Self::background_job_id(&request.payload);
+        let mut ack = self.background_ack(request.id.clone(), request.op, &job_id);
         add_response_time(&mut ack);
         if ws
             .send(WsMessage::Text(serde_json::to_string(&ack)?.into()))
@@ -649,7 +675,15 @@ impl<D: Dispatcher> Agent<D> {
         let upload_base = self.config.upload_base.clone();
         let pending_ready = Arc::clone(&self.pending_ready);
         tasks.spawn(async move {
-            let dispatch_response = dispatch_safely(dispatcher, id.clone(), op, payload).await;
+            let RequestWork {
+                id,
+                op,
+                payload,
+                context,
+                ..
+            } = request;
+            let dispatch_response =
+                dispatch_safely(dispatcher, id.clone(), op, payload, context).await;
             let mut response = if dispatch_response.binary_frame.is_some() {
                 Message::Response {
                     id: id.clone(),
@@ -731,16 +765,14 @@ impl<D: Dispatcher> Agent<D> {
         ws: &mut AgentWebSocket,
         tasks: &mut JoinSet<()>,
         response_tx: &mpsc::Sender<Outbound>,
-        id: String,
-        op: Op,
-        payload: BTreeMap<String, serde_json::Value>,
+        request: RequestWork,
     ) -> Result<bool, AgentError> {
         if tasks.len() >= MAX_IN_FLIGHT_TASKS {
-            let response = overloaded_response(id, tasks.len());
+            let response = overloaded_response(request.id, tasks.len());
             warn!(
                 in_flight = tasks.len(),
                 limit = MAX_IN_FLIGHT_TASKS,
-                %op,
+                op = %request.op,
                 "rejecting request while agent is overloaded"
             );
             return Ok(ws
@@ -748,16 +780,15 @@ impl<D: Dispatcher> Agent<D> {
                 .await
                 .is_ok());
         }
-        let received_at = unix_time_seconds();
-        let background = payload
+        let background = request
+            .payload
             .get("background")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let payload = payload.into_iter().collect();
 
-        if background && op == Op::FileExportChunk {
+        if background && request.op == Op::FileExportChunk {
             let response = Message::Response {
-                id,
+                id: request.id,
                 ok: false,
                 result: None,
                 error: Some(sentinel0_proto::ResponseError {
@@ -774,10 +805,10 @@ impl<D: Dispatcher> Agent<D> {
                 .is_ok());
         }
         if background {
-            self.start_background_request(ws, tasks, response_tx.clone(), id, op, payload)
+            self.start_background_request(ws, tasks, response_tx.clone(), request)
                 .await
         } else {
-            self.spawn_foreground_request(tasks, response_tx.clone(), id, op, payload, received_at);
+            self.spawn_foreground_request(tasks, response_tx.clone(), request);
             Ok(true)
         }
     }
@@ -915,12 +946,20 @@ impl<D: Dispatcher> Agent<D> {
                 }
             }
             Message::Request {
-                id, op, payload, ..
+                id,
+                op,
+                payload,
+                opaque_ref,
+                ..
             } => {
-                if !self
-                    .handle_request(ws, tasks, response_tx, id, op, payload)
-                    .await?
-                {
+                let request = RequestWork {
+                    id,
+                    op,
+                    payload: payload.into_iter().collect(),
+                    context: DispatchContext { opaque_ref },
+                    received_at: unix_time_seconds(),
+                };
+                if !self.handle_request(ws, tasks, response_tx, request).await? {
                     return Ok(Some(SessionEnd::Lost(None)));
                 }
             }
@@ -1064,8 +1103,9 @@ async fn dispatch_safely<D: Dispatcher>(
     id: String,
     op: Op,
     payload: serde_json::Map<String, serde_json::Value>,
+    context: DispatchContext,
 ) -> DispatchResponse {
-    AssertUnwindSafe(dispatcher.dispatch(&id, op, payload))
+    AssertUnwindSafe(dispatcher.dispatch_with_context(&id, op, payload, context))
         .catch_unwind()
         .await
         .unwrap_or_else(|_| {
