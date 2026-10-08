@@ -147,6 +147,7 @@ fn maybe_trim(path: &Path) -> std::io::Result<()> {
     replace
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct RecordMeta<'a> {
     pub opaque_ref: Option<&'a str>,
     pub dispatch_ok: bool,

@@ -1029,6 +1029,34 @@ impl CoreDispatcher {
 }
 
 impl CoreDispatcher {
+    fn audit_fields(message: &Message) -> (bool, Option<String>, Option<bool>, Option<i64>) {
+        let Message::Response {
+            ok, result, error, ..
+        } = message
+        else {
+            return (
+                false,
+                Some("internal_error: non-response dispatch result".into()),
+                None,
+                None,
+            );
+        };
+        (
+            *ok,
+            error
+                .as_ref()
+                .map(|error| format!("{}: {}", error.code, error.message)),
+            result
+                .as_ref()
+                .and_then(|result| result.get("ok"))
+                .and_then(Value::as_bool),
+            result
+                .as_ref()
+                .and_then(|result| result.get("returncode"))
+                .and_then(Value::as_i64),
+        )
+    }
+
     async fn dispatch_inner(
         &self,
         id: &str,
@@ -1092,30 +1120,7 @@ impl CoreDispatcher {
         };
 
         let message = Self::response(id, result);
-        let (dispatch_ok, error, result_ok, result_returncode) = match &message {
-            Message::Response {
-                ok, result, error, ..
-            } => (
-                *ok,
-                error
-                    .as_ref()
-                    .map(|error| format!("{}: {}", error.code, error.message)),
-                result
-                    .as_ref()
-                    .and_then(|result| result.get("ok"))
-                    .and_then(Value::as_bool),
-                result
-                    .as_ref()
-                    .and_then(|result| result.get("returncode"))
-                    .and_then(Value::as_i64),
-            ),
-            _ => (
-                false,
-                Some("internal_error: non-response dispatch result".into()),
-                None,
-                None,
-            ),
-        };
+        let (dispatch_ok, error, result_ok, result_returncode) = Self::audit_fields(&message);
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let op_name = op.as_str().to_owned();
         let audit_task = tokio::task::spawn_blocking(move || {
