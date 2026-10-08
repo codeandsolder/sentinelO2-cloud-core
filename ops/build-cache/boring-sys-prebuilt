@@ -19,7 +19,7 @@ SEED_OUT=${3:-}
 CACHE_ROOT=${BORING_BSSL_CACHE_ROOT:-${SENTINELX_BORING_SYS_CACHE_ROOT:-/srv/scratch/toolchains/boring-sys-prebuilt}}
 BUILD_ROOT=${SENTINELX_BORING_SYS_BUILD_ROOT:-/srv/scratch/toolchains/boring-sys-build}
 CARGO_WRAPPER=${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/libexec/sentinelx-bin/cargo}
-RUST_TOOLCHAIN=${SENTINELX_RUST_TOOLCHAIN:-1.98.1}
+RUST_TOOLCHAIN=${SENTINELX_RUST_TOOLCHAIN:-1.99.0}
 mkdir -p "$CACHE_ROOT"
 
 lock_entry="$(

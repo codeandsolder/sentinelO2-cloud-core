@@ -170,6 +170,9 @@ fake_cargo="$tmp/fake-cargo"
 cat >"$fake_cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n "${FAKE_TOOLCHAIN_PROBE:-}" ]]; then
+    printf '%s\n' "${RUSTUP_TOOLCHAIN:-}" >"$FAKE_TOOLCHAIN_PROBE"
+fi
 if [[ " $* " == *" locate-project "* ]]; then
     if [[ -n "${FAKE_LOCATE_ARGS_PROBE:-}" ]]; then
         printf '%s\n' "$*" >"$FAKE_LOCATE_ARGS_PROBE"
@@ -218,6 +221,18 @@ exit 0
 EOF
 chmod +x "$fake_cargo"
 
+fake_rustup="$tmp/fake-rustup"
+cat >"$fake_rustup" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "show active-toolchain" ]]; then
+    printf '%s\n' '1.99.0-x86_64-unknown-linux-gnu (default)'
+    exit 0
+fi
+exit 64
+EOF
+chmod +x "$fake_rustup"
+
 probe="$tmp/probe-pruner"
 cat >"$probe" <<'EOF'
 #!/usr/bin/env bash
@@ -257,6 +272,7 @@ chmod +x "$offline_ready"
 wrapper_conf="$tmp/wrapper.conf"
 cat >"$wrapper_conf" <<EOF
 SENTINELX_REAL_CARGO=$fake_cargo
+SENTINELX_RUSTUP=$fake_rustup
 SENTINELX_CARGO_TARGET_ROOT=$wrapper_root
 SENTINELX_CARGO_TARGET_LOCK_ROOT=$wrapper_locks
 SENTINELX_CARGO_TARGET_PRUNER=$probe
@@ -278,12 +294,14 @@ probe_started="$tmp/probe-started"
 probe_release="$tmp/probe-release"
 probe_done="$tmp/probe-done"
 warm_probe="$tmp/warm-probe"
+toolchain_probe="$tmp/toolchain-probe"
 cmake_c_probe="$tmp/cmake-c-probe"
 cmake_cxx_probe="$tmp/cmake-cxx-probe"
 (
     cd "$workspace"
     FAKE_WORKSPACE="$workspace" \
     FAKE_WARM_PROBE="$warm_probe" \
+    FAKE_TOOLCHAIN_PROBE="$toolchain_probe" \
     FAKE_CMAKE_C_PROBE="$cmake_c_probe" \
     FAKE_CMAKE_CXX_PROBE="$cmake_cxx_probe" \
     PROBE_STARTED="$probe_started" \
@@ -307,6 +325,17 @@ wait_for_file "$probe_done"
 [[ -z "$(find "$wrapper_root" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]]
 [[ "$(cat "$cmake_c_probe")" == "$native_launcher" ]]
 [[ "$(cat "$cmake_cxx_probe")" == "$native_launcher" ]]
+[[ "$(cat "$toolchain_probe")" == "1.99.0-x86_64-unknown-linux-gnu" ]]
+
+explicit_toolchain_probe="$tmp/explicit-toolchain-probe"
+(
+    cd "$workspace"
+    FAKE_WORKSPACE="$workspace" \
+    FAKE_TOOLCHAIN_PROBE="$explicit_toolchain_probe" \
+    SENTINELX_BUILD_SCRATCH_CONF="$wrapper_conf" \
+    "$WRAPPER" +1.97.0 metadata
+)
+[[ "$(cat "$explicit_toolchain_probe")" == "1.97.0" ]]
 
 # A second invocation must see the retained source pool as warm.
 (

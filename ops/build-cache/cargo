@@ -31,6 +31,16 @@ if (( ${#cargo_args[@]} )) && [[ "${cargo_args[0]}" == +* ]]; then
     export RUSTUP_TOOLCHAIN="$toolchain"
 fi
 
+if [[ -z "${RUSTUP_TOOLCHAIN:-}" ]]; then
+    rustup_cmd="${SENTINELX_RUSTUP:-rustup}"
+    if command -v "$rustup_cmd" >/dev/null 2>&1; then
+        active_toolchain="$("$rustup_cmd" show active-toolchain 2>/dev/null | awk '{print $1}' || true)"
+        if [[ -n "$active_toolchain" ]]; then
+            export RUSTUP_TOOLCHAIN="$active_toolchain"
+        fi
+    fi
+fi
+
 export EPHEMERAL_CARGO_WRAPPER="${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/libexec/sentinelx-bin/cargo}"
 export CARGO="$EPHEMERAL_CARGO_WRAPPER"
 
