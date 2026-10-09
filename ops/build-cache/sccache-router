@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${SCCACHE_SERVER_PORT:-}" ]]; then
+    if (( EUID == 0 )); then
+        export SCCACHE_SERVER_PORT=4227
+    else
+        export SCCACHE_SERVER_PORT=4226
+    fi
+fi
+
+# Daemon units explicitly set this to 1. Ordinary CLI/compiler-wrapper
+# invocations must never create an unsupervised daemon.
+export SCCACHE_START_SERVER="${SCCACHE_START_SERVER:-0}"
+
+exec /usr/local/libexec/sccache-bin/sccache "$@"

@@ -8,6 +8,18 @@ if (( EUID != 0 )); then
     exit 2
 fi
 
+install -d -o root -g root -m 0755 /usr/local/libexec/sccache-bin
+# Keep the managed ELF separate from the public CLI path. The public router
+# selects the correct per-user daemon and disables accidental daemon autostart.
+if [[ ! -x /usr/local/libexec/sccache-bin/sccache ]]; then
+    [[ -x /usr/local/bin/sccache ]] || {
+        echo "install-sccache-autoupdate: no existing sccache binary to migrate" >&2
+        exit 1
+    }
+    install -o root -g root -m 0755 /usr/local/bin/sccache /usr/local/libexec/sccache-bin/sccache
+fi
+install -o root -g root -m 0755 "$HERE/sccache-router" /usr/local/bin/sccache
+install -o root -g root -m 0755 "$HERE/sccache-client" /usr/local/libexec/sccache-client
 install -o root -g root -m 0755 "$HERE/sccache-release-update" /usr/local/libexec/sccache-release-update
 install -o root -g root -m 0755 "$HERE/sccache-dist-client-preflight" /usr/local/libexec/sccache-dist-client-preflight
 install -o root -g root -m 0644 "$HERE/sccache-release-update.service" /etc/systemd/system/sccache-release-update.service

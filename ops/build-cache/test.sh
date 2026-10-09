@@ -9,7 +9,7 @@ BSSL_PREBUILT="$HERE/boring-sys-prebuilt"
 
 # Keep all shipped shell helpers under the maintenance-scripts CI lane even
 # when a test below does not execute a root/systemd-only code path.
-bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$BSSL_PREBUILT"     "$HERE/sccache-release-update"     "$HERE/sccache-dist-client-preflight"     "$HERE/install-sccache-autoupdate"
+bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$BSSL_PREBUILT"     "$HERE/sccache-release-update"     "$HERE/sccache-dist-client-preflight"     "$HERE/sccache-router"     "$HERE/sccache-client"     "$HERE/install-sccache-autoupdate"
 
 # The updater runs as root while the shared compiler daemon runs as the service
 # user. Its post-swap smoke directory must therefore be handed to the daemon,
@@ -23,6 +23,11 @@ grep -F '/api/v1/scheduler/status' "$HERE/sccache-release-update" >/dev/null
 grep -F 'systemctl is-active --quiet "$LOCAL_SERVICE"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE' "$HERE/sccache-release-update" >/dev/null
+grep -F 'LIVE="${SCCACHE_AUTOUPDATE_LIVE:-/usr/local/libexec/sccache-bin/sccache}"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'SCCACHE_SERVER_PORT="$CLIENT_PORT" SCCACHE_START_SERVER=0 "$LIVE" "$@"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'export SCCACHE_START_SERVER="${SCCACHE_START_SERVER:-0}"' "$HERE/sccache-router" >/dev/null
+grep -F 'exec /usr/local/libexec/sccache-bin/sccache "$@"' "$HERE/sccache-router" >/dev/null
+grep -F 'exec /usr/local/libexec/sccache-bin/sccache "${args[@]}"' "$HERE/sccache-client" >/dev/null
 if rg -n '(^|[[:space:]])nc -z' "$HERE/sccache-release-update" >/dev/null; then
     echo "sccache updater must not require netcat" >&2
     exit 1
