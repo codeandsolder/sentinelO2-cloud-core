@@ -118,7 +118,8 @@ touch -d '@300' "$root/fresh/.last-used"
 touch -d '@50' "$root/stale/.last-used"
 before="$(du -s -B1 "$root" | awk '{print $1}')"
 stale_bytes="$(du -s -B1 "$root/stale" | awk '{print $1}')"
-max=$(( before - stale_bytes + 8192 ))
+# Keep the quota between the measured before/after sizes; do not assume a minimum allocated file size (ZFS may defer block accounting until a TXG commits).
+max=$(( before - stale_bytes / 2 ))
 conf="$tmp/lru.conf"
 write_pruner_conf "$root" "$locks" "$max" "$conf"
 SENTINELX_BUILD_SCRATCH_CONF="$conf" "$PRUNER"
@@ -134,7 +135,7 @@ touch -d '@10' "$root/locked/.last-used"
 touch -d '@20' "$root/evictable/.last-used"
 before="$(du -s -B1 "$root" | awk '{print $1}')"
 evictable_bytes="$(du -s -B1 "$root/evictable" | awk '{print $1}')"
-max=$(( before - evictable_bytes + 8192 ))
+max=$(( before - evictable_bytes / 2 ))
 write_pruner_conf "$root" "$locks" "$max" "$conf"
 exec 9>"$locks/locked.lock"
 flock -s 9
