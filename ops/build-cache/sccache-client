@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -z "${SCCACHE_SERVER_PORT:-}" ]]; then
+  if (( EUID == 0 )); then
+    export SCCACHE_SERVER_PORT=4227
+  else
+    export SCCACHE_SERVER_PORT=4226
+  fi
+fi
+export SCCACHE_START_SERVER=0
+export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1
+args=("$@")
+if (( ${#args[@]} )) && [[ "${args[0]}" == "rustc" ]]; then
+  resolved_rustc="$(/usr/bin/rustup which rustc)"
+  args[0]="$resolved_rustc"
+fi
+if [[ -z "${SCCACHE_CANONICAL_BUILD_ROOT:-}" || -z "${SCCACHE_CANONICAL_TARGET_ROOT:-}" ]]; then
+  out_dir=""
+  for ((i=0; i<${#args[@]}; i++)); do
+    case "${args[i]}" in
+      --out-dir)
+        if (( i+1 < ${#args[@]} )); then out_dir="${args[i+1]}"; fi
+        ;;
+      --out-dir=*) out_dir="${args[i]#--out-dir=}" ;;
+    esac
+  done
+  build_root=""
+  target_root=""
+  if [[ "$out_dir" == /home/jan/projects/* ]]; then
+    probe="$out_dir"
+    while [[ "$probe" == /home/jan/projects/* ]]; do
+      if [[ "${probe##*/}" == "target" ]]; then
+        target_root="$probe"
+        build_root="${probe%/target}"
+        break
+      fi
+      parent="${probe%/*}"
+      [[ "$parent" == "$probe" ]] && break
+      probe="$parent"
+    done
+  fi
+  if [[ -z "$build_root" && "$PWD" == /home/jan/projects/* ]]; then
+    rel="${PWD#/home/jan/projects/}"
+    repo="${rel%%/*}"
+    build_root="/home/jan/projects/$repo"
+    target_root="$build_root/target"
+  fi
+  if [[ -n "$build_root" ]]; then
+    export SCCACHE_CANONICAL_BUILD_ROOT="${SCCACHE_CANONICAL_BUILD_ROOT:-$build_root}"
+    export SCCACHE_CANONICAL_TARGET_ROOT="${SCCACHE_CANONICAL_TARGET_ROOT:-$target_root}"
+  fi
+fi
+exec /usr/local/libexec/sccache-bin/sccache "${args[@]}"
