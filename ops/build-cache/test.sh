@@ -23,6 +23,9 @@ grep -F '/api/v1/scheduler/status' "$HERE/sccache-release-update" >/dev/null
 grep -F 'systemctl is-active --quiet "$LOCAL_SERVICE"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE' "$HERE/sccache-release-update" >/dev/null
+grep -F 'ROOT_LOCAL_SERVICE="${SCCACHE_AUTOUPDATE_ROOT_LOCAL_SERVICE:-sccache-local-root.service}"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'systemctl start "$ROOT_LOCAL_SERVICE"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'tcp_ready 127.0.0.1 "$ROOT_CLIENT_PORT"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'LIVE="${SCCACHE_AUTOUPDATE_LIVE:-/usr/local/libexec/sccache-bin/sccache}"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'SCCACHE_SERVER_PORT="$CLIENT_PORT" SCCACHE_START_SERVER=0 "$LIVE" "$@"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'export SCCACHE_START_SERVER="${SCCACHE_START_SERVER:-0}"' "$HERE/sccache-router" >/dev/null
