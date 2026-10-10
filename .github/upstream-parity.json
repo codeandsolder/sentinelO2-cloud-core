@@ -8,7 +8,7 @@
   "protocol": {
     "repo": "pensados/sentinelx-cloud-protocol",
     "branch": "main",
-    "reviewed_sha": "df753ca4a73c919b7e467734c524e9a068634e1b",
-    "reviewed_version": "1.13.0"
+    "reviewed_sha": "00169f8fddbab11082f7ff0f24ef5c7e321c9a47",
+    "reviewed_version": "1.13.2"
   }
 }

@@ -17,6 +17,6 @@
     "os": "linux"
   },
   "preferred_profile": null,
-  "protocol_version": "1.13.0",
+  "protocol_version": "1.13.2",
   "type": "hello"
 }

@@ -232,6 +232,21 @@ for name, response, soft_limit in [
          "result": {"numbers": list(range(3000))}},
         4096,
     ),
+    (
+        "large_list_of_objects",
+        {"type": "response", "id": "bound_5", "ok": True,
+         "result": {"items": [{"id": i, "kind": "fixture"} for i in range(200)],
+                    "summary": "keep"}},
+        4096,
+    ),
+    (
+        "large_dict_result",
+        {"type": "response", "id": "bound_6", "ok": True,
+         "result": {"services": {f"svc-{i:04}": {"status": "ok", "n": i}
+                                  for i in range(200)},
+                    "summary": "keep"}},
+        4096,
+    ),
 ]:
     original = json.loads(json.dumps(response))
     bounded, meta = bound_response(response, soft_limit=soft_limit)
