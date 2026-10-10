@@ -11,7 +11,7 @@ reviewer policy, MQTT/QUIC and other 2.0 ideas stay out of this implementation
 until the drop-in replacement has been used in anger.
 
 The Rust agent implements the full 31-op SentinelX protocol surface and the
-reviewed Linux feature set through upstream core 0.19.3 / protocol 1.13.0,
+reviewed Linux feature set through upstream core 0.23.13 / protocol 1.13.2,
 including binary cross-host transfer, direct rw-path transfer landing, durable
 background completion, progressive help/capabilities, native structured edit,
 git, upload/export, local audit, service control and local-api `run_as`. It

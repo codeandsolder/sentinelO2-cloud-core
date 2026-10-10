@@ -21,6 +21,7 @@ use walkdir::WalkDir;
 const PROBE: usize = 8192;
 const PREVIEW_CHARS: usize = 200;
 const MAX_SEARCH_ERRORS: usize = 32;
+const UNREADABLE_CAP: usize = 50;
 pub(crate) const FILEOPS_TIME_BUDGET: Duration = Duration::from_secs(50);
 const NOT_STARTED_NOTE: &str = "Other scans kept every scan worker busy until the time budget ran out, so this one did not start. Retry it, or narrow the path or glob.";
 const SKIP_DIRS: &[&str] = &[
@@ -76,6 +77,69 @@ fn access_error(raw: &str, error: &std::io::Error) -> HandlerError {
             format!("cannot access {raw:?}: {error}"),
         ),
         _ => HandlerError::new("io_error", format!("cannot access {raw:?}: {error}")),
+    }
+}
+
+fn cannot_list_error(raw: &str) -> HandlerError {
+    HandlerError::new(
+        "permission_denied",
+        format!(
+            "cannot list {raw:?}: the agent OS user can reach this directory but cannot read its contents, so they are unknown (not empty); read/list/search never use sudo"
+        ),
+    )
+}
+
+fn partial_note(dirs: usize, items: u64, item_word: &str, absence: &str) -> String {
+    let mut parts = Vec::new();
+    if dirs != 0 {
+        parts.push(format!(
+            "{dirs} director{} (see unreadable_dirs)",
+            if dirs == 1 { "y" } else { "ies" }
+        ));
+    }
+    if items != 0 {
+        parts.push(format!(
+            "{items} {item_word}{}",
+            if items == 1 { "" } else { "s" }
+        ));
+    }
+    format!(
+        "Partial result: the agent OS user could not read {}. {absence} Grant read+execute to the agent user to see everything.",
+        parts.join(" and ")
+    )
+}
+
+fn record_unreadable_dir(root: &Path, path: &Path, dirs: &mut Vec<String>, count: &mut u64) {
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned();
+    if relative.is_empty() || dirs.contains(&relative) {
+        return;
+    }
+    *count = count.saturating_add(1);
+    if dirs.len() < UNREADABLE_CAP {
+        dirs.push(relative);
+    }
+}
+
+fn append_note(result: &mut BTreeMap<String, Value>, note: &str) {
+    let combined = result
+        .get("note")
+        .and_then(Value::as_str)
+        .map_or_else(|| note.to_owned(), |existing| format!("{existing} {note}"));
+    result.insert("note".into(), Value::String(combined));
+}
+
+fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            ignore_error_path(err)
+        }
+        ignore::Error::Partial(errors) => errors.iter().find_map(ignore_error_path),
+        _ => None,
     }
 }
 
@@ -518,12 +582,34 @@ fn list_not_started(root: &Path) -> BTreeMap<String, Value> {
     ])
 }
 
+#[derive(Default)]
+struct ListAccessGaps {
+    unreadable_dirs: Vec<String>,
+    unreadable_dir_count: u64,
+    uninspectable: u64,
+}
+
+struct ListOptions {
+    depth: usize,
+    hidden: bool,
+    pattern: Option<Pattern>,
+}
+
+#[derive(Default)]
+struct ListScanResult {
+    entries: Vec<Value>,
+    truncated: bool,
+    timed_out: bool,
+    gaps: ListAccessGaps,
+}
+
 fn finish_list_result(
     root: &Path,
     entries: Vec<Value>,
     truncated: bool,
     timed_out: bool,
     budget: Duration,
+    gaps: &ListAccessGaps,
 ) -> BTreeMap<String, Value> {
     let total = entries.len();
     let mut result = BTreeMap::from([
@@ -551,7 +637,157 @@ fn finish_list_result(
             Value::String("max_entries".into()),
         );
     }
+    if gaps.unreadable_dir_count != 0 || gaps.uninspectable != 0 {
+        result.insert("partial".into(), Value::Bool(true));
+        if !gaps.unreadable_dirs.is_empty() {
+            result.insert(
+                "unreadable_dirs".into(),
+                Value::Array(
+                    gaps.unreadable_dirs
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        append_note(
+            &mut result,
+            &partial_note(
+                usize::try_from(gaps.unreadable_dir_count).unwrap_or(usize::MAX),
+                gaps.uninspectable,
+                "entry shown as type unknown",
+                "A directory or entry missing from this listing may still exist.",
+            ),
+        );
+    }
     result
+}
+
+fn list_options(payload: &Map<String, Value>) -> Result<ListOptions, HandlerError> {
+    let depth = payload
+        .get("depth")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .clamp(1, 5);
+    let depth = usize::try_from(depth).unwrap_or(5);
+    let hidden = payload
+        .get("show_hidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let pattern = match payload.get("glob") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(Pattern::new(text).map_err(|error| {
+            HandlerError::new("invalid_payload", format!("invalid glob: {error}"))
+        })?),
+        _ => {
+            return Err(HandlerError::new(
+                "invalid_payload",
+                "glob must be a string",
+            ));
+        }
+    };
+    Ok(ListOptions {
+        depth,
+        hidden,
+        pattern,
+    })
+}
+
+fn scan_list(
+    policy: &Policy,
+    root: &Path,
+    raw: &str,
+    options: &ListOptions,
+    deadline: Instant,
+) -> Result<ListScanResult, HandlerError> {
+    let mut scan = ListScanResult::default();
+    for entry in WalkDir::new(root)
+        .min_depth(1)
+        .max_depth(options.depth)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !SKIP_DIRS.contains(&name.as_ref()) && (options.hidden || !name.starts_with('.'))
+        })
+    {
+        if Instant::now() >= deadline {
+            scan.timed_out = true;
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if error
+                    .io_error()
+                    .is_some_and(|io_error| io_error.kind() == io::ErrorKind::PermissionDenied)
+                {
+                    if let Some(path) = error.path() {
+                        if path == root {
+                            return Err(cannot_list_error(raw));
+                        }
+                        record_unreadable_dir(
+                            root,
+                            path,
+                            &mut scan.gaps.unreadable_dirs,
+                            &mut scan.gaps.unreadable_dir_count,
+                        );
+                    } else {
+                        scan.gaps.uninspectable = scan.gaps.uninspectable.saturating_add(1);
+                    }
+                }
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy();
+        if options
+            .pattern
+            .as_ref()
+            .is_some_and(|pattern| !pattern.matches(&name))
+        {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or_else(|_| entry.path())
+            .to_string_lossy()
+            .into_owned();
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|io_error| io_error.kind() == io::ErrorKind::PermissionDenied) =>
+            {
+                scan.gaps.uninspectable = scan.gaps.uninspectable.saturating_add(1);
+                scan.entries.push(serde_json::json!({
+                    "name": rel,
+                    "type": "unknown",
+                    "size": Value::Null,
+                    "mtime": Value::Null,
+                }));
+                if scan.entries.len() >= policy.file_ops_max_list_entries {
+                    scan.truncated = true;
+                    break;
+                }
+                continue;
+            }
+            Err(_) => continue,
+        };
+        scan.entries.push(serde_json::json!({
+            "name": rel,
+            "type": kind(&meta),
+            "size": meta.len(),
+            "mtime": mtime(&meta),
+        }));
+        if scan.entries.len() >= policy.file_ops_max_list_entries {
+            scan.truncated = true;
+            break;
+        }
+    }
+    Ok(scan)
 }
 
 pub(crate) fn list_until(
@@ -569,77 +805,26 @@ pub(crate) fn list_until(
             format!("{raw:?} is not a directory. Use read instead."),
         ));
     }
-
-    let depth = payload
-        .get("depth")
-        .and_then(Value::as_i64)
-        .unwrap_or(1)
-        .clamp(1, 5);
-    let depth = usize::try_from(depth).unwrap_or(5);
-    let hidden = payload
-        .get("show_hidden")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let pattern = match payload.get("glob") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(text)) => Some(
-            Pattern::new(text)
-                .map_err(|e| HandlerError::new("invalid_payload", format!("invalid glob: {e}")))?,
-        ),
-        _ => {
-            return Err(HandlerError::new(
-                "invalid_payload",
-                "glob must be a string",
-            ));
-        }
-    };
-
-    let mut entries = Vec::new();
-    let mut truncated = false;
-    let mut timed_out = false;
+    let options = list_options(payload)?;
     if Instant::now() > deadline {
         return Ok(list_not_started(&root));
     }
-    for entry in WalkDir::new(&root)
-        .min_depth(1)
-        .max_depth(depth)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !SKIP_DIRS.contains(&name.as_ref()) && (hidden || !name.starts_with('.'))
-        })
-    {
-        if Instant::now() >= deadline {
-            timed_out = true;
-            break;
+    match fs::read_dir(&root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return Err(cannot_list_error(raw));
         }
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name().to_string_lossy();
-        if pattern.as_ref().is_some_and(|p| !p.matches(&name)) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let rel = entry
-            .path()
-            .strip_prefix(&root)
-            .unwrap_or_else(|_| entry.path())
-            .to_string_lossy()
-            .into_owned();
-        entries.push(serde_json::json!({
-            "name": rel,
-            "type": kind(&meta),
-            "size": meta.len(),
-            "mtime": mtime(&meta),
-        }));
-        if entries.len() >= policy.file_ops_max_list_entries {
-            truncated = true;
-            break;
-        }
+        Err(error) => return Err(access_error(raw, &error)),
     }
 
+    let ListScanResult {
+        entries,
+        truncated,
+        timed_out,
+        gaps,
+    } = scan_list(policy, &root, raw, &options, deadline)?;
     Ok(finish_list_result(
-        &root, entries, truncated, timed_out, budget,
+        &root, entries, truncated, timed_out, budget, &gaps,
     ))
 }
 
@@ -655,6 +840,9 @@ struct SearchState {
     files_searched: u64,
     errors: Vec<Value>,
     error_count: u64,
+    unreadable_dirs: Vec<String>,
+    unreadable_dir_count: u64,
+    unreadable_files: u64,
     cap: usize,
     timed_out: bool,
 }
@@ -770,12 +958,16 @@ fn search_candidate(
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) => {
-            record_search_error(
-                &mut state.errors,
-                &mut state.error_count,
-                Some(path),
-                format!("open failed: {error}"),
-            );
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                state.unreadable_files = state.unreadable_files.saturating_add(1);
+            } else {
+                record_search_error(
+                    &mut state.errors,
+                    &mut state.error_count,
+                    Some(path),
+                    format!("open failed: {error}"),
+                );
+            }
             return false;
         }
     };
@@ -783,12 +975,16 @@ fn search_candidate(
     let n = match file.read(&mut probe) {
         Ok(n) => n,
         Err(error) => {
-            record_search_error(
-                &mut state.errors,
-                &mut state.error_count,
-                Some(path),
-                format!("probe read failed: {error}"),
-            );
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                state.unreadable_files = state.unreadable_files.saturating_add(1);
+            } else {
+                record_search_error(
+                    &mut state.errors,
+                    &mut state.error_count,
+                    Some(path),
+                    format!("probe read failed: {error}"),
+                );
+            }
             return false;
         }
     };
@@ -901,6 +1097,31 @@ fn finish_search_result(
             Value::String("max_results".into()),
         );
     }
+    if state.unreadable_dir_count != 0 || state.unreadable_files != 0 {
+        result.insert("partial".into(), Value::Bool(true));
+        if !state.unreadable_dirs.is_empty() {
+            result.insert(
+                "unreadable_dirs".into(),
+                Value::Array(
+                    state
+                        .unreadable_dirs
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        append_note(
+            &mut result,
+            &partial_note(
+                usize::try_from(state.unreadable_dir_count).unwrap_or(usize::MAX),
+                state.unreadable_files,
+                "file",
+                "Matches there, if any, are not included: no match is not proof of absence.",
+            ),
+        );
+    }
     result
 }
 
@@ -934,44 +1155,15 @@ fn search_not_started(root: &Path, needle: &str) -> BTreeMap<String, Value> {
     ])
 }
 
-pub(crate) fn search_until(
-    policy: &Policy,
-    payload: &Map<String, Value>,
+fn run_search_walk(
+    root: &Path,
+    raw: &str,
+    file_glob: Option<&Pattern>,
+    matcher: &RegexMatcher,
+    state: &mut SearchState,
     deadline: Instant,
-    budget: Duration,
-) -> HandlerResult {
-    let raw = require_str(payload, "path")?;
-    let needle = require_str(payload, "pattern")?;
-    let root = resolve(policy, raw)?;
-    let case_sensitive = payload
-        .get("case_sensitive")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let is_regex = payload
-        .get("regex")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let file_glob = search_file_glob(payload)?;
-    let cap = payload
-        .get("max_results")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(policy.file_ops_max_search_results)
-        .min(policy.file_ops_max_search_results);
-    let matcher = build_search_matcher(needle, is_regex, case_sensitive)?;
-    let mut state = SearchState {
-        matches: Vec::new(),
-        files_searched: 0,
-        errors: Vec::new(),
-        error_count: 0,
-        cap,
-        timed_out: false,
-    };
-    if Instant::now() > deadline {
-        return Ok(search_not_started(&root, needle));
-    }
-    let mut walker = WalkBuilder::new(&root);
+) -> Result<(), HandlerError> {
+    let mut walker = WalkBuilder::new(root);
     walker
         .hidden(false)
         .parents(false)
@@ -997,37 +1189,106 @@ pub(crate) fn search_until(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                record_search_error(
-                    &mut state.errors,
-                    &mut state.error_count,
-                    None,
-                    format!("walk failed: {error}"),
-                );
+                if error
+                    .io_error()
+                    .is_some_and(|io_error| io_error.kind() == io::ErrorKind::PermissionDenied)
+                {
+                    if let Some(path) = ignore_error_path(&error) {
+                        if path == root {
+                            return Err(cannot_list_error(raw));
+                        }
+                        record_unreadable_dir(
+                            root,
+                            path,
+                            &mut state.unreadable_dirs,
+                            &mut state.unreadable_dir_count,
+                        );
+                    } else {
+                        state.unreadable_files = state.unreadable_files.saturating_add(1);
+                    }
+                } else {
+                    record_search_error(
+                        &mut state.errors,
+                        &mut state.error_count,
+                        None,
+                        format!("walk failed: {error}"),
+                    );
+                }
                 continue;
             }
         };
         if !entry.file_type().is_some_and(|ty| ty.is_file()) || skip_search_file(entry.path()) {
             continue;
         }
-        if file_glob
-            .as_ref()
-            .is_some_and(|pattern| !pattern.matches(&entry.file_name().to_string_lossy()))
-        {
+        if file_glob.is_some_and(|pattern| !pattern.matches(&entry.file_name().to_string_lossy())) {
             continue;
         }
-        let rel = relative_search_path(&root, raw, entry.path());
-        if search_candidate(
-            entry.path(),
-            &rel,
-            &matcher,
-            &mut searcher,
-            &mut state,
-            deadline,
-        ) {
+        let rel = relative_search_path(root, raw, entry.path());
+        if search_candidate(entry.path(), &rel, matcher, &mut searcher, state, deadline) {
             break;
         }
     }
+    Ok(())
+}
 
+pub(crate) fn search_until(
+    policy: &Policy,
+    payload: &Map<String, Value>,
+    deadline: Instant,
+    budget: Duration,
+) -> HandlerResult {
+    let raw = require_str(payload, "path")?;
+    let needle = require_str(payload, "pattern")?;
+    let root = resolve(policy, raw)?;
+    let root_meta = fs::metadata(&root).map_err(|error| access_error(raw, &error))?;
+    let case_sensitive = payload
+        .get("case_sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_regex = payload
+        .get("regex")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let file_glob = search_file_glob(payload)?;
+    let cap = payload
+        .get("max_results")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(policy.file_ops_max_search_results)
+        .min(policy.file_ops_max_search_results);
+    let matcher = build_search_matcher(needle, is_regex, case_sensitive)?;
+    let mut state = SearchState {
+        matches: Vec::new(),
+        files_searched: 0,
+        errors: Vec::new(),
+        error_count: 0,
+        unreadable_dirs: Vec::new(),
+        unreadable_dir_count: 0,
+        unreadable_files: 0,
+        cap,
+        timed_out: false,
+    };
+    if Instant::now() > deadline {
+        return Ok(search_not_started(&root, needle));
+    }
+    if root_meta.is_dir() {
+        match fs::read_dir(&root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(cannot_list_error(raw));
+            }
+            Err(error) => return Err(access_error(raw, &error)),
+        }
+    }
+    run_search_walk(
+        &root,
+        raw,
+        file_glob.as_ref(),
+        &matcher,
+        &mut state,
+        deadline,
+    )?;
     Ok(finish_search_result(&root, needle, state, budget))
 }
 
@@ -1047,6 +1308,58 @@ mod tests {
             }],
             ..Policy::default()
         }
+    }
+
+    #[test]
+    fn partial_list_names_unreadable_directories_without_calling_it_truncated() {
+        let root = Path::new("/fixture");
+        let result = finish_list_result(
+            root,
+            Vec::new(),
+            false,
+            false,
+            Duration::from_secs(50),
+            &ListAccessGaps {
+                unreadable_dirs: vec!["private".into()],
+                unreadable_dir_count: 1,
+                uninspectable: 1,
+            },
+        );
+        assert_eq!(result["partial"], true);
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["unreadable_dirs"][0], "private");
+        assert!(
+            result["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("may still exist"))
+        );
+    }
+
+    #[test]
+    fn partial_search_says_no_match_is_not_proof_of_absence() {
+        let result = finish_search_result(
+            Path::new("/fixture"),
+            "needle",
+            SearchState {
+                matches: Vec::new(),
+                files_searched: 0,
+                errors: Vec::new(),
+                error_count: 0,
+                unreadable_dirs: vec!["private".into()],
+                unreadable_dir_count: 1,
+                unreadable_files: 2,
+                cap: 10,
+                timed_out: false,
+            },
+            Duration::from_secs(50),
+        );
+        assert_eq!(result["partial"], true);
+        assert_eq!(result["truncated"], false);
+        assert!(
+            result["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("not proof of absence"))
+        );
     }
 
     #[test]

@@ -5,9 +5,9 @@ the official SentinelX agent. Sentinel0² architecture work is out of scope unti
 the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
-- `pensados/sentinelx-cloud-protocol` protocol package 1.13.0.
-- `pensados/sentinelx-cloud-core` 0.23.7 behavior at reviewed upstream commit
-  `9a42a250b45b14c62b7d536897382354f6ccccf9`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-protocol` protocol package 1.13.2.
+- `pensados/sentinelx-cloud-core` 0.23.13 behavior at reviewed upstream commit
+  `bc1a81110ecc8020355bd547795fb8393f49949f`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -26,7 +26,7 @@ Reference surfaces:
   distinguishes hub rejection from network failure. A policy close (`1008`)
   is classified as `enrollment_rejected`, matching the upstream close/frame
   race as well as explicit JSON error frames.
-- SentinelX protocol 1.13.0 constants and all 31 official operation names.
+- SentinelX protocol 1.13.2 constants and all 31 official operation names.
 - Strict JSON message parsing equivalent to Pydantic `extra="forbid"`.
 - `opaque_ref` maximum length of 256 characters.
 - Hello / welcome / request / response / ping / pong / event / error semantic
@@ -65,7 +65,10 @@ Reference surfaces:
 - Handler panics are converted to structured `internal_error` responses rather
   than taking down the connection loop.
 - Official response bounding is checked against Python-generated fixtures and
-  applied to foreground and background responses.
+  applied to foreground and background responses. Protocol 1.13.2 semantics are
+  matched: oversized strings, nested lists and nested maps are trimmed in place,
+  list/object element types stay intact, and `_truncation.omitted` reports JSON
+  Pointer paths plus kept/omitted counts instead of injecting marker elements.
 - 0.18 `_sx_timing` metadata is attached to ordinary foreground results for Hub-side timing; the hosted Hub consumes and strips it before caller-visible tool output.
 - Sentinel0² additionally attaches caller-visible `response_time` to every successful foreground `result` map as compact UTC `HH:MM:SS`. Background acknowledgements are stamped too. Keeping this additive extension inside `result` preserves the strict v1 response envelope while giving chat/model clients a cheap clock sample on every normal tool return. The former `agent.response_timestamp_interval_seconds` option is still accepted for config compatibility but is ignored.
 
@@ -98,6 +101,31 @@ Reference surfaces:
   so child processes are already neutral and no Rust spawn hook is required.
   If future packaging raises either priority value, it must add a safe child
   neutralization mechanism at the same time rather than relying on inheritance.
+- Upstream 0.23.8 audit compaction is matched with a stricter local privacy
+  rule: `content_base64` is replaced by decoded byte count + SHA-256 (or a
+  character count when malformed), text above 65,536 characters is replaced by
+  count + SHA-256 + a bounded head, and token-like strings are still redacted.
+  Ordinary paths, commands and prose remain readable. The request object itself
+  is never mutated.
+- Upstream 0.23.9 and 0.23.10 are satisfied by the protocol 1.13.2 update above;
+  the intermediate 1.13.1 list-trimming behavior is superseded by 1.13.2's
+  list+map trimming and omission metadata.
+- Upstream 0.23.11 was reviewed. Its `Path.exists()` permission fix is specific
+  to Python 3.14; Rust file operations already use fallible metadata calls and
+  preserve `PermissionDenied`. The upstream root-owned-checkout update playbook
+  is not shipped by this repository, so that config-only change is not ported.
+- Upstream 0.23.12 systemd user services are matched on Linux. `services.<name>.user`
+  is validated as a conservative POSIX-style account name. When the agent runs
+  as that user it invokes `systemctl --user` with the user's runtime/bus
+  environment; otherwise it uses non-interactive sudo with
+  `systemctl --user --machine=<user>@.host`. Unknown users return a structured
+  `service_user_not_found`, and invalid configured users are skipped rather than
+  silently retargeted at the system manager.
+- Upstream 0.23.13 unreadable-directory semantics are matched: an unreadable
+  requested directory returns `permission_denied` instead of a false empty/no
+  matches result, while unreadable nested directories/files make list/search
+  results explicitly `partial`, with bounded `unreadable_dirs` evidence and a
+  warning that absence was not proven.
 - Linux host/OS/kernel/CPU/memory/uptime/load metadata used by hello/state.
 - Capabilities are derived from the dispatcher surface rather than maintained
   as a second drifting list. Full capabilities include upstream policy evidence
@@ -187,8 +215,9 @@ Reference surfaces:
   target tree.
 - Trusted `file_url` connections are pinned to the exact public DNS answers
   vetted by the SSRF check, closing the check/connect second-lookup race.
-- Local audit stores request key names and approximate size, not request values;
-  this replaces the earlier large safe-key redaction whitelist.
+- Local audit keeps bounded useful request context rather than raw bulk payloads:
+  large/base64 bodies are compacted to summaries, token-like strings are redacted,
+  and ordinary small values remain visible for diagnosis.
 
 ### Verification
 
