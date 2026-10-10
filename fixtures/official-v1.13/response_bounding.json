@@ -125,12 +125,622 @@
       "result": {
         "_truncation": {
           "continuation_available": false,
-          "delivered_bytes": 278,
+          "delivered_bytes": 3200,
           "execution_status": "completed",
+          "omitted": [
+            {
+              "kept": 602,
+              "omitted": 2398,
+              "path": "/numbers"
+            }
+          ],
           "original_bytes": 16964,
           "response_truncated": true
         },
-        "note": "result omitted: too large to bound field-wise"
+        "numbers": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63,
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76,
+          77,
+          78,
+          79,
+          80,
+          81,
+          82,
+          83,
+          84,
+          85,
+          86,
+          87,
+          88,
+          89,
+          90,
+          91,
+          92,
+          93,
+          94,
+          95,
+          96,
+          97,
+          98,
+          99,
+          100,
+          101,
+          102,
+          103,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112,
+          113,
+          114,
+          115,
+          116,
+          117,
+          118,
+          119,
+          120,
+          121,
+          122,
+          123,
+          124,
+          125,
+          126,
+          127,
+          128,
+          129,
+          130,
+          131,
+          132,
+          133,
+          134,
+          135,
+          136,
+          137,
+          138,
+          139,
+          140,
+          141,
+          142,
+          143,
+          144,
+          145,
+          146,
+          147,
+          148,
+          149,
+          150,
+          151,
+          152,
+          153,
+          154,
+          155,
+          156,
+          157,
+          158,
+          159,
+          160,
+          161,
+          162,
+          163,
+          164,
+          165,
+          166,
+          167,
+          168,
+          169,
+          170,
+          171,
+          172,
+          173,
+          174,
+          175,
+          176,
+          177,
+          178,
+          179,
+          180,
+          181,
+          182,
+          183,
+          184,
+          185,
+          186,
+          187,
+          188,
+          189,
+          190,
+          191,
+          192,
+          193,
+          194,
+          195,
+          196,
+          197,
+          198,
+          199,
+          200,
+          201,
+          202,
+          203,
+          204,
+          205,
+          206,
+          207,
+          208,
+          209,
+          210,
+          211,
+          212,
+          213,
+          214,
+          215,
+          216,
+          217,
+          218,
+          219,
+          220,
+          221,
+          222,
+          223,
+          224,
+          225,
+          226,
+          227,
+          228,
+          229,
+          230,
+          231,
+          232,
+          233,
+          234,
+          235,
+          236,
+          237,
+          238,
+          239,
+          240,
+          241,
+          242,
+          243,
+          244,
+          245,
+          246,
+          247,
+          248,
+          249,
+          250,
+          251,
+          252,
+          253,
+          254,
+          255,
+          256,
+          257,
+          258,
+          259,
+          260,
+          261,
+          262,
+          263,
+          264,
+          265,
+          266,
+          267,
+          268,
+          269,
+          270,
+          271,
+          272,
+          273,
+          274,
+          275,
+          276,
+          277,
+          278,
+          279,
+          280,
+          281,
+          282,
+          283,
+          284,
+          285,
+          286,
+          287,
+          288,
+          289,
+          290,
+          291,
+          292,
+          293,
+          294,
+          295,
+          296,
+          297,
+          298,
+          299,
+          300,
+          301,
+          302,
+          303,
+          304,
+          305,
+          306,
+          307,
+          308,
+          309,
+          310,
+          311,
+          312,
+          313,
+          314,
+          315,
+          316,
+          317,
+          318,
+          319,
+          320,
+          321,
+          322,
+          323,
+          324,
+          325,
+          326,
+          327,
+          328,
+          329,
+          330,
+          331,
+          332,
+          333,
+          334,
+          335,
+          336,
+          337,
+          338,
+          339,
+          340,
+          341,
+          342,
+          343,
+          344,
+          345,
+          346,
+          347,
+          348,
+          349,
+          350,
+          351,
+          352,
+          353,
+          354,
+          355,
+          356,
+          357,
+          358,
+          359,
+          360,
+          361,
+          362,
+          363,
+          364,
+          365,
+          366,
+          367,
+          368,
+          369,
+          370,
+          371,
+          372,
+          373,
+          374,
+          375,
+          376,
+          377,
+          378,
+          379,
+          380,
+          381,
+          382,
+          383,
+          384,
+          385,
+          386,
+          387,
+          388,
+          389,
+          390,
+          391,
+          392,
+          393,
+          394,
+          395,
+          396,
+          397,
+          398,
+          399,
+          400,
+          401,
+          402,
+          403,
+          404,
+          405,
+          406,
+          407,
+          408,
+          409,
+          410,
+          411,
+          412,
+          413,
+          414,
+          415,
+          416,
+          417,
+          418,
+          419,
+          420,
+          421,
+          422,
+          423,
+          424,
+          425,
+          426,
+          427,
+          428,
+          429,
+          430,
+          431,
+          432,
+          433,
+          434,
+          435,
+          436,
+          437,
+          438,
+          439,
+          440,
+          441,
+          442,
+          443,
+          444,
+          445,
+          446,
+          447,
+          448,
+          449,
+          450,
+          451,
+          452,
+          453,
+          454,
+          455,
+          456,
+          457,
+          458,
+          459,
+          460,
+          461,
+          462,
+          463,
+          464,
+          465,
+          466,
+          467,
+          468,
+          469,
+          470,
+          471,
+          472,
+          473,
+          474,
+          475,
+          476,
+          477,
+          478,
+          479,
+          480,
+          481,
+          482,
+          483,
+          484,
+          485,
+          486,
+          487,
+          488,
+          489,
+          490,
+          491,
+          492,
+          493,
+          494,
+          495,
+          496,
+          497,
+          498,
+          499,
+          500,
+          501,
+          502,
+          503,
+          504,
+          505,
+          506,
+          507,
+          508,
+          509,
+          510,
+          511,
+          512,
+          513,
+          514,
+          515,
+          516,
+          517,
+          518,
+          519,
+          520,
+          521,
+          522,
+          523,
+          524,
+          525,
+          526,
+          527,
+          528,
+          529,
+          530,
+          531,
+          532,
+          533,
+          534,
+          535,
+          536,
+          537,
+          538,
+          539,
+          540,
+          541,
+          542,
+          543,
+          544,
+          545,
+          546,
+          547,
+          548,
+          549,
+          550,
+          551,
+          552,
+          553,
+          554,
+          555,
+          556,
+          557,
+          558,
+          559,
+          560,
+          561,
+          562,
+          563,
+          564,
+          565,
+          566,
+          567,
+          568,
+          569,
+          570,
+          571,
+          572,
+          573,
+          574,
+          575,
+          576,
+          577,
+          578,
+          579,
+          580,
+          581,
+          582,
+          583,
+          584,
+          585,
+          586,
+          587,
+          588,
+          589,
+          590,
+          591,
+          592,
+          593,
+          594,
+          595,
+          596,
+          597,
+          598,
+          599,
+          600,
+          601
+        ]
       },
       "type": "response"
     },
@@ -3145,12 +3755,2487 @@
     },
     "meta": {
       "continuation_available": false,
-      "delivered_bytes": 278,
+      "delivered_bytes": 3200,
       "execution_status": "completed",
+      "omitted": [
+        {
+          "kept": 602,
+          "omitted": 2398,
+          "path": "/numbers"
+        }
+      ],
       "original_bytes": 16964,
       "response_truncated": true
     },
     "name": "untrimmable_non_strings",
+    "soft_limit": 4096
+  },
+  {
+    "expected": {
+      "id": "bound_5",
+      "ok": true,
+      "result": {
+        "_truncation": {
+          "continuation_available": false,
+          "delivered_bytes": 3594,
+          "execution_status": "completed",
+          "omitted": [
+            {
+              "kept": 106,
+              "omitted": 94,
+              "path": "/items"
+            }
+          ],
+          "original_bytes": 6381,
+          "response_truncated": true
+        },
+        "items": [
+          {
+            "id": 0,
+            "kind": "fixture"
+          },
+          {
+            "id": 1,
+            "kind": "fixture"
+          },
+          {
+            "id": 2,
+            "kind": "fixture"
+          },
+          {
+            "id": 3,
+            "kind": "fixture"
+          },
+          {
+            "id": 4,
+            "kind": "fixture"
+          },
+          {
+            "id": 5,
+            "kind": "fixture"
+          },
+          {
+            "id": 6,
+            "kind": "fixture"
+          },
+          {
+            "id": 7,
+            "kind": "fixture"
+          },
+          {
+            "id": 8,
+            "kind": "fixture"
+          },
+          {
+            "id": 9,
+            "kind": "fixture"
+          },
+          {
+            "id": 10,
+            "kind": "fixture"
+          },
+          {
+            "id": 11,
+            "kind": "fixture"
+          },
+          {
+            "id": 12,
+            "kind": "fixture"
+          },
+          {
+            "id": 13,
+            "kind": "fixture"
+          },
+          {
+            "id": 14,
+            "kind": "fixture"
+          },
+          {
+            "id": 15,
+            "kind": "fixture"
+          },
+          {
+            "id": 16,
+            "kind": "fixture"
+          },
+          {
+            "id": 17,
+            "kind": "fixture"
+          },
+          {
+            "id": 18,
+            "kind": "fixture"
+          },
+          {
+            "id": 19,
+            "kind": "fixture"
+          },
+          {
+            "id": 20,
+            "kind": "fixture"
+          },
+          {
+            "id": 21,
+            "kind": "fixture"
+          },
+          {
+            "id": 22,
+            "kind": "fixture"
+          },
+          {
+            "id": 23,
+            "kind": "fixture"
+          },
+          {
+            "id": 24,
+            "kind": "fixture"
+          },
+          {
+            "id": 25,
+            "kind": "fixture"
+          },
+          {
+            "id": 26,
+            "kind": "fixture"
+          },
+          {
+            "id": 27,
+            "kind": "fixture"
+          },
+          {
+            "id": 28,
+            "kind": "fixture"
+          },
+          {
+            "id": 29,
+            "kind": "fixture"
+          },
+          {
+            "id": 30,
+            "kind": "fixture"
+          },
+          {
+            "id": 31,
+            "kind": "fixture"
+          },
+          {
+            "id": 32,
+            "kind": "fixture"
+          },
+          {
+            "id": 33,
+            "kind": "fixture"
+          },
+          {
+            "id": 34,
+            "kind": "fixture"
+          },
+          {
+            "id": 35,
+            "kind": "fixture"
+          },
+          {
+            "id": 36,
+            "kind": "fixture"
+          },
+          {
+            "id": 37,
+            "kind": "fixture"
+          },
+          {
+            "id": 38,
+            "kind": "fixture"
+          },
+          {
+            "id": 39,
+            "kind": "fixture"
+          },
+          {
+            "id": 40,
+            "kind": "fixture"
+          },
+          {
+            "id": 41,
+            "kind": "fixture"
+          },
+          {
+            "id": 42,
+            "kind": "fixture"
+          },
+          {
+            "id": 43,
+            "kind": "fixture"
+          },
+          {
+            "id": 44,
+            "kind": "fixture"
+          },
+          {
+            "id": 45,
+            "kind": "fixture"
+          },
+          {
+            "id": 46,
+            "kind": "fixture"
+          },
+          {
+            "id": 47,
+            "kind": "fixture"
+          },
+          {
+            "id": 48,
+            "kind": "fixture"
+          },
+          {
+            "id": 49,
+            "kind": "fixture"
+          },
+          {
+            "id": 50,
+            "kind": "fixture"
+          },
+          {
+            "id": 51,
+            "kind": "fixture"
+          },
+          {
+            "id": 52,
+            "kind": "fixture"
+          },
+          {
+            "id": 53,
+            "kind": "fixture"
+          },
+          {
+            "id": 54,
+            "kind": "fixture"
+          },
+          {
+            "id": 55,
+            "kind": "fixture"
+          },
+          {
+            "id": 56,
+            "kind": "fixture"
+          },
+          {
+            "id": 57,
+            "kind": "fixture"
+          },
+          {
+            "id": 58,
+            "kind": "fixture"
+          },
+          {
+            "id": 59,
+            "kind": "fixture"
+          },
+          {
+            "id": 60,
+            "kind": "fixture"
+          },
+          {
+            "id": 61,
+            "kind": "fixture"
+          },
+          {
+            "id": 62,
+            "kind": "fixture"
+          },
+          {
+            "id": 63,
+            "kind": "fixture"
+          },
+          {
+            "id": 64,
+            "kind": "fixture"
+          },
+          {
+            "id": 65,
+            "kind": "fixture"
+          },
+          {
+            "id": 66,
+            "kind": "fixture"
+          },
+          {
+            "id": 67,
+            "kind": "fixture"
+          },
+          {
+            "id": 68,
+            "kind": "fixture"
+          },
+          {
+            "id": 69,
+            "kind": "fixture"
+          },
+          {
+            "id": 70,
+            "kind": "fixture"
+          },
+          {
+            "id": 71,
+            "kind": "fixture"
+          },
+          {
+            "id": 72,
+            "kind": "fixture"
+          },
+          {
+            "id": 73,
+            "kind": "fixture"
+          },
+          {
+            "id": 74,
+            "kind": "fixture"
+          },
+          {
+            "id": 75,
+            "kind": "fixture"
+          },
+          {
+            "id": 76,
+            "kind": "fixture"
+          },
+          {
+            "id": 77,
+            "kind": "fixture"
+          },
+          {
+            "id": 78,
+            "kind": "fixture"
+          },
+          {
+            "id": 79,
+            "kind": "fixture"
+          },
+          {
+            "id": 80,
+            "kind": "fixture"
+          },
+          {
+            "id": 81,
+            "kind": "fixture"
+          },
+          {
+            "id": 82,
+            "kind": "fixture"
+          },
+          {
+            "id": 83,
+            "kind": "fixture"
+          },
+          {
+            "id": 84,
+            "kind": "fixture"
+          },
+          {
+            "id": 85,
+            "kind": "fixture"
+          },
+          {
+            "id": 86,
+            "kind": "fixture"
+          },
+          {
+            "id": 87,
+            "kind": "fixture"
+          },
+          {
+            "id": 88,
+            "kind": "fixture"
+          },
+          {
+            "id": 89,
+            "kind": "fixture"
+          },
+          {
+            "id": 90,
+            "kind": "fixture"
+          },
+          {
+            "id": 91,
+            "kind": "fixture"
+          },
+          {
+            "id": 92,
+            "kind": "fixture"
+          },
+          {
+            "id": 93,
+            "kind": "fixture"
+          },
+          {
+            "id": 94,
+            "kind": "fixture"
+          },
+          {
+            "id": 95,
+            "kind": "fixture"
+          },
+          {
+            "id": 96,
+            "kind": "fixture"
+          },
+          {
+            "id": 97,
+            "kind": "fixture"
+          },
+          {
+            "id": 98,
+            "kind": "fixture"
+          },
+          {
+            "id": 99,
+            "kind": "fixture"
+          },
+          {
+            "id": 100,
+            "kind": "fixture"
+          },
+          {
+            "id": 101,
+            "kind": "fixture"
+          },
+          {
+            "id": 102,
+            "kind": "fixture"
+          },
+          {
+            "id": 103,
+            "kind": "fixture"
+          },
+          {
+            "id": 104,
+            "kind": "fixture"
+          },
+          {
+            "id": 105,
+            "kind": "fixture"
+          }
+        ],
+        "summary": "keep"
+      },
+      "type": "response"
+    },
+    "input": {
+      "id": "bound_5",
+      "ok": true,
+      "result": {
+        "items": [
+          {
+            "id": 0,
+            "kind": "fixture"
+          },
+          {
+            "id": 1,
+            "kind": "fixture"
+          },
+          {
+            "id": 2,
+            "kind": "fixture"
+          },
+          {
+            "id": 3,
+            "kind": "fixture"
+          },
+          {
+            "id": 4,
+            "kind": "fixture"
+          },
+          {
+            "id": 5,
+            "kind": "fixture"
+          },
+          {
+            "id": 6,
+            "kind": "fixture"
+          },
+          {
+            "id": 7,
+            "kind": "fixture"
+          },
+          {
+            "id": 8,
+            "kind": "fixture"
+          },
+          {
+            "id": 9,
+            "kind": "fixture"
+          },
+          {
+            "id": 10,
+            "kind": "fixture"
+          },
+          {
+            "id": 11,
+            "kind": "fixture"
+          },
+          {
+            "id": 12,
+            "kind": "fixture"
+          },
+          {
+            "id": 13,
+            "kind": "fixture"
+          },
+          {
+            "id": 14,
+            "kind": "fixture"
+          },
+          {
+            "id": 15,
+            "kind": "fixture"
+          },
+          {
+            "id": 16,
+            "kind": "fixture"
+          },
+          {
+            "id": 17,
+            "kind": "fixture"
+          },
+          {
+            "id": 18,
+            "kind": "fixture"
+          },
+          {
+            "id": 19,
+            "kind": "fixture"
+          },
+          {
+            "id": 20,
+            "kind": "fixture"
+          },
+          {
+            "id": 21,
+            "kind": "fixture"
+          },
+          {
+            "id": 22,
+            "kind": "fixture"
+          },
+          {
+            "id": 23,
+            "kind": "fixture"
+          },
+          {
+            "id": 24,
+            "kind": "fixture"
+          },
+          {
+            "id": 25,
+            "kind": "fixture"
+          },
+          {
+            "id": 26,
+            "kind": "fixture"
+          },
+          {
+            "id": 27,
+            "kind": "fixture"
+          },
+          {
+            "id": 28,
+            "kind": "fixture"
+          },
+          {
+            "id": 29,
+            "kind": "fixture"
+          },
+          {
+            "id": 30,
+            "kind": "fixture"
+          },
+          {
+            "id": 31,
+            "kind": "fixture"
+          },
+          {
+            "id": 32,
+            "kind": "fixture"
+          },
+          {
+            "id": 33,
+            "kind": "fixture"
+          },
+          {
+            "id": 34,
+            "kind": "fixture"
+          },
+          {
+            "id": 35,
+            "kind": "fixture"
+          },
+          {
+            "id": 36,
+            "kind": "fixture"
+          },
+          {
+            "id": 37,
+            "kind": "fixture"
+          },
+          {
+            "id": 38,
+            "kind": "fixture"
+          },
+          {
+            "id": 39,
+            "kind": "fixture"
+          },
+          {
+            "id": 40,
+            "kind": "fixture"
+          },
+          {
+            "id": 41,
+            "kind": "fixture"
+          },
+          {
+            "id": 42,
+            "kind": "fixture"
+          },
+          {
+            "id": 43,
+            "kind": "fixture"
+          },
+          {
+            "id": 44,
+            "kind": "fixture"
+          },
+          {
+            "id": 45,
+            "kind": "fixture"
+          },
+          {
+            "id": 46,
+            "kind": "fixture"
+          },
+          {
+            "id": 47,
+            "kind": "fixture"
+          },
+          {
+            "id": 48,
+            "kind": "fixture"
+          },
+          {
+            "id": 49,
+            "kind": "fixture"
+          },
+          {
+            "id": 50,
+            "kind": "fixture"
+          },
+          {
+            "id": 51,
+            "kind": "fixture"
+          },
+          {
+            "id": 52,
+            "kind": "fixture"
+          },
+          {
+            "id": 53,
+            "kind": "fixture"
+          },
+          {
+            "id": 54,
+            "kind": "fixture"
+          },
+          {
+            "id": 55,
+            "kind": "fixture"
+          },
+          {
+            "id": 56,
+            "kind": "fixture"
+          },
+          {
+            "id": 57,
+            "kind": "fixture"
+          },
+          {
+            "id": 58,
+            "kind": "fixture"
+          },
+          {
+            "id": 59,
+            "kind": "fixture"
+          },
+          {
+            "id": 60,
+            "kind": "fixture"
+          },
+          {
+            "id": 61,
+            "kind": "fixture"
+          },
+          {
+            "id": 62,
+            "kind": "fixture"
+          },
+          {
+            "id": 63,
+            "kind": "fixture"
+          },
+          {
+            "id": 64,
+            "kind": "fixture"
+          },
+          {
+            "id": 65,
+            "kind": "fixture"
+          },
+          {
+            "id": 66,
+            "kind": "fixture"
+          },
+          {
+            "id": 67,
+            "kind": "fixture"
+          },
+          {
+            "id": 68,
+            "kind": "fixture"
+          },
+          {
+            "id": 69,
+            "kind": "fixture"
+          },
+          {
+            "id": 70,
+            "kind": "fixture"
+          },
+          {
+            "id": 71,
+            "kind": "fixture"
+          },
+          {
+            "id": 72,
+            "kind": "fixture"
+          },
+          {
+            "id": 73,
+            "kind": "fixture"
+          },
+          {
+            "id": 74,
+            "kind": "fixture"
+          },
+          {
+            "id": 75,
+            "kind": "fixture"
+          },
+          {
+            "id": 76,
+            "kind": "fixture"
+          },
+          {
+            "id": 77,
+            "kind": "fixture"
+          },
+          {
+            "id": 78,
+            "kind": "fixture"
+          },
+          {
+            "id": 79,
+            "kind": "fixture"
+          },
+          {
+            "id": 80,
+            "kind": "fixture"
+          },
+          {
+            "id": 81,
+            "kind": "fixture"
+          },
+          {
+            "id": 82,
+            "kind": "fixture"
+          },
+          {
+            "id": 83,
+            "kind": "fixture"
+          },
+          {
+            "id": 84,
+            "kind": "fixture"
+          },
+          {
+            "id": 85,
+            "kind": "fixture"
+          },
+          {
+            "id": 86,
+            "kind": "fixture"
+          },
+          {
+            "id": 87,
+            "kind": "fixture"
+          },
+          {
+            "id": 88,
+            "kind": "fixture"
+          },
+          {
+            "id": 89,
+            "kind": "fixture"
+          },
+          {
+            "id": 90,
+            "kind": "fixture"
+          },
+          {
+            "id": 91,
+            "kind": "fixture"
+          },
+          {
+            "id": 92,
+            "kind": "fixture"
+          },
+          {
+            "id": 93,
+            "kind": "fixture"
+          },
+          {
+            "id": 94,
+            "kind": "fixture"
+          },
+          {
+            "id": 95,
+            "kind": "fixture"
+          },
+          {
+            "id": 96,
+            "kind": "fixture"
+          },
+          {
+            "id": 97,
+            "kind": "fixture"
+          },
+          {
+            "id": 98,
+            "kind": "fixture"
+          },
+          {
+            "id": 99,
+            "kind": "fixture"
+          },
+          {
+            "id": 100,
+            "kind": "fixture"
+          },
+          {
+            "id": 101,
+            "kind": "fixture"
+          },
+          {
+            "id": 102,
+            "kind": "fixture"
+          },
+          {
+            "id": 103,
+            "kind": "fixture"
+          },
+          {
+            "id": 104,
+            "kind": "fixture"
+          },
+          {
+            "id": 105,
+            "kind": "fixture"
+          },
+          {
+            "id": 106,
+            "kind": "fixture"
+          },
+          {
+            "id": 107,
+            "kind": "fixture"
+          },
+          {
+            "id": 108,
+            "kind": "fixture"
+          },
+          {
+            "id": 109,
+            "kind": "fixture"
+          },
+          {
+            "id": 110,
+            "kind": "fixture"
+          },
+          {
+            "id": 111,
+            "kind": "fixture"
+          },
+          {
+            "id": 112,
+            "kind": "fixture"
+          },
+          {
+            "id": 113,
+            "kind": "fixture"
+          },
+          {
+            "id": 114,
+            "kind": "fixture"
+          },
+          {
+            "id": 115,
+            "kind": "fixture"
+          },
+          {
+            "id": 116,
+            "kind": "fixture"
+          },
+          {
+            "id": 117,
+            "kind": "fixture"
+          },
+          {
+            "id": 118,
+            "kind": "fixture"
+          },
+          {
+            "id": 119,
+            "kind": "fixture"
+          },
+          {
+            "id": 120,
+            "kind": "fixture"
+          },
+          {
+            "id": 121,
+            "kind": "fixture"
+          },
+          {
+            "id": 122,
+            "kind": "fixture"
+          },
+          {
+            "id": 123,
+            "kind": "fixture"
+          },
+          {
+            "id": 124,
+            "kind": "fixture"
+          },
+          {
+            "id": 125,
+            "kind": "fixture"
+          },
+          {
+            "id": 126,
+            "kind": "fixture"
+          },
+          {
+            "id": 127,
+            "kind": "fixture"
+          },
+          {
+            "id": 128,
+            "kind": "fixture"
+          },
+          {
+            "id": 129,
+            "kind": "fixture"
+          },
+          {
+            "id": 130,
+            "kind": "fixture"
+          },
+          {
+            "id": 131,
+            "kind": "fixture"
+          },
+          {
+            "id": 132,
+            "kind": "fixture"
+          },
+          {
+            "id": 133,
+            "kind": "fixture"
+          },
+          {
+            "id": 134,
+            "kind": "fixture"
+          },
+          {
+            "id": 135,
+            "kind": "fixture"
+          },
+          {
+            "id": 136,
+            "kind": "fixture"
+          },
+          {
+            "id": 137,
+            "kind": "fixture"
+          },
+          {
+            "id": 138,
+            "kind": "fixture"
+          },
+          {
+            "id": 139,
+            "kind": "fixture"
+          },
+          {
+            "id": 140,
+            "kind": "fixture"
+          },
+          {
+            "id": 141,
+            "kind": "fixture"
+          },
+          {
+            "id": 142,
+            "kind": "fixture"
+          },
+          {
+            "id": 143,
+            "kind": "fixture"
+          },
+          {
+            "id": 144,
+            "kind": "fixture"
+          },
+          {
+            "id": 145,
+            "kind": "fixture"
+          },
+          {
+            "id": 146,
+            "kind": "fixture"
+          },
+          {
+            "id": 147,
+            "kind": "fixture"
+          },
+          {
+            "id": 148,
+            "kind": "fixture"
+          },
+          {
+            "id": 149,
+            "kind": "fixture"
+          },
+          {
+            "id": 150,
+            "kind": "fixture"
+          },
+          {
+            "id": 151,
+            "kind": "fixture"
+          },
+          {
+            "id": 152,
+            "kind": "fixture"
+          },
+          {
+            "id": 153,
+            "kind": "fixture"
+          },
+          {
+            "id": 154,
+            "kind": "fixture"
+          },
+          {
+            "id": 155,
+            "kind": "fixture"
+          },
+          {
+            "id": 156,
+            "kind": "fixture"
+          },
+          {
+            "id": 157,
+            "kind": "fixture"
+          },
+          {
+            "id": 158,
+            "kind": "fixture"
+          },
+          {
+            "id": 159,
+            "kind": "fixture"
+          },
+          {
+            "id": 160,
+            "kind": "fixture"
+          },
+          {
+            "id": 161,
+            "kind": "fixture"
+          },
+          {
+            "id": 162,
+            "kind": "fixture"
+          },
+          {
+            "id": 163,
+            "kind": "fixture"
+          },
+          {
+            "id": 164,
+            "kind": "fixture"
+          },
+          {
+            "id": 165,
+            "kind": "fixture"
+          },
+          {
+            "id": 166,
+            "kind": "fixture"
+          },
+          {
+            "id": 167,
+            "kind": "fixture"
+          },
+          {
+            "id": 168,
+            "kind": "fixture"
+          },
+          {
+            "id": 169,
+            "kind": "fixture"
+          },
+          {
+            "id": 170,
+            "kind": "fixture"
+          },
+          {
+            "id": 171,
+            "kind": "fixture"
+          },
+          {
+            "id": 172,
+            "kind": "fixture"
+          },
+          {
+            "id": 173,
+            "kind": "fixture"
+          },
+          {
+            "id": 174,
+            "kind": "fixture"
+          },
+          {
+            "id": 175,
+            "kind": "fixture"
+          },
+          {
+            "id": 176,
+            "kind": "fixture"
+          },
+          {
+            "id": 177,
+            "kind": "fixture"
+          },
+          {
+            "id": 178,
+            "kind": "fixture"
+          },
+          {
+            "id": 179,
+            "kind": "fixture"
+          },
+          {
+            "id": 180,
+            "kind": "fixture"
+          },
+          {
+            "id": 181,
+            "kind": "fixture"
+          },
+          {
+            "id": 182,
+            "kind": "fixture"
+          },
+          {
+            "id": 183,
+            "kind": "fixture"
+          },
+          {
+            "id": 184,
+            "kind": "fixture"
+          },
+          {
+            "id": 185,
+            "kind": "fixture"
+          },
+          {
+            "id": 186,
+            "kind": "fixture"
+          },
+          {
+            "id": 187,
+            "kind": "fixture"
+          },
+          {
+            "id": 188,
+            "kind": "fixture"
+          },
+          {
+            "id": 189,
+            "kind": "fixture"
+          },
+          {
+            "id": 190,
+            "kind": "fixture"
+          },
+          {
+            "id": 191,
+            "kind": "fixture"
+          },
+          {
+            "id": 192,
+            "kind": "fixture"
+          },
+          {
+            "id": 193,
+            "kind": "fixture"
+          },
+          {
+            "id": 194,
+            "kind": "fixture"
+          },
+          {
+            "id": 195,
+            "kind": "fixture"
+          },
+          {
+            "id": 196,
+            "kind": "fixture"
+          },
+          {
+            "id": 197,
+            "kind": "fixture"
+          },
+          {
+            "id": 198,
+            "kind": "fixture"
+          },
+          {
+            "id": 199,
+            "kind": "fixture"
+          }
+        ],
+        "summary": "keep"
+      },
+      "type": "response"
+    },
+    "meta": {
+      "continuation_available": false,
+      "delivered_bytes": 3594,
+      "execution_status": "completed",
+      "omitted": [
+        {
+          "kept": 106,
+          "omitted": 94,
+          "path": "/items"
+        }
+      ],
+      "original_bytes": 6381,
+      "response_truncated": true
+    },
+    "name": "large_list_of_objects",
+    "soft_limit": 4096
+  },
+  {
+    "expected": {
+      "id": "bound_6",
+      "ok": true,
+      "result": {
+        "_truncation": {
+          "continuation_available": false,
+          "delivered_bytes": 3623,
+          "execution_status": "completed",
+          "omitted": [
+            {
+              "kept": 85,
+              "omitted": 115,
+              "path": "/services"
+            }
+          ],
+          "original_bytes": 7984,
+          "response_truncated": true
+        },
+        "services": {
+          "svc-0000": {
+            "n": 0,
+            "status": "ok"
+          },
+          "svc-0001": {
+            "n": 1,
+            "status": "ok"
+          },
+          "svc-0002": {
+            "n": 2,
+            "status": "ok"
+          },
+          "svc-0003": {
+            "n": 3,
+            "status": "ok"
+          },
+          "svc-0004": {
+            "n": 4,
+            "status": "ok"
+          },
+          "svc-0005": {
+            "n": 5,
+            "status": "ok"
+          },
+          "svc-0006": {
+            "n": 6,
+            "status": "ok"
+          },
+          "svc-0007": {
+            "n": 7,
+            "status": "ok"
+          },
+          "svc-0008": {
+            "n": 8,
+            "status": "ok"
+          },
+          "svc-0009": {
+            "n": 9,
+            "status": "ok"
+          },
+          "svc-0010": {
+            "n": 10,
+            "status": "ok"
+          },
+          "svc-0011": {
+            "n": 11,
+            "status": "ok"
+          },
+          "svc-0012": {
+            "n": 12,
+            "status": "ok"
+          },
+          "svc-0013": {
+            "n": 13,
+            "status": "ok"
+          },
+          "svc-0014": {
+            "n": 14,
+            "status": "ok"
+          },
+          "svc-0015": {
+            "n": 15,
+            "status": "ok"
+          },
+          "svc-0016": {
+            "n": 16,
+            "status": "ok"
+          },
+          "svc-0017": {
+            "n": 17,
+            "status": "ok"
+          },
+          "svc-0018": {
+            "n": 18,
+            "status": "ok"
+          },
+          "svc-0019": {
+            "n": 19,
+            "status": "ok"
+          },
+          "svc-0020": {
+            "n": 20,
+            "status": "ok"
+          },
+          "svc-0021": {
+            "n": 21,
+            "status": "ok"
+          },
+          "svc-0022": {
+            "n": 22,
+            "status": "ok"
+          },
+          "svc-0023": {
+            "n": 23,
+            "status": "ok"
+          },
+          "svc-0024": {
+            "n": 24,
+            "status": "ok"
+          },
+          "svc-0025": {
+            "n": 25,
+            "status": "ok"
+          },
+          "svc-0026": {
+            "n": 26,
+            "status": "ok"
+          },
+          "svc-0027": {
+            "n": 27,
+            "status": "ok"
+          },
+          "svc-0028": {
+            "n": 28,
+            "status": "ok"
+          },
+          "svc-0029": {
+            "n": 29,
+            "status": "ok"
+          },
+          "svc-0030": {
+            "n": 30,
+            "status": "ok"
+          },
+          "svc-0031": {
+            "n": 31,
+            "status": "ok"
+          },
+          "svc-0032": {
+            "n": 32,
+            "status": "ok"
+          },
+          "svc-0033": {
+            "n": 33,
+            "status": "ok"
+          },
+          "svc-0034": {
+            "n": 34,
+            "status": "ok"
+          },
+          "svc-0035": {
+            "n": 35,
+            "status": "ok"
+          },
+          "svc-0036": {
+            "n": 36,
+            "status": "ok"
+          },
+          "svc-0037": {
+            "n": 37,
+            "status": "ok"
+          },
+          "svc-0038": {
+            "n": 38,
+            "status": "ok"
+          },
+          "svc-0039": {
+            "n": 39,
+            "status": "ok"
+          },
+          "svc-0040": {
+            "n": 40,
+            "status": "ok"
+          },
+          "svc-0041": {
+            "n": 41,
+            "status": "ok"
+          },
+          "svc-0042": {
+            "n": 42,
+            "status": "ok"
+          },
+          "svc-0043": {
+            "n": 43,
+            "status": "ok"
+          },
+          "svc-0044": {
+            "n": 44,
+            "status": "ok"
+          },
+          "svc-0045": {
+            "n": 45,
+            "status": "ok"
+          },
+          "svc-0046": {
+            "n": 46,
+            "status": "ok"
+          },
+          "svc-0047": {
+            "n": 47,
+            "status": "ok"
+          },
+          "svc-0048": {
+            "n": 48,
+            "status": "ok"
+          },
+          "svc-0049": {
+            "n": 49,
+            "status": "ok"
+          },
+          "svc-0050": {
+            "n": 50,
+            "status": "ok"
+          },
+          "svc-0051": {
+            "n": 51,
+            "status": "ok"
+          },
+          "svc-0052": {
+            "n": 52,
+            "status": "ok"
+          },
+          "svc-0053": {
+            "n": 53,
+            "status": "ok"
+          },
+          "svc-0054": {
+            "n": 54,
+            "status": "ok"
+          },
+          "svc-0055": {
+            "n": 55,
+            "status": "ok"
+          },
+          "svc-0056": {
+            "n": 56,
+            "status": "ok"
+          },
+          "svc-0057": {
+            "n": 57,
+            "status": "ok"
+          },
+          "svc-0058": {
+            "n": 58,
+            "status": "ok"
+          },
+          "svc-0059": {
+            "n": 59,
+            "status": "ok"
+          },
+          "svc-0060": {
+            "n": 60,
+            "status": "ok"
+          },
+          "svc-0061": {
+            "n": 61,
+            "status": "ok"
+          },
+          "svc-0062": {
+            "n": 62,
+            "status": "ok"
+          },
+          "svc-0063": {
+            "n": 63,
+            "status": "ok"
+          },
+          "svc-0064": {
+            "n": 64,
+            "status": "ok"
+          },
+          "svc-0065": {
+            "n": 65,
+            "status": "ok"
+          },
+          "svc-0066": {
+            "n": 66,
+            "status": "ok"
+          },
+          "svc-0067": {
+            "n": 67,
+            "status": "ok"
+          },
+          "svc-0068": {
+            "n": 68,
+            "status": "ok"
+          },
+          "svc-0069": {
+            "n": 69,
+            "status": "ok"
+          },
+          "svc-0070": {
+            "n": 70,
+            "status": "ok"
+          },
+          "svc-0071": {
+            "n": 71,
+            "status": "ok"
+          },
+          "svc-0072": {
+            "n": 72,
+            "status": "ok"
+          },
+          "svc-0073": {
+            "n": 73,
+            "status": "ok"
+          },
+          "svc-0074": {
+            "n": 74,
+            "status": "ok"
+          },
+          "svc-0075": {
+            "n": 75,
+            "status": "ok"
+          },
+          "svc-0076": {
+            "n": 76,
+            "status": "ok"
+          },
+          "svc-0077": {
+            "n": 77,
+            "status": "ok"
+          },
+          "svc-0078": {
+            "n": 78,
+            "status": "ok"
+          },
+          "svc-0079": {
+            "n": 79,
+            "status": "ok"
+          },
+          "svc-0080": {
+            "n": 80,
+            "status": "ok"
+          },
+          "svc-0081": {
+            "n": 81,
+            "status": "ok"
+          },
+          "svc-0082": {
+            "n": 82,
+            "status": "ok"
+          },
+          "svc-0083": {
+            "n": 83,
+            "status": "ok"
+          },
+          "svc-0084": {
+            "n": 84,
+            "status": "ok"
+          }
+        },
+        "summary": "keep"
+      },
+      "type": "response"
+    },
+    "input": {
+      "id": "bound_6",
+      "ok": true,
+      "result": {
+        "services": {
+          "svc-0000": {
+            "n": 0,
+            "status": "ok"
+          },
+          "svc-0001": {
+            "n": 1,
+            "status": "ok"
+          },
+          "svc-0002": {
+            "n": 2,
+            "status": "ok"
+          },
+          "svc-0003": {
+            "n": 3,
+            "status": "ok"
+          },
+          "svc-0004": {
+            "n": 4,
+            "status": "ok"
+          },
+          "svc-0005": {
+            "n": 5,
+            "status": "ok"
+          },
+          "svc-0006": {
+            "n": 6,
+            "status": "ok"
+          },
+          "svc-0007": {
+            "n": 7,
+            "status": "ok"
+          },
+          "svc-0008": {
+            "n": 8,
+            "status": "ok"
+          },
+          "svc-0009": {
+            "n": 9,
+            "status": "ok"
+          },
+          "svc-0010": {
+            "n": 10,
+            "status": "ok"
+          },
+          "svc-0011": {
+            "n": 11,
+            "status": "ok"
+          },
+          "svc-0012": {
+            "n": 12,
+            "status": "ok"
+          },
+          "svc-0013": {
+            "n": 13,
+            "status": "ok"
+          },
+          "svc-0014": {
+            "n": 14,
+            "status": "ok"
+          },
+          "svc-0015": {
+            "n": 15,
+            "status": "ok"
+          },
+          "svc-0016": {
+            "n": 16,
+            "status": "ok"
+          },
+          "svc-0017": {
+            "n": 17,
+            "status": "ok"
+          },
+          "svc-0018": {
+            "n": 18,
+            "status": "ok"
+          },
+          "svc-0019": {
+            "n": 19,
+            "status": "ok"
+          },
+          "svc-0020": {
+            "n": 20,
+            "status": "ok"
+          },
+          "svc-0021": {
+            "n": 21,
+            "status": "ok"
+          },
+          "svc-0022": {
+            "n": 22,
+            "status": "ok"
+          },
+          "svc-0023": {
+            "n": 23,
+            "status": "ok"
+          },
+          "svc-0024": {
+            "n": 24,
+            "status": "ok"
+          },
+          "svc-0025": {
+            "n": 25,
+            "status": "ok"
+          },
+          "svc-0026": {
+            "n": 26,
+            "status": "ok"
+          },
+          "svc-0027": {
+            "n": 27,
+            "status": "ok"
+          },
+          "svc-0028": {
+            "n": 28,
+            "status": "ok"
+          },
+          "svc-0029": {
+            "n": 29,
+            "status": "ok"
+          },
+          "svc-0030": {
+            "n": 30,
+            "status": "ok"
+          },
+          "svc-0031": {
+            "n": 31,
+            "status": "ok"
+          },
+          "svc-0032": {
+            "n": 32,
+            "status": "ok"
+          },
+          "svc-0033": {
+            "n": 33,
+            "status": "ok"
+          },
+          "svc-0034": {
+            "n": 34,
+            "status": "ok"
+          },
+          "svc-0035": {
+            "n": 35,
+            "status": "ok"
+          },
+          "svc-0036": {
+            "n": 36,
+            "status": "ok"
+          },
+          "svc-0037": {
+            "n": 37,
+            "status": "ok"
+          },
+          "svc-0038": {
+            "n": 38,
+            "status": "ok"
+          },
+          "svc-0039": {
+            "n": 39,
+            "status": "ok"
+          },
+          "svc-0040": {
+            "n": 40,
+            "status": "ok"
+          },
+          "svc-0041": {
+            "n": 41,
+            "status": "ok"
+          },
+          "svc-0042": {
+            "n": 42,
+            "status": "ok"
+          },
+          "svc-0043": {
+            "n": 43,
+            "status": "ok"
+          },
+          "svc-0044": {
+            "n": 44,
+            "status": "ok"
+          },
+          "svc-0045": {
+            "n": 45,
+            "status": "ok"
+          },
+          "svc-0046": {
+            "n": 46,
+            "status": "ok"
+          },
+          "svc-0047": {
+            "n": 47,
+            "status": "ok"
+          },
+          "svc-0048": {
+            "n": 48,
+            "status": "ok"
+          },
+          "svc-0049": {
+            "n": 49,
+            "status": "ok"
+          },
+          "svc-0050": {
+            "n": 50,
+            "status": "ok"
+          },
+          "svc-0051": {
+            "n": 51,
+            "status": "ok"
+          },
+          "svc-0052": {
+            "n": 52,
+            "status": "ok"
+          },
+          "svc-0053": {
+            "n": 53,
+            "status": "ok"
+          },
+          "svc-0054": {
+            "n": 54,
+            "status": "ok"
+          },
+          "svc-0055": {
+            "n": 55,
+            "status": "ok"
+          },
+          "svc-0056": {
+            "n": 56,
+            "status": "ok"
+          },
+          "svc-0057": {
+            "n": 57,
+            "status": "ok"
+          },
+          "svc-0058": {
+            "n": 58,
+            "status": "ok"
+          },
+          "svc-0059": {
+            "n": 59,
+            "status": "ok"
+          },
+          "svc-0060": {
+            "n": 60,
+            "status": "ok"
+          },
+          "svc-0061": {
+            "n": 61,
+            "status": "ok"
+          },
+          "svc-0062": {
+            "n": 62,
+            "status": "ok"
+          },
+          "svc-0063": {
+            "n": 63,
+            "status": "ok"
+          },
+          "svc-0064": {
+            "n": 64,
+            "status": "ok"
+          },
+          "svc-0065": {
+            "n": 65,
+            "status": "ok"
+          },
+          "svc-0066": {
+            "n": 66,
+            "status": "ok"
+          },
+          "svc-0067": {
+            "n": 67,
+            "status": "ok"
+          },
+          "svc-0068": {
+            "n": 68,
+            "status": "ok"
+          },
+          "svc-0069": {
+            "n": 69,
+            "status": "ok"
+          },
+          "svc-0070": {
+            "n": 70,
+            "status": "ok"
+          },
+          "svc-0071": {
+            "n": 71,
+            "status": "ok"
+          },
+          "svc-0072": {
+            "n": 72,
+            "status": "ok"
+          },
+          "svc-0073": {
+            "n": 73,
+            "status": "ok"
+          },
+          "svc-0074": {
+            "n": 74,
+            "status": "ok"
+          },
+          "svc-0075": {
+            "n": 75,
+            "status": "ok"
+          },
+          "svc-0076": {
+            "n": 76,
+            "status": "ok"
+          },
+          "svc-0077": {
+            "n": 77,
+            "status": "ok"
+          },
+          "svc-0078": {
+            "n": 78,
+            "status": "ok"
+          },
+          "svc-0079": {
+            "n": 79,
+            "status": "ok"
+          },
+          "svc-0080": {
+            "n": 80,
+            "status": "ok"
+          },
+          "svc-0081": {
+            "n": 81,
+            "status": "ok"
+          },
+          "svc-0082": {
+            "n": 82,
+            "status": "ok"
+          },
+          "svc-0083": {
+            "n": 83,
+            "status": "ok"
+          },
+          "svc-0084": {
+            "n": 84,
+            "status": "ok"
+          },
+          "svc-0085": {
+            "n": 85,
+            "status": "ok"
+          },
+          "svc-0086": {
+            "n": 86,
+            "status": "ok"
+          },
+          "svc-0087": {
+            "n": 87,
+            "status": "ok"
+          },
+          "svc-0088": {
+            "n": 88,
+            "status": "ok"
+          },
+          "svc-0089": {
+            "n": 89,
+            "status": "ok"
+          },
+          "svc-0090": {
+            "n": 90,
+            "status": "ok"
+          },
+          "svc-0091": {
+            "n": 91,
+            "status": "ok"
+          },
+          "svc-0092": {
+            "n": 92,
+            "status": "ok"
+          },
+          "svc-0093": {
+            "n": 93,
+            "status": "ok"
+          },
+          "svc-0094": {
+            "n": 94,
+            "status": "ok"
+          },
+          "svc-0095": {
+            "n": 95,
+            "status": "ok"
+          },
+          "svc-0096": {
+            "n": 96,
+            "status": "ok"
+          },
+          "svc-0097": {
+            "n": 97,
+            "status": "ok"
+          },
+          "svc-0098": {
+            "n": 98,
+            "status": "ok"
+          },
+          "svc-0099": {
+            "n": 99,
+            "status": "ok"
+          },
+          "svc-0100": {
+            "n": 100,
+            "status": "ok"
+          },
+          "svc-0101": {
+            "n": 101,
+            "status": "ok"
+          },
+          "svc-0102": {
+            "n": 102,
+            "status": "ok"
+          },
+          "svc-0103": {
+            "n": 103,
+            "status": "ok"
+          },
+          "svc-0104": {
+            "n": 104,
+            "status": "ok"
+          },
+          "svc-0105": {
+            "n": 105,
+            "status": "ok"
+          },
+          "svc-0106": {
+            "n": 106,
+            "status": "ok"
+          },
+          "svc-0107": {
+            "n": 107,
+            "status": "ok"
+          },
+          "svc-0108": {
+            "n": 108,
+            "status": "ok"
+          },
+          "svc-0109": {
+            "n": 109,
+            "status": "ok"
+          },
+          "svc-0110": {
+            "n": 110,
+            "status": "ok"
+          },
+          "svc-0111": {
+            "n": 111,
+            "status": "ok"
+          },
+          "svc-0112": {
+            "n": 112,
+            "status": "ok"
+          },
+          "svc-0113": {
+            "n": 113,
+            "status": "ok"
+          },
+          "svc-0114": {
+            "n": 114,
+            "status": "ok"
+          },
+          "svc-0115": {
+            "n": 115,
+            "status": "ok"
+          },
+          "svc-0116": {
+            "n": 116,
+            "status": "ok"
+          },
+          "svc-0117": {
+            "n": 117,
+            "status": "ok"
+          },
+          "svc-0118": {
+            "n": 118,
+            "status": "ok"
+          },
+          "svc-0119": {
+            "n": 119,
+            "status": "ok"
+          },
+          "svc-0120": {
+            "n": 120,
+            "status": "ok"
+          },
+          "svc-0121": {
+            "n": 121,
+            "status": "ok"
+          },
+          "svc-0122": {
+            "n": 122,
+            "status": "ok"
+          },
+          "svc-0123": {
+            "n": 123,
+            "status": "ok"
+          },
+          "svc-0124": {
+            "n": 124,
+            "status": "ok"
+          },
+          "svc-0125": {
+            "n": 125,
+            "status": "ok"
+          },
+          "svc-0126": {
+            "n": 126,
+            "status": "ok"
+          },
+          "svc-0127": {
+            "n": 127,
+            "status": "ok"
+          },
+          "svc-0128": {
+            "n": 128,
+            "status": "ok"
+          },
+          "svc-0129": {
+            "n": 129,
+            "status": "ok"
+          },
+          "svc-0130": {
+            "n": 130,
+            "status": "ok"
+          },
+          "svc-0131": {
+            "n": 131,
+            "status": "ok"
+          },
+          "svc-0132": {
+            "n": 132,
+            "status": "ok"
+          },
+          "svc-0133": {
+            "n": 133,
+            "status": "ok"
+          },
+          "svc-0134": {
+            "n": 134,
+            "status": "ok"
+          },
+          "svc-0135": {
+            "n": 135,
+            "status": "ok"
+          },
+          "svc-0136": {
+            "n": 136,
+            "status": "ok"
+          },
+          "svc-0137": {
+            "n": 137,
+            "status": "ok"
+          },
+          "svc-0138": {
+            "n": 138,
+            "status": "ok"
+          },
+          "svc-0139": {
+            "n": 139,
+            "status": "ok"
+          },
+          "svc-0140": {
+            "n": 140,
+            "status": "ok"
+          },
+          "svc-0141": {
+            "n": 141,
+            "status": "ok"
+          },
+          "svc-0142": {
+            "n": 142,
+            "status": "ok"
+          },
+          "svc-0143": {
+            "n": 143,
+            "status": "ok"
+          },
+          "svc-0144": {
+            "n": 144,
+            "status": "ok"
+          },
+          "svc-0145": {
+            "n": 145,
+            "status": "ok"
+          },
+          "svc-0146": {
+            "n": 146,
+            "status": "ok"
+          },
+          "svc-0147": {
+            "n": 147,
+            "status": "ok"
+          },
+          "svc-0148": {
+            "n": 148,
+            "status": "ok"
+          },
+          "svc-0149": {
+            "n": 149,
+            "status": "ok"
+          },
+          "svc-0150": {
+            "n": 150,
+            "status": "ok"
+          },
+          "svc-0151": {
+            "n": 151,
+            "status": "ok"
+          },
+          "svc-0152": {
+            "n": 152,
+            "status": "ok"
+          },
+          "svc-0153": {
+            "n": 153,
+            "status": "ok"
+          },
+          "svc-0154": {
+            "n": 154,
+            "status": "ok"
+          },
+          "svc-0155": {
+            "n": 155,
+            "status": "ok"
+          },
+          "svc-0156": {
+            "n": 156,
+            "status": "ok"
+          },
+          "svc-0157": {
+            "n": 157,
+            "status": "ok"
+          },
+          "svc-0158": {
+            "n": 158,
+            "status": "ok"
+          },
+          "svc-0159": {
+            "n": 159,
+            "status": "ok"
+          },
+          "svc-0160": {
+            "n": 160,
+            "status": "ok"
+          },
+          "svc-0161": {
+            "n": 161,
+            "status": "ok"
+          },
+          "svc-0162": {
+            "n": 162,
+            "status": "ok"
+          },
+          "svc-0163": {
+            "n": 163,
+            "status": "ok"
+          },
+          "svc-0164": {
+            "n": 164,
+            "status": "ok"
+          },
+          "svc-0165": {
+            "n": 165,
+            "status": "ok"
+          },
+          "svc-0166": {
+            "n": 166,
+            "status": "ok"
+          },
+          "svc-0167": {
+            "n": 167,
+            "status": "ok"
+          },
+          "svc-0168": {
+            "n": 168,
+            "status": "ok"
+          },
+          "svc-0169": {
+            "n": 169,
+            "status": "ok"
+          },
+          "svc-0170": {
+            "n": 170,
+            "status": "ok"
+          },
+          "svc-0171": {
+            "n": 171,
+            "status": "ok"
+          },
+          "svc-0172": {
+            "n": 172,
+            "status": "ok"
+          },
+          "svc-0173": {
+            "n": 173,
+            "status": "ok"
+          },
+          "svc-0174": {
+            "n": 174,
+            "status": "ok"
+          },
+          "svc-0175": {
+            "n": 175,
+            "status": "ok"
+          },
+          "svc-0176": {
+            "n": 176,
+            "status": "ok"
+          },
+          "svc-0177": {
+            "n": 177,
+            "status": "ok"
+          },
+          "svc-0178": {
+            "n": 178,
+            "status": "ok"
+          },
+          "svc-0179": {
+            "n": 179,
+            "status": "ok"
+          },
+          "svc-0180": {
+            "n": 180,
+            "status": "ok"
+          },
+          "svc-0181": {
+            "n": 181,
+            "status": "ok"
+          },
+          "svc-0182": {
+            "n": 182,
+            "status": "ok"
+          },
+          "svc-0183": {
+            "n": 183,
+            "status": "ok"
+          },
+          "svc-0184": {
+            "n": 184,
+            "status": "ok"
+          },
+          "svc-0185": {
+            "n": 185,
+            "status": "ok"
+          },
+          "svc-0186": {
+            "n": 186,
+            "status": "ok"
+          },
+          "svc-0187": {
+            "n": 187,
+            "status": "ok"
+          },
+          "svc-0188": {
+            "n": 188,
+            "status": "ok"
+          },
+          "svc-0189": {
+            "n": 189,
+            "status": "ok"
+          },
+          "svc-0190": {
+            "n": 190,
+            "status": "ok"
+          },
+          "svc-0191": {
+            "n": 191,
+            "status": "ok"
+          },
+          "svc-0192": {
+            "n": 192,
+            "status": "ok"
+          },
+          "svc-0193": {
+            "n": 193,
+            "status": "ok"
+          },
+          "svc-0194": {
+            "n": 194,
+            "status": "ok"
+          },
+          "svc-0195": {
+            "n": 195,
+            "status": "ok"
+          },
+          "svc-0196": {
+            "n": 196,
+            "status": "ok"
+          },
+          "svc-0197": {
+            "n": 197,
+            "status": "ok"
+          },
+          "svc-0198": {
+            "n": 198,
+            "status": "ok"
+          },
+          "svc-0199": {
+            "n": 199,
+            "status": "ok"
+          }
+        },
+        "summary": "keep"
+      },
+      "type": "response"
+    },
+    "meta": {
+      "continuation_available": false,
+      "delivered_bytes": 3623,
+      "execution_status": "completed",
+      "omitted": [
+        {
+          "kept": 85,
+          "omitted": 115,
+          "path": "/services"
+        }
+      ],
+      "original_bytes": 7984,
+      "response_truncated": true
+    },
+    "name": "large_dict_result",
     "soft_limit": 4096
   }
 ]

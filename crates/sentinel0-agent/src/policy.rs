@@ -35,6 +35,7 @@ pub struct ServiceSpec {
     pub description: String,
     pub domain: String,
     pub backend: String,
+    pub user: String,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +272,7 @@ struct RawService {
     description: String,
     domain: String,
     backend: String,
+    user: String,
 }
 
 impl Default for RawService {
@@ -282,6 +284,7 @@ impl Default for RawService {
             description: String::new(),
             domain: "system".into(),
             backend: "service".into(),
+            user: String::new(),
         }
     }
 }
@@ -404,12 +407,31 @@ fn parse_locations(
     Ok(locations)
 }
 
+fn valid_service_user(user: &str) -> bool {
+    let bytes = user.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-'))
+}
+
 fn parse_services(raw_services: BTreeMap<String, RawService>) -> BTreeMap<String, ServiceSpec> {
     raw_services
         .into_iter()
-        .map(|(name, service)| {
+        .filter_map(|(name, service)| {
+            let user = service.user.trim().to_owned();
+            if !user.is_empty() && !valid_service_user(&user) {
+                warn!(service = %name, user = %user, "service has invalid systemd user; skipping it");
+                return None;
+            }
             let unit = service.unit.unwrap_or_else(|| name.clone());
-            (
+            Some((
                 name,
                 ServiceSpec {
                     unit,
@@ -418,8 +440,9 @@ fn parse_services(raw_services: BTreeMap<String, RawService>) -> BTreeMap<String
                     description: service.description,
                     domain: service.domain,
                     backend: service.backend,
+                    user,
                 },
-            )
+            ))
         })
         .collect()
 }
@@ -749,6 +772,24 @@ upload_base: /var/lib/sentinelx/uploads
         assert_eq!(policy.preferred_profile.as_deref(), Some("compact"));
         assert_eq!(policy.file_ops_paths.len(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn systemd_user_services_are_parsed_and_invalid_users_are_skipped() -> TestResult {
+        let policy = parse(
+            r#"
+services:
+  good:
+    actions: [status, restart]
+    user: alice_2.test-user
+  bad:
+    actions: [status]
+    user: "bad user;root"
+"#,
+        )?;
+        assert_eq!(policy.services["good"].user, "alice_2.test-user");
+        assert!(!policy.services.contains_key("bad"));
         Ok(())
     }
 

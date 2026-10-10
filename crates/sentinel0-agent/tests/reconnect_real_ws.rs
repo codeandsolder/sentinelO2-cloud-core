@@ -3,7 +3,7 @@ mod common;
 use common::{TestResult, TestValue as _};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{Agent, AgentConfig, AuthToken, ReconnectPolicy, UnsupportedDispatcher};
-use sentinel0_proto::{HostInfo, Message};
+use sentinel0_proto::{HostInfo, Message, PROTOCOL_VERSION};
 use std::{
     sync::{
         Arc,
@@ -88,7 +88,7 @@ async fn real_socket_reconnects_after_1012_and_reauthenticates() -> TestResult {
                     host,
                     ..
                 } => {
-                    assert_eq!(protocol_version, "1.13.0");
+                    assert_eq!(protocol_version, PROTOCOL_VERSION);
                     assert_eq!(host.id, "host_test");
                 }
                 other => {

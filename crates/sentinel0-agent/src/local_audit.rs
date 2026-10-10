@@ -1,5 +1,7 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     fs::{self, OpenOptions},
@@ -12,6 +14,8 @@ pub const MAX_LINES: usize = 5000;
 const TRIM_TRIGGER: usize = 5500;
 const RETENTION_CHECK_EVERY: usize = 100;
 const TAIL_BLOCK: usize = 64 * 1024;
+const MAX_AUDIT_TEXT_CHARS: usize = 65_536;
+const AUDIT_TEXT_HEAD_CHARS: usize = 2_048;
 
 fn looks_tokenish(text: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_alphanumeric())
@@ -22,30 +26,70 @@ fn looks_tokenish(text: &str) -> bool {
         })
 }
 
-fn audit_value(value: &Value) -> Value {
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    crate::hex_lower(digest.as_ref())
+}
+
+fn audit_string(key: Option<&str>, text: &str) -> Value {
+    if key == Some("content_base64") {
+        return STANDARD.decode(text).map_or_else(
+            |_| {
+                json!({
+                    "omitted": "base64",
+                    "chars": text.chars().count(),
+                })
+            },
+            |decoded| {
+                json!({
+                    "omitted": "base64",
+                    "bytes": decoded.len(),
+                    "sha256": sha256_hex(&decoded),
+                })
+            },
+        );
+    }
+    if looks_tokenish(text) {
+        return Value::String("[redacted-tokenish]".into());
+    }
+    let chars = text.chars().count();
+    if chars > MAX_AUDIT_TEXT_CHARS {
+        return json!({
+            "omitted": "text",
+            "chars": chars,
+            "sha256": sha256_hex(text.as_bytes()),
+            "head": text.chars().take(AUDIT_TEXT_HEAD_CHARS).collect::<String>(),
+        });
+    }
+    Value::String(text.to_owned())
+}
+
+fn audit_value(key: Option<&str>, value: &Value) -> Value {
     match value {
-        Value::String(text) if looks_tokenish(text) => Value::String("[redacted-tokenish]".into()),
-        Value::Array(items) => Value::Array(items.iter().map(audit_value).collect()),
+        Value::String(text) => audit_string(key, text),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| audit_value(None, item)).collect())
+        }
         Value::Object(fields) => Value::Object(
             fields
                 .iter()
-                .map(|(key, value)| (key.clone(), audit_value(value)))
+                .map(|(key, value)| (key.clone(), audit_value(Some(key), value)))
                 .collect(),
         ),
         _ => value.clone(),
     }
 }
 
-/// Preserve the request that was actually made.
+/// Preserve useful request context without turning the audit log into bulk storage.
 ///
-/// The only generic failsafe is deliberately cheap: long mixed alphanumeric
-/// chunks look more like opaque keys/tokens than prose, so strings containing
-/// one are replaced.
+/// Opaque token-like strings remain redacted, upload bodies and very large text
+/// fields are represented by bounded size/hash summaries, and ordinary paths,
+/// commands and prose stay readable.
 #[must_use]
 pub fn summarize_payload(payload: &Map<String, Value>) -> Map<String, Value> {
     payload
         .iter()
-        .map(|(key, value)| (key.clone(), audit_value(value)))
+        .map(|(key, value)| (key.clone(), audit_value(Some(key), value)))
         .collect()
 }
 
@@ -335,6 +379,27 @@ mod tests {
         );
         assert_eq!(summary["env"]["MODE"], "debug");
         assert_eq!(summary["env"]["TOKEN"], "[redacted-tokenish]");
+    }
+
+    #[test]
+    fn bulky_payload_fields_are_compacted_without_mutating_useful_small_values() {
+        let base64 = STANDARD.encode(b"bulk bytes");
+        let huge = "plain words ".repeat(7_000);
+        let payload = Map::from_iter([
+            ("content_base64".into(), Value::String(base64)),
+            ("content".into(), Value::String(huge)),
+            ("command".into(), Value::String("cargo test".into())),
+        ]);
+        let summary = summarize_payload(&payload);
+        assert_eq!(summary["content_base64"]["omitted"], "base64");
+        assert_eq!(summary["content_base64"]["bytes"], 10);
+        assert_eq!(summary["content"]["omitted"], "text");
+        assert!(
+            summary["content"]["head"]
+                .as_str()
+                .is_some_and(|head| !head.is_empty())
+        );
+        assert_eq!(summary["command"], "cargo test");
     }
 
     #[test]

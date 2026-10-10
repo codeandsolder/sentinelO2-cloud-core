@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: &str = "1.13.0";
+pub const PROTOCOL_VERSION: &str = "1.13.2";
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const RECOMMENDED_CHUNK_BYTES: usize = 262_144;

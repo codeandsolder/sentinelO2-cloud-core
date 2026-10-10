@@ -2,13 +2,13 @@
   "core": {
     "repo": "pensados/sentinelx-cloud-core",
     "branch": "main",
-    "reviewed_sha": "9a42a250b45b14c62b7d536897382354f6ccccf9",
-    "reviewed_version": "0.23.7"
+    "reviewed_sha": "bc1a81110ecc8020355bd547795fb8393f49949f",
+    "reviewed_version": "0.23.13"
   },
   "protocol": {
     "repo": "pensados/sentinelx-cloud-protocol",
     "branch": "main",
-    "reviewed_sha": "df753ca4a73c919b7e467734c524e9a068634e1b",
-    "reviewed_version": "1.13.0"
+    "reviewed_sha": "00169f8fddbab11082f7ff0f24ef5c7e321c9a47",
+    "reviewed_version": "1.13.2"
   }
 }

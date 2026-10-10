@@ -2,7 +2,7 @@ use crate::{
     DispatchContext, DispatchResponse, Dispatcher, edit, fileops,
     handler_error::{HandlerError, HandlerResult, require_str},
     host,
-    policy::Policy,
+    policy::{Policy, ServiceSpec},
     segment, shell,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -21,6 +21,86 @@ use std::{
 const MAX_CONCURRENT_SCANS: usize = 4;
 static SCAN_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS)));
+
+type ServiceInvocation = (Vec<String>, Option<Map<String, Value>>);
+
+fn systemd_service_invocation(
+    policy: &Policy,
+    service_name: &str,
+    spec: &ServiceSpec,
+    action: &str,
+) -> Result<ServiceInvocation, HandlerError> {
+    let systemctl = policy.tooling.command("systemctl").display().to_string();
+    if !spec.user.is_empty() {
+        let user = nix::unistd::User::from_name(&spec.user)
+            .map_err(|error| {
+                HandlerError::new(
+                    "service_user_lookup_failed",
+                    format!("failed looking up systemd user {:?}: {error}", spec.user),
+                )
+            })?
+            .ok_or_else(|| {
+                HandlerError::with_details(
+                    "service_user_not_found",
+                    format!(
+                        "service {service_name:?} is declared as a systemd user unit of {:?}, but that user does not exist on this host",
+                        spec.user
+                    ),
+                    Map::from_iter([
+                        ("service".into(), Value::String(service_name.to_owned())),
+                        ("user".into(), Value::String(spec.user.clone())),
+                    ]),
+                )
+            })?;
+        if user.uid == nix::unistd::Uid::effective() {
+            let uid = user.uid.as_raw();
+            let env = Map::from_iter([
+                (
+                    "XDG_RUNTIME_DIR".into(),
+                    Value::String(format!("/run/user/{uid}")),
+                ),
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".into(),
+                    Value::String(format!("unix:path=/run/user/{uid}/bus")),
+                ),
+            ]);
+            return Ok((
+                vec![systemctl, "--user".into(), action.into(), spec.unit.clone()],
+                Some(env),
+            ));
+        }
+        let sudo = policy.tooling.command("sudo").display().to_string();
+        return Ok((
+            vec![
+                sudo,
+                "-n".into(),
+                systemctl,
+                "--user".into(),
+                format!("--machine={}@.host", spec.user),
+                action.into(),
+                spec.unit.clone(),
+            ],
+            None,
+        ));
+    }
+
+    let read_only = matches!(action, "status" | "is-active" | "is-enabled");
+    if spec.requires_sudo && !read_only {
+        let sudo = policy.tooling.command("sudo").display().to_string();
+        Ok((
+            vec![
+                sudo,
+                "-n".into(),
+                systemctl,
+                action.into(),
+                spec.unit.clone(),
+            ],
+            None,
+        ))
+    } else {
+        Ok((vec![systemctl, action.into(), spec.unit.clone()], None))
+    }
+}
 
 fn decode_exec_command(command: &str) -> Result<Cow<'_, str>, HandlerError> {
     let Some(encoded) = command.strip_prefix("b64,") else {
@@ -292,16 +372,19 @@ impl CoreDispatcher {
             .services
             .iter()
             .map(|(name, spec)| {
-                (
-                    name.clone(),
-                    json!({
-                        "unit": spec.unit,
-                        "backend": spec.backend,
-                        "actions": spec.actions,
-                        "requires_sudo": spec.requires_sudo,
-                        "description": spec.description,
-                    }),
-                )
+                let mut details = json!({
+                    "unit": spec.unit,
+                    "backend": spec.backend,
+                    "actions": spec.actions,
+                    "requires_sudo": spec.requires_sudo,
+                    "description": spec.description,
+                });
+                if !spec.user.is_empty()
+                    && let Some(map) = details.as_object_mut()
+                {
+                    map.insert("user".into(), Value::String(spec.user.clone()));
+                }
+                (name.clone(), details)
             })
             .collect()
     }
@@ -873,7 +956,9 @@ impl CoreDispatcher {
         let Some(spec) = self.policy.services.get(service) else {
             return Err(HandlerError::with_details(
                 "service_not_allowed",
-                format!("service {service:?} is not registered in policy"),
+                format!(
+                    "service {service:?} is not registered in policy; if it is a systemd user unit, register it with user: <owner> so the agent targets that user's manager"
+                ),
                 Map::from_iter([(
                     "available".into(),
                     Value::Array(
@@ -907,25 +992,15 @@ impl CoreDispatcher {
             ));
         }
 
-        let read_only = matches!(action, "status" | "is-active" | "is-enabled");
-        let systemctl = self
-            .policy
-            .tooling
-            .command("systemctl")
-            .display()
-            .to_string();
-        let argv = if spec.requires_sudo && !read_only {
-            vec![
-                self.policy.tooling.command("sudo").display().to_string(),
-                "-n".into(),
-                systemctl,
-                action.into(),
-                spec.unit.clone(),
-            ]
-        } else {
-            vec![systemctl, action.into(), spec.unit.clone()]
-        };
-        shell::run_argv(&self.policy, &argv, Duration::from_secs(30), None, None).await
+        let (argv, env) = systemd_service_invocation(&self.policy, service, spec, action)?;
+        shell::run_argv(
+            &self.policy,
+            &argv,
+            Duration::from_secs(30),
+            None,
+            env.as_ref(),
+        )
+        .await
     }
 
     async fn read_audit(&self, payload: &Map<String, Value>) -> HandlerResult {
@@ -1389,6 +1464,7 @@ mod tests {
                 description: String::new(),
                 domain: "system".into(),
                 backend: "service".into(),
+                user: String::new(),
             },
         );
         let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
@@ -1588,6 +1664,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn systemd_user_invocation_targets_the_users_manager() -> TestResult {
+        let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::effective()).test_value()?
+        else {
+            return Ok(());
+        };
+        let spec = ServiceSpec {
+            unit: "fixture.service".into(),
+            actions: vec!["status".into()],
+            requires_sudo: true,
+            description: String::new(),
+            domain: "system".into(),
+            backend: "service".into(),
+            user: user.name,
+        };
+        let (argv, env) =
+            systemd_service_invocation(&Policy::default(), "fixture", &spec, "status")
+                .test_value()?;
+        assert_eq!(argv[1], "--user");
+        let env = env.test_value()?;
+        assert!(
+            env["XDG_RUNTIME_DIR"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("/run/user/"))
+        );
+        assert!(
+            env["DBUS_SESSION_BUS_ADDRESS"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("unix:path=/run/user/"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_systemd_user_is_a_structured_error() {
+        let spec = ServiceSpec {
+            unit: "fixture.service".into(),
+            actions: vec!["status".into()],
+            requires_sudo: true,
+            description: String::new(),
+            domain: "system".into(),
+            backend: "service".into(),
+            user: "sentinelo2-user-that-does-not-exist".into(),
+        };
+        let error =
+            systemd_service_invocation(&Policy::default(), "fixture", &spec, "status").err();
+        assert!(error.is_some_and(|error| error.code == "service_user_not_found"));
+    }
+
     #[tokio::test]
     async fn read_only_service_action_does_not_add_sudo() -> TestResult {
         let mut policy = Policy::default();
@@ -1600,6 +1725,7 @@ mod tests {
                 description: String::new(),
                 domain: "system".into(),
                 backend: "service".into(),
+                user: String::new(),
             },
         );
         let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
