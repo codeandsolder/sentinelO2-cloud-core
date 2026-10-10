@@ -143,7 +143,7 @@ jobs:
         run: ./target/release/sentinelx-core --help >/dev/null
       - name: Checksum
         run: (cd target/release && sha256sum sentinelx-core > sentinelx-core.sha256)
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: sentinelx-core-linux-x86_64
           path: |
