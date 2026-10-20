@@ -1518,11 +1518,10 @@ mod tests {
         let navigation = default.help_navigation();
         assert!(!navigation.contains_key("exec"));
         let access = default.help_extending_access();
-        assert!(
-            access["command"]
-                .as_str()?
-                .contains("exec_mode is allowlist")
-        );
+        assert!(matches!(
+            access["command"].as_str(),
+            Some(value) if value.contains("exec_mode is allowlist")
+        ));
 
         let unrestricted = CoreDispatcher::new(
             Policy {
@@ -1534,7 +1533,10 @@ mod tests {
             "test",
         );
         let navigation = unrestricted.help_navigation();
-        assert!(navigation["exec"].as_str()?.contains("unrestricted mode"));
+        assert!(matches!(
+            navigation["exec"].as_str(),
+            Some(value) if value.contains("unrestricted mode")
+        ));
 
         let strict = CoreDispatcher::new(
             Policy {
@@ -1547,7 +1549,10 @@ mod tests {
             "test",
         );
         let navigation = strict.help_navigation();
-        assert!(navigation["exec"].as_str()?.contains("strict mode"));
+        assert!(matches!(
+            navigation["exec"].as_str(),
+            Some(value) if value.contains("strict mode")
+        ));
         Ok(())
     }
 
