@@ -1,17 +1,48 @@
 use crate::policy::Policy;
 
 const READ_ONLY_FILTERS: &[&str] = &[
-    "head", "tail", "sort", "uniq", "wc", "cut", "tr", "grep", "egrep", "fgrep", "rg", "cat",
-    "rev", "tac", "nl", "fold", "paste", "join", "comm", "column", "base64", "md5sum",
-    "sha256sum", "echo", "printf", "true", "false", "seq", "basename", "dirname", "realpath",
-    "readlink", "date",
+    "head",
+    "tail",
+    "sort",
+    "uniq",
+    "wc",
+    "cut",
+    "tr",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "cat",
+    "rev",
+    "tac",
+    "nl",
+    "fold",
+    "paste",
+    "join",
+    "comm",
+    "column",
+    "base64",
+    "md5sum",
+    "sha256sum",
+    "echo",
+    "printf",
+    "true",
+    "false",
+    "seq",
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    "date",
 ];
 const POSITION_FREE: &[&str] = &["cd"];
 const SAFE_BUILTINS: &[&str] = &[
     "set", "test", "[", "[[", "true", "false", ":", "read", "shift", "break", "continue", "exit",
     "return", "wait",
 ];
-const LEADING_KEYWORDS: &[&str] = &["do", "then", "else", "elif", "if", "while", "until", "!", "{", "time"];
+const LEADING_KEYWORDS: &[&str] = &[
+    "do", "then", "else", "elif", "if", "while", "until", "!", "{", "time",
+];
 const CLOSING_KEYWORDS: &[&str] = &["done", "fi", "}"];
 const HEADER_KEYWORDS: &[&str] = &["for", "select"];
 const MAX_NESTING: usize = 8;
@@ -56,7 +87,10 @@ pub fn split_top_level(command: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        if chars.get(i + 1).is_some_and(|next| (ch == '&' && *next == '&') || (ch == '|' && *next == '|')) {
+        if chars
+            .get(i + 1)
+            .is_some_and(|next| (ch == '&' && *next == '&') || (ch == '|' && *next == '|'))
+        {
             if !buf.trim().is_empty() {
                 out.push(buf.trim().to_owned());
             }
@@ -149,7 +183,9 @@ pub fn has_substitution(command: &str) -> Option<&'static str> {
 
 #[must_use]
 pub fn control_character(command: &str) -> Option<char> {
-    command.chars().find(|ch| ((*ch as u32) < 32 && *ch != '\t') || *ch as u32 == 127)
+    command
+        .chars()
+        .find(|ch| ((*ch as u32) < 32 && *ch != '\t') || *ch as u32 == 127)
 }
 
 #[must_use]
@@ -211,7 +247,12 @@ pub fn file_redirection(command: &str) -> Option<String> {
             j += 1;
         }
         let mut k = j;
-        while k < bytes.len() && !matches!(bytes[k], b' ' | b'\t' | b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')') {
+        while k < bytes.len()
+            && !matches!(
+                bytes[k],
+                b' ' | b'\t' | b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')'
+            )
+        {
             k += 1;
         }
         if command[j..k].trim_matches(['\'', '"']) == "/dev/null" {
@@ -349,13 +390,16 @@ fn command_part(segment: &str) -> Result<Option<String>, UnparseableCommand> {
 
 fn only_assignments(segment: &str) -> bool {
     let tokens: Vec<&str> = segment.split_whitespace().collect();
-    !tokens.is_empty() && tokens.into_iter().all(|token| {
-        token.split_once('=').is_some_and(|(name, _)| {
-            let mut chars = name.chars();
-            chars.next().is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    !tokens.is_empty()
+        && tokens.into_iter().all(|token| {
+            token.split_once('=').is_some_and(|(name, _)| {
+                let mut chars = name.chars();
+                chars
+                    .next()
+                    .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+                    && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            })
         })
-    })
 }
 
 fn substitution_bodies(command: &str) -> Result<(String, Vec<String>), UnparseableCommand> {
@@ -391,7 +435,8 @@ fn substitution_bodies(command: &str) -> Result<(String, Vec<String>), Unparseab
             i += 1;
             continue;
         }
-        let process = quote.is_none() && (bytes[i..].starts_with(b"<(") || bytes[i..].starts_with(b">("));
+        let process =
+            quote.is_none() && (bytes[i..].starts_with(b"<(") || bytes[i..].starts_with(b">("));
         let dollar = bytes[i..].starts_with(b"$(") && !bytes[i..].starts_with(b"$((");
         if dollar || process {
             let body_start = i + 2;
@@ -421,7 +466,9 @@ fn substitution_bodies(command: &str) -> Result<(String, Vec<String>), Unparseab
                 j += 1;
             }
             if j >= bytes.len() {
-                return Err(UnparseableCommand("unbalanced parentheses in a substitution".into()));
+                return Err(UnparseableCommand(
+                    "unbalanced parentheses in a substitution".into(),
+                ));
             }
             bodies.push(command[body_start..j].to_owned());
             masked.push_str("__SX_SUBST__");
@@ -431,7 +478,11 @@ fn substitution_bodies(command: &str) -> Result<(String, Vec<String>), Unparseab
         if ch == b'`' {
             let mut j = i + 1;
             while j < bytes.len() && bytes[j] != b'`' {
-                j += if bytes[j] == b'\\' && j + 1 < bytes.len() { 2 } else { 1 };
+                j += if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    2
+                } else {
+                    1
+                };
             }
             if j >= bytes.len() {
                 return Err(UnparseableCommand("unbalanced backtick".into()));
@@ -447,7 +498,10 @@ fn substitution_bodies(command: &str) -> Result<(String, Vec<String>), Unparseab
     Ok((masked, bodies))
 }
 
-pub fn unauthorised_chain(policy: &Policy, command: &str) -> Result<Option<String>, UnparseableCommand> {
+pub fn unauthorised_chain(
+    policy: &Policy,
+    command: &str,
+) -> Result<Option<String>, UnparseableCommand> {
     unauthorised_chain_inner(policy, command, 0)
 }
 
@@ -524,12 +578,18 @@ mod tests {
 
     #[test]
     fn quoted_separators_are_data_not_structure() {
-        assert_eq!(split_top_level("printf ';|&&' && echo done"), vec!["printf ';|&&'", "echo done"]);
+        assert_eq!(
+            split_top_level("printf ';|&&' && echo done"),
+            vec!["printf ';|&&'", "echo done"]
+        );
     }
 
     #[test]
     fn newlines_and_background_operators_split_commands() {
-        assert_eq!(split_top_level("uptime & id\npwd&&ls"), vec!["uptime", "id", "pwd", "ls"]);
+        assert_eq!(
+            split_top_level("uptime & id\npwd&&ls"),
+            vec!["uptime", "id", "pwd", "ls"]
+        );
         assert_eq!(split_top_level("printf x 2>&1"), vec!["printf x 2>&1"]);
     }
 
@@ -554,17 +614,35 @@ mod tests {
     fn filters_cannot_open_paths_or_use_write_options() {
         let policy = policy(&["make"]);
         assert_eq!(unauthorised_segment(&policy, "make | cat"), None);
-        assert_eq!(unauthorised_segment(&policy, "make | cat /etc/shadow"), Some("cat /etc/shadow".into()));
-        assert_eq!(unauthorised_segment(&policy, "make | sort -o /tmp/x"), Some("sort -o /tmp/x".into()));
+        assert_eq!(
+            unauthorised_segment(&policy, "make | cat /etc/shadow"),
+            Some("cat /etc/shadow".into())
+        );
+        assert_eq!(
+            unauthorised_segment(&policy, "make | sort -o /tmp/x"),
+            Some("sort -o /tmp/x".into())
+        );
     }
 
     #[test]
     fn chain_check_handles_grammar_and_substitutions() {
         let policy = policy(&["make", "ls", "printf"]);
-        assert_eq!(unauthorised_chain(&policy, "cd /tmp && make | head").unwrap(), None);
-        assert_eq!(unauthorised_chain(&policy, "make; curl bad").unwrap(), Some("curl bad".into()));
-        assert_eq!(unauthorised_chain(&policy, "printf '%s' \"$(id)\"").unwrap(), Some("id".into()));
-        assert_eq!(unauthorised_chain(&policy, "for x in 1 2; do printf '%s' \"$x\"; done").unwrap(), None);
+        assert_eq!(
+            unauthorised_chain(&policy, "cd /tmp && make | head").unwrap(),
+            None
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "make; curl bad").unwrap(),
+            Some("curl bad".into())
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "printf '%s' \"$(id)\"").unwrap(),
+            Some("id".into())
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "for x in 1 2; do printf '%s' \"$x\"; done").unwrap(),
+            None
+        );
         assert!(unauthorised_chain(&policy, "case x in x) ls;; esac").is_err());
     }
 }

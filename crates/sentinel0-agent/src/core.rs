@@ -2,7 +2,7 @@ use crate::{
     DispatchContext, DispatchResponse, Dispatcher, edit, fileops,
     handler_error::{HandlerError, HandlerResult, require_str},
     host,
-    policy::{Policy, ServiceSpec},
+    policy::{ExecMode, Policy, ServiceSpec},
     segment, shell,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -306,6 +306,7 @@ impl CoreDispatcher {
                     "exec_timeout_default": self.policy.exec_timeout_default,
                     "exec_timeout_max": self.policy.exec_timeout_max,
                     "exec_capture_max_bytes": self.policy.exec_capture_max_bytes,
+                    "exec_mode": self.policy.exec_mode.as_str(),
                     "exec_enforce_allowlist": self.policy.exec_enforce_allowlist,
                 }),
             ),
@@ -505,6 +506,10 @@ impl CoreDispatcher {
                         .map(Value::String)
                         .collect(),
                 ),
+            ),
+            (
+                "exec_mode".into(),
+                Value::String(self.policy.exec_mode.as_str().into()),
             ),
             ("exec_strict".into(), Value::Bool(self.policy.exec_strict)),
             (
@@ -884,17 +889,32 @@ impl CoreDispatcher {
             ));
         }
 
-        if self.policy.exec_enforce_allowlist {
-            if self.policy.exec_strict {
+        match self.policy.exec_mode {
+            ExecMode::Unrestricted => {}
+            ExecMode::Strict => {
+                if let Some(control) = segment::control_character(command) {
+                    return Err(HandlerError::new(
+                        "command_not_allowed",
+                        format!("strict exec refuses control character {control:?}"),
+                    ));
+                }
                 if let Some(substitution) = segment::has_substitution(command) {
                     return Err(HandlerError::with_details(
                         "command_not_allowed",
-                        format!(
-                            "exec_strict is on and this command uses {substitution} command substitution"
-                        ),
+                        format!("strict exec refuses {substitution} command substitution"),
                         Map::from_iter([
                             ("command".into(), Value::String(command.into())),
                             ("substitution".into(), Value::String(substitution.into())),
+                        ]),
+                    ));
+                }
+                if let Some(redirection) = segment::file_redirection(command) {
+                    return Err(HandlerError::with_details(
+                        "command_not_allowed",
+                        format!("strict exec refuses file redirection {redirection:?}"),
+                        Map::from_iter([
+                            ("command".into(), Value::String(command.into())),
+                            ("redirection".into(), Value::String(redirection)),
                         ]),
                     ));
                 }
@@ -902,7 +922,7 @@ impl CoreDispatcher {
                     return Err(HandlerError::with_details(
                         "command_not_allowed",
                         format!(
-                            "exec_strict is on and segment {offending:?} is not covered by allowed_commands"
+                            "strict exec segment {offending:?} is not covered by allowed_commands"
                         ),
                         Map::from_iter([
                             ("command".into(), Value::String(command.into())),
@@ -911,29 +931,29 @@ impl CoreDispatcher {
                     ));
                 }
             }
-            if !self.policy.is_command_allowed(command) {
-                return Err(HandlerError::with_details(
-                    "command_not_allowed",
-                    format!(
-                        "command not in allowlist: {}",
-                        command.split_whitespace().next().unwrap_or("")
-                    ),
-                    Map::from_iter([
-                        ("command".into(), Value::String(command.into())),
-                        (
-                            "allowed_commands".into(),
-                            Value::Array(
-                                self.policy
-                                    .allowed_commands
-                                    .iter()
-                                    .cloned()
-                                    .map(Value::String)
-                                    .collect(),
-                            ),
-                        ),
-                    ]),
-                ));
-            }
+            ExecMode::Allowlist => match segment::unauthorised_chain(&self.policy, command) {
+                Ok(None) => {}
+                Ok(Some(offending)) => {
+                    return Err(HandlerError::with_details(
+                        "command_not_allowed",
+                        format!("command segment {offending:?} is not covered by allowed_commands"),
+                        Map::from_iter([
+                            ("command".into(), Value::String(command.into())),
+                            ("offending_segment".into(), Value::String(offending)),
+                        ]),
+                    ));
+                }
+                Err(segment::UnparseableCommand(reason)) => {
+                    return Err(HandlerError::with_details(
+                        "command_not_allowed",
+                        format!("command structure cannot be checked safely: {reason}"),
+                        Map::from_iter([
+                            ("command".into(), Value::String(command.into())),
+                            ("reason".into(), Value::String(reason)),
+                        ]),
+                    ));
+                }
+            },
         }
 
         shell::run_shell(

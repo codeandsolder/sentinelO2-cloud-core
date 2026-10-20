@@ -197,7 +197,7 @@ pub struct ReconnectPolicy {
 impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self {
-            steps: vec![0, 1, 2, 5, 10, 20, 30, 60, 120, 300]
+            steps: vec![0, 1, 2, 5, 10, 20, 30, 60]
                 .into_iter()
                 .map(Duration::from_secs)
                 .collect::<Vec<_>>()

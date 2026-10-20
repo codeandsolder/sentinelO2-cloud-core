@@ -339,8 +339,8 @@ fn validator_argv(
                 "--python".into(),
                 policy.tooling.uv_python.clone(),
                 "python".into(),
-                "-m".into(),
-                "py_compile".into(),
+                "-c".into(),
+                "import pathlib,sys; p=sys.argv[1]; compile(pathlib.Path(p).read_bytes(), p, 'exec')".into(),
                 path.display().to_string(),
             ],
             "sh" => vec![

@@ -90,6 +90,16 @@ fn safe_dest(upload_base: &Path, target: &str) -> Result<PathBuf, HandlerError> 
             "target_path must remain under upload_base and must not contain '..'",
         ));
     }
+    if relative
+        .components()
+        .next()
+        .is_some_and(|part| part.as_os_str() == ".sentinelx_uploads")
+    {
+        return Err(HandlerError::new(
+            "path_not_allowed",
+            "target_path must not address the reserved .sentinelx_uploads staging area",
+        ));
+    }
 
     let base = soft_canonicalize::soft_canonicalize(upload_base)
         .map_err(|e| HandlerError::new("io_error", format!("cannot resolve upload_base: {e}")))?;
@@ -670,7 +680,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
         }
     }
 
-    let destination = PathBuf::from(&meta.target_path);
+    let destination = safe_dest(&policy.upload_base, &meta.target_path)?;
     finalize_chunked_upload(&assembled, &destination, meta.overwrite)?;
     let cleanup_warning = match fs::remove_dir_all(&dir) {
         Ok(()) => None,
