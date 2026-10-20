@@ -463,6 +463,14 @@ impl CoreDispatcher {
         Ok(locations)
     }
 
+    fn capability_unusable_commands(&self) -> Value {
+        if self.policy.exec_enforce_allowlist {
+            Self::unusable_commands_for(&self.policy.allowed_commands, Self::no_new_privileges())
+        } else {
+            json!({})
+        }
+    }
+
     fn capabilities_full(&self, ops: Vec<String>) -> HandlerResult {
         let services = self.capability_services();
         let (paths, readable, writable) = self.capability_paths();
@@ -518,14 +526,7 @@ impl CoreDispatcher {
             ),
             (
                 "unusable_commands".into(),
-                if self.policy.exec_enforce_allowlist {
-                    Self::unusable_commands_for(
-                        &self.policy.allowed_commands,
-                        Self::no_new_privileges(),
-                    )
-                } else {
-                    json!({})
-                },
+                self.capability_unusable_commands(),
             ),
             ("services".into(), Value::Object(services)),
             ("locations".into(), Value::Object(locations)),
@@ -853,48 +854,7 @@ impl CoreDispatcher {
         )
     }
 
-    async fn exec(&self, payload: &Map<String, Value>) -> HandlerResult {
-        let command = decode_exec_command(require_str(payload, "command")?)?;
-        let command = command.as_ref();
-        let timeout_secs = payload
-            .get("timeout")
-            .and_then(Value::as_f64)
-            .unwrap_or_else(|| {
-                self.policy
-                    .exec_timeout_default
-                    .to_f64()
-                    .unwrap_or(f64::MAX)
-            })
-            .max(0.001);
-        let ceiling = if payload
-            .get("background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            self.policy
-                .exec_timeout_max
-                .max(crate::jobs::BACKGROUND_TIMEOUT_MAX_SECS)
-        } else {
-            self.policy.exec_timeout_max
-        };
-        let timeout_secs = timeout_secs.min(ceiling.to_f64().unwrap_or(f64::MAX));
-
-        if let Some(kind) = self.policy.tooling.direct_python_violation(command) {
-            let replacement = if kind == "pip" {
-                "uv pip … (or uv sync / uv tool install)"
-            } else {
-                "uv run --no-project python …"
-            };
-            return Err(HandlerError::with_details(
-                "use_uv",
-                format!("direct {kind} invocation is disabled; use {replacement}"),
-                Map::from_iter([
-                    ("command".into(), Value::String(command.into())),
-                    ("replacement".into(), Value::String(replacement.into())),
-                ]),
-            ));
-        }
-
+    fn validate_exec_policy(&self, command: &str) -> Result<(), HandlerError> {
         match self.policy.exec_mode {
             ExecMode::Unrestricted => {}
             ExecMode::Strict => {
@@ -961,6 +921,53 @@ impl CoreDispatcher {
                 }
             },
         }
+
+        Ok(())
+    }
+
+    async fn exec(&self, payload: &Map<String, Value>) -> HandlerResult {
+        let command = decode_exec_command(require_str(payload, "command")?)?;
+        let command = command.as_ref();
+        let timeout_secs = payload
+            .get("timeout")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                self.policy
+                    .exec_timeout_default
+                    .to_f64()
+                    .unwrap_or(f64::MAX)
+            })
+            .max(0.001);
+        let ceiling = if payload
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.policy
+                .exec_timeout_max
+                .max(crate::jobs::BACKGROUND_TIMEOUT_MAX_SECS)
+        } else {
+            self.policy.exec_timeout_max
+        };
+        let timeout_secs = timeout_secs.min(ceiling.to_f64().unwrap_or(f64::MAX));
+
+        if let Some(kind) = self.policy.tooling.direct_python_violation(command) {
+            let replacement = if kind == "pip" {
+                "uv pip … (or uv sync / uv tool install)"
+            } else {
+                "uv run --no-project python …"
+            };
+            return Err(HandlerError::with_details(
+                "use_uv",
+                format!("direct {kind} invocation is disabled; use {replacement}"),
+                Map::from_iter([
+                    ("command".into(), Value::String(command.into())),
+                    ("replacement".into(), Value::String(replacement.into())),
+                ]),
+            ));
+        }
+
+        self.validate_exec_policy(command)?;
 
         shell::run_shell(
             &self.policy,
@@ -1479,6 +1486,7 @@ mod tests {
                 path: dir.path().to_owned(),
                 access: FileAccess::ReadWrite,
             }],
+            allowed_commands: vec!["true".into()],
             ..Policy::default()
         };
         policy.services.insert(
@@ -1513,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn help_exec_matches_exec_mode() -> TestResult {
+    fn help_exec_matches_exec_mode() {
         let default = CoreDispatcher::new(Policy::default(), PathBuf::from("config.yaml"), "test");
         let navigation = default.help_navigation();
         assert!(!navigation.contains_key("exec"));
@@ -1553,7 +1561,6 @@ mod tests {
             navigation["exec"].as_str(),
             Some(value) if value.contains("strict mode")
         ));
-        Ok(())
     }
 
     #[test]

@@ -267,7 +267,7 @@ pub fn file_redirection(command: &str) -> Option<String> {
 fn shell_words(segment: &str) -> Result<Vec<String>, ()> {
     let mut out = Vec::new();
     let mut current = String::new();
-    let mut chars = segment.chars().peekable();
+    let mut chars = segment.chars();
     let mut quote: Option<char> = None;
     while let Some(ch) = chars.next() {
         if let Some(active) = quote {
@@ -364,17 +364,17 @@ fn filter_unsafe(segment: &str) -> bool {
 }
 
 fn command_part(segment: &str) -> Result<Option<String>, UnparseableCommand> {
-    let mut rest = segment.trim().to_owned();
+    let mut rest = segment.trim();
     loop {
-        rest = rest.trim_start_matches('(').trim().to_owned();
-        let word = first_word(&rest).to_owned();
-        if LEADING_KEYWORDS.contains(&word.as_str()) {
-            rest = rest[word.len()..].trim().to_owned();
+        rest = rest.trim_start_matches('(').trim();
+        let word = first_word(rest);
+        if LEADING_KEYWORDS.contains(&word) {
+            rest = rest[word.len()..].trim();
         } else {
             break;
         }
     }
-    let word = first_word(&rest);
+    let word = first_word(rest);
     if word.is_empty() || CLOSING_KEYWORDS.contains(&word) || HEADER_KEYWORDS.contains(&word) {
         return Ok(None);
     }
@@ -382,10 +382,9 @@ fn command_part(segment: &str) -> Result<Option<String>, UnparseableCommand> {
         return Err(UnparseableCommand("a case statement".into()));
     }
     while rest.ends_with(')') && rest.matches(')').count() > rest.matches('(').count() {
-        rest.pop();
-        rest = rest.trim_end().to_owned();
+        rest = rest[..rest.len() - 1].trim_end();
     }
-    Ok((!rest.is_empty()).then_some(rest))
+    Ok((!rest.is_empty()).then(|| rest.to_owned()))
 }
 
 fn only_assignments(segment: &str) -> bool {
@@ -498,6 +497,10 @@ fn substitution_bodies(command: &str) -> Result<(String, Vec<String>), Unparseab
     Ok((masked, bodies))
 }
 
+/// Returns the first command segment not authorised by policy.
+///
+/// # Errors
+/// Returns [`UnparseableCommand`] when shell structure cannot be checked safely.
 pub fn unauthorised_chain(
     policy: &Policy,
     command: &str,
@@ -629,20 +632,20 @@ mod tests {
     fn chain_check_handles_grammar_and_substitutions() {
         let policy = policy(&["make", "ls", "printf"]);
         assert_eq!(
-            unauthorised_chain(&policy, "cd /tmp && make | head").unwrap(),
-            None
+            unauthorised_chain(&policy, "cd /tmp && make | head"),
+            Ok(None)
         );
         assert_eq!(
-            unauthorised_chain(&policy, "make; curl bad").unwrap(),
-            Some("curl bad".into())
+            unauthorised_chain(&policy, "make; curl bad"),
+            Ok(Some("curl bad".into()))
         );
         assert_eq!(
-            unauthorised_chain(&policy, "printf '%s' \"$(id)\"").unwrap(),
-            Some("id".into())
+            unauthorised_chain(&policy, "printf '%s' \"$(id)\""),
+            Ok(Some("id".into()))
         );
         assert_eq!(
-            unauthorised_chain(&policy, "for x in 1 2; do printf '%s' \"$x\"; done").unwrap(),
-            None
+            unauthorised_chain(&policy, "for x in 1 2; do printf '%s' \"$x\"; done"),
+            Ok(None)
         );
         assert!(unauthorised_chain(&policy, "case x in x) ls;; esac").is_err());
     }
