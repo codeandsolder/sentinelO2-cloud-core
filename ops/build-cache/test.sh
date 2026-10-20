@@ -31,6 +31,12 @@ grep -F 'SCCACHE_SERVER_PORT="$CLIENT_PORT" SCCACHE_START_SERVER=0 "$LIVE" "$@"'
 grep -F 'export SCCACHE_START_SERVER="${SCCACHE_START_SERVER:-0}"' "$HERE/sccache-router" >/dev/null
 grep -F 'exec /usr/local/libexec/sccache-bin/sccache "$@"' "$HERE/sccache-router" >/dev/null
 grep -F 'exec /usr/local/libexec/sccache-bin/sccache "${args[@]}"' "$HERE/sccache-client" >/dev/null
+grep -F 'export SCCACHE_NO_AUTO_START_SERVER=1' "$HERE/sccache-client" >/dev/null
+grep -F 'if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${OUT_DIR:-}" ]]; then' "$HERE/sccache-client" >/dev/null
+if rg -n '^export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1$|/home/jan/projects/\*|SCCACHE_CANONICAL_BUILD_ROOT=' "$HERE/sccache-client" >/dev/null; then
+    echo "sccache client must not unconditionally enable canonical Rust or guess site-specific roots" >&2
+    exit 1
+fi
 if rg -n '(^|[[:space:]])nc -z' "$HERE/sccache-release-update" >/dev/null; then
     echo "sccache updater must not require netcat" >&2
     exit 1
