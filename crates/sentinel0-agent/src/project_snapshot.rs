@@ -1,7 +1,7 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
-    process_output::{WaitOutcome, wait_bounded_with_limits},
+    process_output::{POST_TIMEOUT_GRACE, WaitOutcome, wait_bounded_with_limits},
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -106,9 +106,22 @@ async fn run_git(
             .await
         {
             Ok(WaitOutcome::Completed(captured)) => captured,
-            Ok(WaitOutcome::TimedOut) => {
-                let cleanup_error = cleanup_git_child(&mut child, pid, "timeout").await;
+            Ok(WaitOutcome::TimedOut(pending)) => {
+                let mut cleanup_error = cleanup_git_child(&mut child, pid, "timeout").await;
+                let captured = pending
+                    .finish_after_kill(&mut child, POST_TIMEOUT_GRACE)
+                    .await;
+                if let Some(error) = captured.capture_error {
+                    cleanup_error =
+                        Some(cleanup_error.map_or_else(
+                            || error.clone(),
+                            |existing| format!("{existing}; {error}"),
+                        ));
+                }
                 let mut details = Map::new();
+                if captured.left_running {
+                    details.insert("left_running".into(), Value::Bool(true));
+                }
                 if let Some(error) = cleanup_error {
                     details.insert("cleanup_error".into(), Value::String(error));
                 }

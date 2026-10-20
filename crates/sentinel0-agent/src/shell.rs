@@ -1,7 +1,10 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
-    process_output::{CapturedOutput, WaitOutcome, wait_bounded},
+    process_output::{
+        CapturedOutput, CapturedStream, LEFT_RUNNING_NOTE, POST_TIMEOUT_GRACE, TimedOutOutput,
+        WaitOutcome, wait_bounded,
+    },
 };
 use serde_json::{Map, Value};
 use std::{
@@ -16,13 +19,25 @@ fn rounded_seconds(start: Instant) -> f64 {
     (secs * 100.0).round() / 100.0
 }
 
+fn add_capture_metadata(
+    out: &mut BTreeMap<String, Value>,
+    stdout: &CapturedStream,
+    stderr: &CapturedStream,
+) {
+    if stdout.truncated() || stderr.truncated() {
+        out.insert("output_truncated".into(), Value::Bool(true));
+        out.insert("stdout_bytes".into(), Value::from(stdout.total_bytes()));
+        out.insert("stderr_bytes".into(), Value::from(stderr.total_bytes()));
+    }
+}
+
 fn result(
     output: String,
     duration: f64,
     returncode: i32,
     timed_out: bool,
     captured: Option<&CapturedOutput>,
-    kill_error: Option<String>,
+    cleanup_error: Option<String>,
 ) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::from([
         ("output".into(), Value::String(output)),
@@ -33,36 +48,54 @@ fn result(
         out.insert("timed_out".into(), Value::Bool(true));
     }
     if let Some(captured) = captured {
-        let truncated = captured.stdout.truncated() || captured.stderr.truncated();
-        if truncated {
-            out.insert("output_truncated".into(), Value::Bool(true));
-            out.insert(
-                "stdout_bytes".into(),
-                Value::from(captured.stdout.total_bytes()),
-            );
-            out.insert(
-                "stderr_bytes".into(),
-                Value::from(captured.stderr.total_bytes()),
-            );
-        }
+        add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
     }
-    if let Some(error) = kill_error {
+    if let Some(error) = cleanup_error {
         out.insert("cleanup_error".into(), Value::String(error));
     }
     out
 }
 
-fn merged_output(captured: &CapturedOutput) -> String {
-    let stdout = captured.stdout.rendered_trimmed_lossy();
-    let stderr = captured.stderr.rendered_trimmed_lossy();
-    if stdout.is_empty() && stderr.is_empty() {
-        "⚠️ Sin salida".into()
-    } else if stderr.is_empty() {
+fn merge_streams(stdout: &CapturedStream, stderr: &CapturedStream) -> String {
+    let stdout = stdout.rendered_trimmed_lossy();
+    let stderr = stderr.rendered_trimmed_lossy();
+    if stderr.is_empty() {
         stdout
     } else if stdout.is_empty() {
         stderr
     } else {
         format!("{stdout}\n{stderr}")
+    }
+}
+
+fn merged_output(captured: &CapturedOutput) -> String {
+    let output = merge_streams(&captured.stdout, &captured.stderr);
+    if output.is_empty() {
+        "⚠️ Sin salida".into()
+    } else {
+        output
+    }
+}
+
+fn timeout_output(captured: &TimedOutOutput) -> String {
+    let partial = merge_streams(&captured.stdout, &captured.stderr);
+    let mut output = if partial.is_empty() {
+        "⏱️ Timeout".to_owned()
+    } else {
+        format!("⏱️ Timeout. Output written before the timeout:\n{partial}")
+    };
+    if captured.left_running {
+        output.push('\n');
+        output.push_str(LEFT_RUNNING_NOTE);
+    }
+    output
+}
+
+fn combine_cleanup_errors(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
     }
 }
 
@@ -188,20 +221,26 @@ pub async fn run_argv(
                 None,
             ))
         }
-        WaitOutcome::TimedOut => {
+        WaitOutcome::TimedOut(pending) => {
             let kill_error = kill_group(pid);
             process_group_guard.disarm();
-            if let Err(error) = child.wait().await {
-                tracing::warn!(%error, "failed reaping timed-out child");
-            }
-            Ok(result(
-                "⏱️ Timeout".into(),
+            let captured = pending
+                .finish_after_kill(&mut child, POST_TIMEOUT_GRACE)
+                .await;
+            let cleanup_error = combine_cleanup_errors(kill_error, captured.capture_error.clone());
+            let mut out = result(
+                timeout_output(&captured),
                 rounded_seconds(start),
                 -1,
                 true,
                 None,
-                kill_error,
-            ))
+                cleanup_error,
+            );
+            add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
+            if captured.left_running {
+                out.insert("left_running".into(), Value::Bool(true));
+            }
+            Ok(out)
         }
     }
 }
@@ -273,6 +312,28 @@ mod tests {
         .test_value()?;
         assert_eq!(result["returncode"], -1);
         assert_eq!(result["timed_out"], true);
+        assert_eq!(result["output"], "⏱️ Timeout");
+        assert!(!result.contains_key("left_running"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timeout_keeps_output_written_before_deadline() -> TestResult {
+        let result = run_shell(
+            &Policy::default(),
+            "printf 'step1\n'; printf 'err1\n' >&2; sleep 10",
+            Duration::from_millis(100),
+            None,
+            None,
+        )
+        .await
+        .test_value()?;
+        let output = result["output"].as_str().test_value()?;
+        assert!(output.starts_with("⏱️ Timeout. Output written before the timeout:"));
+        assert!(output.contains("step1"));
+        assert!(output.contains("err1"));
+        assert!(!result.contains_key("left_running"));
 
         Ok(())
     }
@@ -378,6 +439,49 @@ mod tests {
             "descendant {} survived timeout",
             stamp.pid
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn escaped_descendant_is_reported_without_extending_timeout_indefinitely() -> TestResult {
+        let dir = tempfile::tempdir().test_value()?;
+        let pidfile = dir.path().join("escaped.pid");
+        let mut env = Map::new();
+        env.insert(
+            "PIDFILE".into(),
+            Value::String(pidfile.display().to_string()),
+        );
+        let started = Instant::now();
+        let result = run_shell(
+            &Policy::default(),
+            r#"setsid sleep 60 & cat "/proc/$!/stat" > "$PIDFILE"; echo started; sleep 60"#,
+            Duration::from_millis(100),
+            None,
+            Some(&env),
+        )
+        .await
+        .test_value()?;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(7),
+            "escaped descendant extended timeout too far: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result["timed_out"], true);
+        assert_eq!(result["left_running"], true);
+        let output = result["output"].as_str().test_value()?;
+        assert!(output.starts_with("⏱️ Timeout. Output written before the timeout:"));
+        assert!(output.contains("started"));
+        assert!(output.contains(LEFT_RUNNING_NOTE));
+
+        let stamp = child_stamp_from(&pidfile).await?;
+        let escaped = nix::unistd::Pid::from_raw(stamp.pid.cast_signed());
+        match nix::sys::signal::kill(escaped, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => return Err(error.into()),
+        }
+        assert!(wait_for_process_exit(stamp).await);
         Ok(())
     }
 
