@@ -590,8 +590,8 @@ impl CoreDispatcher {
             .file_ops_paths
             .iter()
             .any(|entry| entry.access == crate::policy::FileAccess::ReadWrite);
-        let exec_policy_allows_any =
-            !self.policy.exec_enforce_allowlist || !self.policy.allowed_commands.is_empty();
+        let exec_policy_allows_any = self.policy.exec_mode == ExecMode::Unrestricted
+            || !self.policy.allowed_commands.is_empty();
         let has_services = !self.policy.services.is_empty();
 
         let mut navigation = Map::from_iter([
@@ -631,10 +631,16 @@ impl CoreDispatcher {
             );
         }
         if self.help_ops_live(&[Op::Exec]) && exec_policy_allows_any {
-            let description = if self.policy.exec_enforce_allowlist {
-                "run a shell command covered by this host's configured command allowlist"
-            } else {
-                "run a shell command; command allowlist enforcement is disabled on this host"
+            let description = match self.policy.exec_mode {
+                ExecMode::Allowlist => {
+                    "run a shell command whose command segments are covered by allowed_commands"
+                }
+                ExecMode::Strict => {
+                    "run a shell command in strict mode; segments must be allowlisted and unsafe shell features are refused"
+                }
+                ExecMode::Unrestricted => {
+                    "run a shell command in unrestricted mode; allowed_commands is not enforced"
+                }
             };
             navigation.insert("exec".into(), Value::String(description.into()));
         }
@@ -696,10 +702,10 @@ impl CoreDispatcher {
             ),
             (
                 "command".into(),
-                Value::String(if self.policy.exec_enforce_allowlist {
-                    "Command allowlist enforcement is enabled. Add the command under allowed_commands, then reload; or use the configured add_allowed_command playbook when available.".into()
-                } else {
-                    "Command allowlist enforcement is disabled, so exec does not require an allowed_commands entry. OS permissions and the agent's runtime guardrails still apply.".into()
+                Value::String(match self.policy.exec_mode {
+                    ExecMode::Allowlist => "exec_mode is allowlist. Add the command under allowed_commands, then reload; or use the configured add_allowed_command playbook when available.".into(),
+                    ExecMode::Strict => "exec_mode is strict. Add the command under allowed_commands, then reload; strict shell safety checks still apply.".into(),
+                    ExecMode::Unrestricted => "exec_mode is unrestricted, so exec does not require an allowed_commands entry. OS permissions and the agent's runtime guardrails still apply.".into(),
                 }),
             ),
             (
@@ -722,7 +728,7 @@ impl CoreDispatcher {
             (
                 "security_model".into(),
                 json!({
-                    "two_layers": "Every action must pass the SentinelX policy checks that apply to it and the agent OS account's permissions. Exec command allowlisting is optional and reported explicitly.",
+                    "two_layers": "Every action must pass the SentinelX policy checks that apply to it and the agent OS account's permissions. Exec behavior is controlled by exec_mode (allowlist by default, strict, or unrestricted) and reported explicitly.",
                     "allowlist_errors": "path_not_allowed, command_not_allowed and service_not_allowed mean the host policy refused the requested scope.",
                     "permission_errors": "permission_denied means policy allowed the request but the operating-system account could not access the resource.",
                     "sudo": "read/list/search never escalate; edit may use sudo when requested; move/copy/delete/chmod/chown never sudo.",
@@ -1435,10 +1441,10 @@ mod tests {
             .test_value()?;
         let navigation = response["navigation"].as_object().test_value()?;
 
-        assert_eq!(navigation.len(), 3);
+        assert_eq!(navigation.len(), 2);
         assert!(navigation.contains_key("capabilities"));
         assert!(navigation.contains_key("state"));
-        assert!(navigation.contains_key("exec"));
+        assert!(!navigation.contains_key("exec"));
         assert!(!navigation.contains_key("read / list / search"));
         assert!(!navigation.contains_key("service / restart"));
         assert!(!navigation.contains_key("playbooks"));
@@ -1507,38 +1513,41 @@ mod tests {
     }
 
     #[test]
-    fn help_exec_matches_optional_allowlist_enforcement() -> TestResult {
-        let dispatcher = CoreDispatcher::new(Policy::default(), "/tmp/config".into(), "test");
-        let navigation = dispatcher.help_navigation();
-        assert!(navigation.contains_key("exec"));
-        assert!(
-            navigation["exec"]
-                .as_str()
-                .test_value()?
-                .contains("enforcement is disabled")
-        );
-
-        let access = dispatcher.help_extending_access();
+    fn help_exec_matches_exec_mode() -> TestResult {
+        let default = CoreDispatcher::new(Policy::default(), PathBuf::from("config.yaml"), "test");
+        let navigation = default.help_navigation();
+        assert!(!navigation.contains_key("exec"));
+        let access = default.help_extending_access();
         assert!(
             access["command"]
-                .as_str()
-                .test_value()?
-                .contains("does not require an allowed_commands entry")
+                .as_str()?
+                .contains("exec_mode is allowlist")
         );
 
-        let enforced = Policy {
-            exec_enforce_allowlist: true,
-            ..Policy::default()
-        };
-        let dispatcher = CoreDispatcher::new(enforced, "/tmp/config".into(), "test");
-        assert!(!dispatcher.help_navigation().contains_key("exec"));
-        assert!(
-            dispatcher.help_extending_access()["command"]
-                .as_str()
-                .test_value()?
-                .contains("enforcement is enabled")
+        let unrestricted = CoreDispatcher::new(
+            Policy {
+                exec_mode: ExecMode::Unrestricted,
+                exec_enforce_allowlist: false,
+                ..Policy::default()
+            },
+            PathBuf::from("config.yaml"),
+            "test",
         );
+        let navigation = unrestricted.help_navigation();
+        assert!(navigation["exec"].as_str()?.contains("unrestricted mode"));
 
+        let strict = CoreDispatcher::new(
+            Policy {
+                exec_mode: ExecMode::Strict,
+                exec_strict: true,
+                allowed_commands: vec!["git".into()],
+                ..Policy::default()
+            },
+            PathBuf::from("config.yaml"),
+            "test",
+        );
+        let navigation = strict.help_navigation();
+        assert!(navigation["exec"].as_str()?.contains("strict mode"));
         Ok(())
     }
 

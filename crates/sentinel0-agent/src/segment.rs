@@ -528,7 +528,8 @@ fn unauthorised_chain_inner(
         if POSITION_FREE.contains(&word) || SAFE_BUILTINS.contains(&word) {
             continue;
         }
-        if (index > 0 || depth > 0) && READ_ONLY_FILTERS.contains(&word) {
+        let filter_position = index > 0 || depth > 0;
+        if filter_position && READ_ONLY_FILTERS.contains(&word) {
             if filter_unsafe(&segment) {
                 return Ok(Some(segment));
             }

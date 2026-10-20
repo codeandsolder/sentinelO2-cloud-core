@@ -324,25 +324,65 @@ async fn stage_single_upload(
     }
 }
 
+fn finalize_staged_upload(
+    source: &Path,
+    destination: &Path,
+    overwrite: bool,
+) -> std::io::Result<()> {
+    let first = if overwrite {
+        fs::rename(source, destination)
+    } else {
+        rename_no_replace(source, destination)
+    };
+    match first {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() != std::io::ErrorKind::CrossesDevices => return Err(error),
+        Err(_) => {}
+    }
+
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("upload");
+    let adjacent = parent.join(format!(
+        ".{name}.sentinel-upload-{:016x}.tmp",
+        rand::random::<u64>()
+    ));
+    let copied = (|| -> std::io::Result<()> {
+        fs::copy(source, &adjacent)?;
+        fs::File::open(&adjacent)?.sync_all()?;
+        if overwrite {
+            fs::rename(&adjacent, destination)?;
+        } else {
+            rename_no_replace(&adjacent, destination)?;
+        }
+        fs::remove_file(source)?;
+        Ok(())
+    })();
+    if copied.is_err() {
+        let _ = fs::remove_file(&adjacent);
+    }
+    copied
+}
+
 async fn finalize_single_upload(
     temp: &Path,
     destination: &Path,
     overwrite: bool,
 ) -> Result<(), HandlerError> {
-    let finalize = if overwrite {
-        async_fs::rename(temp, destination).await
-    } else {
-        let temp = temp.to_owned();
-        let destination = destination.to_owned();
-        tokio::task::spawn_blocking(move || rename_no_replace(&temp, &destination))
+    let staged = temp.to_owned();
+    let target = destination.to_owned();
+    let finalize =
+        tokio::task::spawn_blocking(move || finalize_staged_upload(&staged, &target, overwrite))
             .await
             .map_err(|error| {
                 HandlerError::new(
                     "internal_error",
                     format!("upload finalization task failed: {error}"),
                 )
-            })?
-    };
+            })?;
     if let Err(error) = finalize {
         let cleanup = match async_fs::remove_file(temp).await {
             Ok(()) => None,
@@ -358,11 +398,9 @@ async fn finalize_single_upload(
             code,
             cleanup.map_or_else(
                 || format!("failed finalizing upload: {error}"),
-                |cleanup| {
-                    format!(
-                        "failed finalizing upload: {error}; staged-file cleanup also failed: {cleanup}"
-                    )
-                },
+                |cleanup| format!(
+                    "failed finalizing upload: {error}; staged-file cleanup also failed: {cleanup}"
+                ),
             ),
         ));
     }
@@ -600,6 +638,45 @@ fn assemble_upload_parts(
     Ok((total, hex_bytes(hasher.finalize())))
 }
 
+fn authorised_persisted_destination(
+    policy: &Policy,
+    meta: &UploadMeta,
+) -> Result<PathBuf, HandlerError> {
+    let target = PathBuf::from(&meta.target_path);
+    if meta.landed_in_place {
+        return policy.resolve_path(&meta.target_path, true).ok_or_else(|| {
+            HandlerError::new(
+                "path_not_allowed",
+                format!(
+                    "persisted target_path {} is no longer inside a writable file_ops path",
+                    target.display()
+                ),
+            )
+        });
+    }
+
+    let base = soft_canonicalize::soft_canonicalize(&policy.upload_base).map_err(|error| {
+        HandlerError::new("io_error", format!("failed resolving upload_base: {error}"))
+    })?;
+    let destination = soft_canonicalize::soft_canonicalize(&target).map_err(|error| {
+        HandlerError::new(
+            "io_error",
+            format!("failed resolving upload target: {error}"),
+        )
+    })?;
+    if destination != base && !destination.starts_with(&base) {
+        return Err(HandlerError::new(
+            "path_traversal",
+            format!(
+                "persisted target_path {} is not under upload_base {}",
+                target.display(),
+                base.display()
+            ),
+        ));
+    }
+    Ok(destination)
+}
+
 fn finalize_chunked_upload(
     assembled: &Path,
     destination: &Path,
@@ -616,12 +693,7 @@ fn finalize_chunked_upload(
             HandlerError::new("io_error", format!("cannot create destination parent: {e}"))
         })?;
     }
-    let finalize = if overwrite {
-        fs::rename(assembled, destination)
-    } else {
-        rename_no_replace(assembled, destination)
-    };
-    finalize.map_err(|error| {
+    finalize_staged_upload(assembled, destination, overwrite).map_err(|error| {
         HandlerError::new(
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 "conflict"
@@ -680,7 +752,7 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
         }
     }
 
-    let destination = safe_dest(&policy.upload_base, &meta.target_path)?;
+    let destination = authorised_persisted_destination(policy, &meta)?;
     finalize_chunked_upload(&assembled, &destination, meta.overwrite)?;
     let cleanup_warning = match fs::remove_dir_all(&dir) {
         Ok(()) => None,

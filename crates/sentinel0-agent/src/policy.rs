@@ -584,18 +584,46 @@ fn parse_exec_mode(raw: Option<&str>, exec_strict: bool) -> ExecMode {
 
 impl Policy {
     /// # Errors
-    /// Returns an error when the policy file cannot be read, parsed, or validated.
+    /// Returns an error only when the policy file cannot be read. Invalid text or YAML is logged and
+    /// falls back to the built-in deny-by-default policy so the agent can still come online.
     pub fn from_file(path: &Path) -> Result<Self, PolicyError> {
         if !path.exists() {
             warn!(path = %path.display(), "policy file missing; loading built-in defaults");
             return Ok(Self::default());
         }
-
-        let text = fs::read_to_string(path).map_err(|source| PolicyError::Read {
+        let bytes = fs::read(path).map_err(|source| PolicyError::Read {
             path: path.into(),
             source,
         })?;
-        let raw: RawPolicy = yaml_serde::from_str(&text).map_err(|source| PolicyError::Parse {
+        match Self::from_bytes(path, &bytes) {
+            Ok(policy) => Ok(policy),
+            Err(error) => {
+                warn!(path = %path.display(), %error, "policy is invalid; loading built-in defaults");
+                Ok(Self::default())
+            }
+        }
+    }
+
+    /// # Errors
+    /// Returns an error when the policy file cannot be read, decoded as UTF-8, parsed, or validated.
+    pub fn from_file_strict(path: &Path) -> Result<Self, PolicyError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes = fs::read(path).map_err(|source| PolicyError::Read {
+            path: path.into(),
+            source,
+        })?;
+        Self::from_bytes(path, &bytes)
+    }
+
+    fn from_bytes(path: &Path, bytes: &[u8]) -> Result<Self, PolicyError> {
+        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+        let text = std::str::from_utf8(bytes).map_err(|source| PolicyError::Read {
+            path: path.into(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        })?;
+        let raw: RawPolicy = yaml_serde::from_str(text).map_err(|source| PolicyError::Parse {
             path: path.into(),
             source,
         })?;
