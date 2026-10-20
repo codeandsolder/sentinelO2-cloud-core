@@ -1,53 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# The managed sccache daemon executes the compiler path supplied by the client.
+# If that path is one of our strict compiler wrappers, it lands back here with
+# the daemon itself as our parent. Re-entering sccache from that context would
+# recursively submit the same compile to the daemon and deadlock. The compile
+# is already inside sccache, so execute the real compiler directly instead.
+parent_exe="$(readlink "/proc/$PPID/exe" 2>/dev/null || true)"
+parent_exe="${parent_exe% (deleted)}"
+if [[ "$parent_exe" == */sccache ]]; then
+    exec "$@"
+fi
+
+# During an sccache binary rollout, stop admitting new compiler submissions
+# while allowing already-admitted daemon work to finish. A stale marker is
+# ignored after 15 minutes so an interrupted updater cannot wedge compilation.
+drain="/dev/shm/sccache-maintenance-drain"
+while [[ -e "$drain" ]]; do
+    drain_mtime="$(stat -c %Y "$drain" 2>/dev/null || printf '0')"
+    now="$(date +%s)"
+    if (( drain_mtime <= 0 || now - drain_mtime >= 900 )); then
+        break
+    fi
+    sleep 0.1
+done
+
 if [[ -z "${SCCACHE_SERVER_PORT:-}" ]]; then
-  if (( EUID == 0 )); then
-    export SCCACHE_SERVER_PORT=4227
-  else
-    export SCCACHE_SERVER_PORT=4226
-  fi
+    if (( EUID == 0 )); then
+        export SCCACHE_SERVER_PORT=4227
+    else
+        export SCCACHE_SERVER_PORT=4226
+    fi
 fi
 export SCCACHE_START_SERVER=0
-export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1
+export SCCACHE_NO_AUTO_START_SERVER=1
+
+# Canonical Rust is an optimization, not a correctness requirement. Only opt
+# into it when Cargo (or an explicit caller) supplied target-layout context.
+# Direct rustc with no Cargo target context uses ordinary sccache.
+if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${OUT_DIR:-}" ]]; then
+    export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1
+else
+    unset SCCACHE_EXPERIMENTAL_CANONICAL_RUST
+fi
+
 args=("$@")
 if (( ${#args[@]} )) && [[ "${args[0]}" == "rustc" ]]; then
-  resolved_rustc="$(/usr/bin/rustup which rustc)"
-  args[0]="$resolved_rustc"
+    resolved_rustc="$(/usr/bin/rustup which rustc)"
+    args[0]="$resolved_rustc"
 fi
-if [[ -z "${SCCACHE_CANONICAL_BUILD_ROOT:-}" || -z "${SCCACHE_CANONICAL_TARGET_ROOT:-}" ]]; then
-  out_dir=""
-  for ((i=0; i<${#args[@]}; i++)); do
-    case "${args[i]}" in
-      --out-dir)
-        if (( i+1 < ${#args[@]} )); then out_dir="${args[i+1]}"; fi
-        ;;
-      --out-dir=*) out_dir="${args[i]#--out-dir=}" ;;
-    esac
-  done
-  build_root=""
-  target_root=""
-  if [[ "$out_dir" == /home/jan/projects/* ]]; then
-    probe="$out_dir"
-    while [[ "$probe" == /home/jan/projects/* ]]; do
-      if [[ "${probe##*/}" == "target" ]]; then
-        target_root="$probe"
-        build_root="${probe%/target}"
-        break
-      fi
-      parent="${probe%/*}"
-      [[ "$parent" == "$probe" ]] && break
-      probe="$parent"
-    done
-  fi
-  if [[ -z "$build_root" && "$PWD" == /home/jan/projects/* ]]; then
-    rel="${PWD#/home/jan/projects/}"
-    repo="${rel%%/*}"
-    build_root="/home/jan/projects/$repo"
-    target_root="$build_root/target"
-  fi
-  if [[ -n "$build_root" ]]; then
-    export SCCACHE_CANONICAL_BUILD_ROOT="${SCCACHE_CANONICAL_BUILD_ROOT:-$build_root}"
-    export SCCACHE_CANONICAL_TARGET_ROOT="${SCCACHE_CANONICAL_TARGET_ROOT:-$target_root}"
-  fi
-fi
+
 exec /usr/local/libexec/sccache-bin/sccache "${args[@]}"
