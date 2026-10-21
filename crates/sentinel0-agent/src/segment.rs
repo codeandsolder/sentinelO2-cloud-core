@@ -401,79 +401,110 @@ fn only_assignments(segment: &str) -> bool {
         })
 }
 
-fn substitution_bodies(command: &str) -> Result<(String, Vec<String>), UnparseableCommand> {
+fn matching_paren(command: &str, mut index: usize) -> Result<usize, UnparseableCommand> {
     let bytes = command.as_bytes();
-    let mut masked = String::new();
+    let mut depth = 1usize;
+    let mut quote: Option<u8> = None;
+    while index < bytes.len() {
+        let ch = bytes[index];
+        if let Some(active) = quote {
+            if ch == b'\\' && active == b'"' && index + 1 < bytes.len() {
+                index += 2;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == b'\\' && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if matches!(ch, b'\'' | b'"') {
+            quote = Some(ch);
+        } else if ch == b'(' {
+            depth += 1;
+        } else if ch == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Ok(index);
+            }
+        }
+        index += 1;
+    }
+    Err(UnparseableCommand(
+        "unbalanced parentheses in a substitution".into(),
+    ))
+}
+
+fn mask_substitutions(
+    command: &str,
+    literal_quotes: bool,
+) -> Result<(String, Vec<String>), UnparseableCommand> {
+    let bytes = command.as_bytes();
+    let mut masked = Vec::with_capacity(bytes.len());
     let mut bodies = Vec::new();
-    let mut i = 0;
+    let mut i = 0usize;
     let mut quote: Option<u8> = None;
     while i < bytes.len() {
         let ch = bytes[i];
-        if quote == Some(b'\'') {
-            masked.push(ch as char);
-            if ch == b'\'' {
-                quote = None;
+        if !literal_quotes {
+            if quote == Some(b'\'') {
+                masked.push(ch);
+                if ch == b'\'' {
+                    quote = None;
+                }
+                i += 1;
+                continue;
             }
-            i += 1;
-            continue;
-        }
-        if ch == b'\\' && i + 1 < bytes.len() {
-            masked.push_str(&command[i..i + 2]);
+            if ch == b'\\' && i + 1 < bytes.len() {
+                masked.extend_from_slice(&bytes[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            if quote == Some(b'"') && ch == b'"' {
+                quote = None;
+                masked.push(ch);
+                i += 1;
+                continue;
+            }
+            if quote.is_none() && matches!(ch, b'\'' | b'"') {
+                quote = Some(ch);
+                masked.push(ch);
+                i += 1;
+                continue;
+            }
+        } else if ch == b'\\' && i + 1 < bytes.len() {
+            masked.extend_from_slice(&bytes[i..i + 2]);
             i += 2;
             continue;
         }
-        if quote == Some(b'"') && ch == b'"' {
-            quote = None;
-            masked.push('"');
-            i += 1;
-            continue;
-        }
-        if quote.is_none() && matches!(ch, b'\'' | b'"') {
-            quote = Some(ch);
-            masked.push(ch as char);
-            i += 1;
-            continue;
-        }
-        let process =
-            quote.is_none() && (bytes[i..].starts_with(b"<(") || bytes[i..].starts_with(b">("));
-        let dollar = bytes[i..].starts_with(b"$(") && !bytes[i..].starts_with(b"$((");
-        if dollar || process {
-            let body_start = i + 2;
-            let mut j = body_start;
-            let mut depth = 1usize;
-            let mut inner_quote: Option<u8> = None;
-            while j < bytes.len() {
-                let current = bytes[j];
-                if let Some(active) = inner_quote {
-                    if current == b'\\' && active == b'"' && j + 1 < bytes.len() {
-                        j += 2;
-                        continue;
-                    }
-                    if current == active {
-                        inner_quote = None;
-                    }
-                } else if matches!(current, b'\'' | b'"') {
-                    inner_quote = Some(current);
-                } else if current == b'(' {
-                    depth += 1;
-                } else if current == b')' {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                j += 1;
+
+        if bytes[i..].starts_with(b"$((") {
+            let close = matching_paren(command, i + 2)?;
+            if close <= i + 3 {
+                return Err(UnparseableCommand("empty arithmetic expansion".into()));
             }
-            if j >= bytes.len() {
-                return Err(UnparseableCommand(
-                    "unbalanced parentheses in a substitution".into(),
-                ));
-            }
-            bodies.push(command[body_start..j].to_owned());
-            masked.push_str("__SX_SUBST__");
-            i = j + 1;
+            let (_, nested) = mask_substitutions(&command[i + 3..close - 1], literal_quotes)?;
+            bodies.extend(nested);
+            masked.push(b'0');
+            i = close + 1;
             continue;
         }
+
+        let process = !literal_quotes
+            && quote.is_none()
+            && (bytes[i..].starts_with(b"<(") || bytes[i..].starts_with(b">("));
+        if bytes[i..].starts_with(b"$(") || process {
+            let close = matching_paren(command, i + 2)?;
+            bodies.push(command[i + 2..close].to_owned());
+            masked.extend_from_slice(b"__SX_SUBST__");
+            i = close + 1;
+            continue;
+        }
+
         if ch == b'`' {
             let mut j = i + 1;
             while j < bytes.len() && bytes[j] != b'`' {
@@ -487,14 +518,177 @@ fn substitution_bodies(command: &str) -> Result<(String, Vec<String>), Unparseab
                 return Err(UnparseableCommand("unbalanced backtick".into()));
             }
             bodies.push(command[i + 1..j].replace("\\`", "`"));
-            masked.push_str("__SX_SUBST__");
+            masked.extend_from_slice(b"__SX_SUBST__");
             i = j + 1;
             continue;
         }
-        masked.push(ch as char);
+
+        masked.push(ch);
         i += 1;
     }
+    let masked = String::from_utf8(masked)
+        .map_err(|_| UnparseableCommand("command stopped being valid UTF-8".into()))?;
     Ok((masked, bodies))
+}
+
+#[derive(Debug)]
+struct HeredocSpec {
+    delimiter: String,
+    strip_tabs: bool,
+    live: bool,
+}
+
+fn heredoc_stop(ch: u8) -> bool {
+    ch.is_ascii_whitespace() || b";&|<>()'\"".contains(&ch)
+}
+
+fn parse_heredoc_operator(
+    command: &str,
+    start: usize,
+) -> Result<(usize, HeredocSpec), UnparseableCommand> {
+    let bytes = command.as_bytes();
+    let mut i = start + 2;
+    let strip_tabs = bytes.get(i) == Some(&b'-');
+    if strip_tabs {
+        i += 1;
+    }
+    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    let Some(&first) = bytes.get(i) else {
+        return Err(UnparseableCommand(
+            "a here-document whose delimiter can't be read".into(),
+        ));
+    };
+
+    let (delimiter, live, end) = if matches!(first, b'\'' | b'"') {
+        let quote = first;
+        let body_start = i + 1;
+        let mut j = body_start;
+        while j < bytes.len() && bytes[j] != quote && bytes[j] != b'\n' {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != quote {
+            return Err(UnparseableCommand(
+                "a here-document whose delimiter can't be read".into(),
+            ));
+        }
+        (command[body_start..j].to_owned(), false, j + 1)
+    } else {
+        let escaped = first == b'\\';
+        if escaped {
+            i += 1;
+        }
+        let body_start = i;
+        while i < bytes.len() && !heredoc_stop(bytes[i]) {
+            i += 1;
+        }
+        if i == body_start {
+            return Err(UnparseableCommand(
+                "a here-document whose delimiter can't be read".into(),
+            ));
+        }
+        (command[body_start..i].to_owned(), !escaped, i)
+    };
+
+    Ok((
+        end,
+        HeredocSpec {
+            delimiter,
+            strip_tabs,
+            live,
+        },
+    ))
+}
+
+fn strip_heredoc_bodies(command: &str) -> Result<(String, Vec<String>), UnparseableCommand> {
+    let bytes = command.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut live_bodies = Vec::new();
+    let mut pending = Vec::<HeredocSpec>::new();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if let Some(active) = quote {
+            out.push(ch);
+            if ch == b'\\' && active == b'"' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == b'\\' && i + 1 < bytes.len() {
+            out.extend_from_slice(&bytes[i..i + 2]);
+            i += 2;
+            continue;
+        }
+        if matches!(ch, b'\'' | b'"') {
+            quote = Some(ch);
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<<") && !bytes[i..].starts_with(b"<<<") {
+            let (end, spec) = parse_heredoc_operator(command, i)?;
+            out.extend_from_slice(&bytes[i..end]);
+            pending.push(spec);
+            i = end;
+            continue;
+        }
+        if ch == b'\n' && !pending.is_empty() {
+            out.push(ch);
+            i += 1;
+            for spec in std::mem::take(&mut pending) {
+                let mut body = Vec::<String>::new();
+                loop {
+                    if i >= bytes.len() {
+                        return Err(UnparseableCommand(format!(
+                            "here-document not terminated (missing {:?})",
+                            spec.delimiter
+                        )));
+                    }
+                    let relative_end = bytes[i..].iter().position(|byte| *byte == b'\n');
+                    let line_end = relative_end.map_or(bytes.len(), |offset| i + offset);
+                    let line = &command[i..line_end];
+                    i = if line_end < bytes.len() {
+                        line_end + 1
+                    } else {
+                        bytes.len()
+                    };
+                    let candidate = if spec.strip_tabs {
+                        line.trim_start_matches('\t')
+                    } else {
+                        line
+                    }
+                    .trim_end_matches('\r');
+                    if candidate == spec.delimiter {
+                        break;
+                    }
+                    body.push(line.to_owned());
+                }
+                if spec.live {
+                    live_bodies.push(body.join("\n"));
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+
+    if !pending.is_empty() {
+        return Err(UnparseableCommand("a here-document with no body".into()));
+    }
+    let stripped = String::from_utf8(out)
+        .map_err(|_| UnparseableCommand("command stopped being valid UTF-8".into()))?;
+    Ok((stripped, live_bodies))
 }
 
 /// Returns the first command segment not authorised by policy.
@@ -516,10 +710,12 @@ fn unauthorised_chain_inner(
     if depth > MAX_NESTING {
         return Err(UnparseableCommand("substitutions nested too deeply".into()));
     }
-    if command.contains("<<") && !command.contains("<<<") {
-        return Err(UnparseableCommand("a here-document".into()));
+    let (stripped, live_bodies) = strip_heredoc_bodies(command)?;
+    let (masked, mut bodies) = mask_substitutions(&stripped, false)?;
+    for body in live_bodies {
+        let (_, nested) = mask_substitutions(&body, true)?;
+        bodies.extend(nested);
     }
-    let (masked, bodies) = substitution_bodies(command)?;
     for (index, raw) in split_top_level(&masked).into_iter().enumerate() {
         let Some(segment) = command_part(&raw)? else {
             continue;
@@ -648,5 +844,31 @@ mod tests {
             Ok(None)
         );
         assert!(unauthorised_chain(&policy, "case x in x) ls;; esac").is_err());
+    }
+
+    #[test]
+    fn chain_check_understands_heredocs_and_arithmetic() {
+        let policy = policy(&["cat", "printf"]);
+        assert_eq!(
+            unauthorised_chain(&policy, "cat <<EOF\nplain data\nEOF"),
+            Ok(None)
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "cat <<'EOF'\n$(id)\nEOF"),
+            Ok(None)
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "cat <<EOF\n'$(id)'\nEOF"),
+            Ok(Some("id".into()))
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "printf '%s' \"$((1 | 2))\""),
+            Ok(None)
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "printf '%s' \"$((1 + $(id)))\""),
+            Ok(Some("id".into()))
+        );
+        assert!(unauthorised_chain(&policy, "cat <<EOF\nmissing terminator").is_err());
     }
 }

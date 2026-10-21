@@ -217,7 +217,7 @@ struct RawExec {
     timeout_default: u64,
     timeout_max: u64,
     capture_max_bytes: usize,
-    enforce_allowlist: bool,
+    enforce_allowlist: Option<bool>,
 }
 
 impl Default for RawExec {
@@ -226,7 +226,7 @@ impl Default for RawExec {
             timeout_default: 60,
             timeout_max: 600,
             capture_max_bytes: 4 * 1024 * 1024,
-            enforce_allowlist: false,
+            enforce_allowlist: None,
         }
     }
 }
@@ -555,31 +555,52 @@ fn parse_tooling(raw: RawTooling) -> Tooling {
     }
 }
 
-fn parse_exec_mode(raw: Option<&str>, exec_strict: bool) -> ExecMode {
-    let Some(raw) = raw else {
-        return if exec_strict {
-            ExecMode::Strict
-        } else {
-            ExecMode::Allowlist
+fn parse_exec_mode(
+    raw: Option<&str>,
+    exec_strict: bool,
+    legacy_enforce_allowlist: Option<bool>,
+) -> ExecMode {
+    if let Some(raw) = raw {
+        let mode = raw.trim().to_ascii_lowercase();
+        let parsed = match mode.as_str() {
+            "allowlist" => ExecMode::Allowlist,
+            "strict" => ExecMode::Strict,
+            "unrestricted" => ExecMode::Unrestricted,
+            _ => {
+                warn!(value = %raw, "invalid exec_mode; falling back to allowlist");
+                ExecMode::Allowlist
+            }
         };
-    };
-    let mode = raw.trim().to_ascii_lowercase();
-    let parsed = match mode.as_str() {
-        "allowlist" => ExecMode::Allowlist,
-        "strict" => ExecMode::Strict,
-        "unrestricted" => ExecMode::Unrestricted,
-        _ => {
-            warn!(value = %raw, "invalid exec_mode; falling back to allowlist");
-            ExecMode::Allowlist
+        if exec_strict && parsed != ExecMode::Strict {
+            warn!(
+                exec_mode = parsed.as_str(),
+                "exec_mode overrides legacy exec_strict"
+            );
         }
-    };
-    if exec_strict && parsed != ExecMode::Strict {
-        warn!(
-            exec_mode = parsed.as_str(),
-            "exec_mode overrides legacy exec_strict"
-        );
+        if let Some(legacy) = legacy_enforce_allowlist {
+            let legacy_mode = if legacy {
+                ExecMode::Allowlist
+            } else {
+                ExecMode::Unrestricted
+            };
+            if legacy_mode != parsed {
+                warn!(
+                    exec_mode = parsed.as_str(),
+                    legacy_enforce_allowlist = legacy,
+                    "exec_mode overrides legacy exec.enforce_allowlist"
+                );
+            }
+        }
+        return parsed;
     }
-    parsed
+
+    if exec_strict {
+        ExecMode::Strict
+    } else if legacy_enforce_allowlist == Some(false) {
+        ExecMode::Unrestricted
+    } else {
+        ExecMode::Allowlist
+    }
 }
 
 impl Policy {
@@ -676,7 +697,7 @@ impl Policy {
             upload_base.unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/uploads"));
         let upload_base = soft_canonicalize(&upload_base).unwrap_or(upload_base);
         let tooling = parse_tooling(tooling);
-        let exec_mode = parse_exec_mode(exec_mode.as_deref(), exec_strict);
+        let exec_mode = parse_exec_mode(exec_mode.as_deref(), exec_strict, exec.enforce_allowlist);
 
         let policy = Self {
             exec_mode,
@@ -897,6 +918,18 @@ services:
 
         let policy = parse("allowed_commands: [git]\nexec_mode: nonsense\n")?;
         assert_eq!(policy.exec_mode, ExecMode::Allowlist);
+
+        let policy = parse("allowed_commands: [git]\nexec:\n  enforce_allowlist: false\n")?;
+        assert_eq!(policy.exec_mode, ExecMode::Unrestricted);
+        assert!(!policy.exec_enforce_allowlist);
+
+        let policy = parse("allowed_commands: [git]\nexec:\n  enforce_allowlist: true\n")?;
+        assert_eq!(policy.exec_mode, ExecMode::Allowlist);
+
+        let policy = parse(
+            "allowed_commands: [git]\nexec_mode: strict\nexec:\n  enforce_allowlist: false\n",
+        )?;
+        assert_eq!(policy.exec_mode, ExecMode::Strict);
         Ok(())
     }
 

@@ -678,49 +678,101 @@ impl CoreDispatcher {
         navigation
     }
 
+    fn config_is_writable(&self) -> bool {
+        let config = self.config_path.to_string_lossy();
+        self.help_ops_live(&[Op::Edit]) && self.policy.resolve_path(config.as_ref(), true).is_some()
+    }
+
+    fn config_edit_step(&self) -> String {
+        if self.config_is_writable() {
+            format!(
+                "call sentinel_edit on {} with validator_preset='yaml' (and sudo=true if OS ownership requires it)",
+                self.config_path.display()
+            )
+        } else {
+            format!(
+                "ask the operator to edit {} ON the host from a terminal or dashboard; sentinel_edit cannot write this config because edit is disabled or the config path is not under a file_ops entry with access: rw",
+                self.config_path.display()
+            )
+        }
+    }
+
+    const fn reload_agent_step() -> &'static str {
+        "reload the agent with sentinel_restart (or restart sentinelx-cloud-core on the host if self-restart is not exposed)"
+    }
+
+    fn policy_change_guidance(&self) -> String {
+        format!(
+            "With the operator's approval: (1) {}; (2) make only the narrow policy change; (3) {}; (4) confirm the effective policy with capabilities.",
+            self.config_edit_step(),
+            Self::reload_agent_step()
+        )
+    }
+
+    fn allow_command_guidance(&self, offending: &str) -> String {
+        let word = offending.split_whitespace().next().unwrap_or(offending);
+        format!(
+            "If {word:?} is safe and routine, add it under allowed_commands with the operator's approval: (1) {}; (2) add a line for {word:?}; (3) {}; (4) confirm with capabilities that {word:?} is present. For a one-off workflow that should not change policy, use script_run instead.",
+            self.config_edit_step(),
+            Self::reload_agent_step()
+        )
+    }
+
+    fn enrich_policy_error(&self, mut error: HandlerError) -> HandlerError {
+        if matches!(
+            error.code.as_str(),
+            "path_not_allowed" | "service_not_allowed" | "service_action_not_allowed"
+        ) {
+            error
+                .details
+                .entry("policy_change_guidance".into())
+                .or_insert_with(|| Value::String(self.policy_change_guidance()));
+        }
+        error
+    }
+
     fn help_extending_access(&self) -> Map<String, Value> {
-        let has_writable = self
-            .policy
-            .file_ops_paths
-            .iter()
-            .any(|entry| entry.access == crate::policy::FileAccess::ReadWrite);
-        let remote_edit_possible = self.help_ops_live(&[Op::Edit]) && has_writable;
+        let config_writable = self.config_is_writable();
+        let policy_guidance = self.policy_change_guidance();
+        let command = match self.policy.exec_mode {
+            ExecMode::Allowlist => format!(
+                "exec_mode is allowlist. Add the command under allowed_commands, then reload; or use the configured add_allowed_command playbook when available. {policy_guidance}"
+            ),
+            ExecMode::Strict => format!(
+                "exec_mode is strict. Add the command under allowed_commands, then reload; strict shell safety checks still apply. {policy_guidance}"
+            ),
+            ExecMode::Unrestricted => "exec_mode is unrestricted, so exec does not require an allowed_commands entry. OS permissions and the agent's runtime guardrails still apply.".into(),
+        };
 
         Map::from_iter([
             (
                 "note".into(),
-                Value::String(if remote_edit_possible {
-                    "These changes need the operator's approval; apply them via SentinelX where a config path is available, or on the host.".into()
+                Value::String(if config_writable {
+                    format!(
+                        "This host can edit its own config remotely when the operator approves it: {}.",
+                        self.config_edit_step()
+                    )
                 } else {
-                    "This host cannot edit its own config remotely: edit is disabled or no writable path is configured. The steps below must be applied by the operator ON the host (edit config.yaml directly and reload the agent), not through SentinelX.".into()
+                    format!(
+                        "This host cannot edit its own config remotely. {}.",
+                        self.config_edit_step()
+                    )
                 }),
             ),
             (
                 "read_or_write_directory".into(),
-                Value::String(
-                    "Add an entry under file_ops.paths with access 'r' or 'rw' covering a parent directory, then reload the agent; or use the configured add_allowed_read_path playbook when available.".into(),
-                ),
+                Value::String(format!(
+                    "Add an entry under file_ops.paths with access 'r' or 'rw' covering a parent directory, then reload the agent; or use the configured add_allowed_read_path playbook when available. {policy_guidance}"
+                )),
             ),
-            (
-                "command".into(),
-                Value::String(match self.policy.exec_mode {
-                    ExecMode::Allowlist => "exec_mode is allowlist. Add the command under allowed_commands, then reload; or use the configured add_allowed_command playbook when available.".into(),
-                    ExecMode::Strict => "exec_mode is strict. Add the command under allowed_commands, then reload; strict shell safety checks still apply.".into(),
-                    ExecMode::Unrestricted => "exec_mode is unrestricted, so exec does not require an allowed_commands entry. OS permissions and the agent's runtime guardrails still apply.".into(),
-                }),
-            ),
+            ("command".into(), Value::String(command)),
             (
                 "service".into(),
-                Value::String(
-                    "Add the service and allowed actions under services, then reload; or use the configured add_service playbook when available.".into(),
-                ),
+                Value::String(format!(
+                    "Add the service and allowed actions under services, then reload; or use the configured add_service playbook when available. {policy_guidance}"
+                )),
             ),
-            (
-                "how_to_edit_config".into(),
-                Value::String(
-                    "Config changes require operator approval: back up config.yaml, make the narrow change, validate it, then reload the agent.".into(),
-                ),
-            ),
+            ("how_to_edit_config".into(), Value::String(policy_guidance)),
         ])
     }
 
@@ -885,14 +937,16 @@ impl CoreDispatcher {
                     ));
                 }
                 if let Some(offending) = segment::unauthorised_segment(&self.policy, command) {
+                    let suggestion = self.allow_command_guidance(&offending);
                     return Err(HandlerError::with_details(
                         "command_not_allowed",
                         format!(
-                            "strict exec segment {offending:?} is not covered by allowed_commands"
+                            "strict exec segment {offending:?} is not covered by allowed_commands. {suggestion}"
                         ),
                         Map::from_iter([
                             ("command".into(), Value::String(command.into())),
                             ("offending_segment".into(), Value::String(offending)),
+                            ("suggestion".into(), Value::String(suggestion)),
                         ]),
                     ));
                 }
@@ -900,12 +954,16 @@ impl CoreDispatcher {
             ExecMode::Allowlist => match segment::unauthorised_chain(&self.policy, command) {
                 Ok(None) => {}
                 Ok(Some(offending)) => {
+                    let suggestion = self.allow_command_guidance(&offending);
                     return Err(HandlerError::with_details(
                         "command_not_allowed",
-                        format!("command segment {offending:?} is not covered by allowed_commands"),
+                        format!(
+                            "command segment {offending:?} is not covered by allowed_commands. {suggestion}"
+                        ),
                         Map::from_iter([
                             ("command".into(), Value::String(command.into())),
                             ("offending_segment".into(), Value::String(offending)),
+                            ("suggestion".into(), Value::String(suggestion)),
                         ]),
                     ));
                 }
@@ -1227,6 +1285,7 @@ impl CoreDispatcher {
             Op::LocalApi => (crate::local_api::handle(&self.policy, &payload).await, None),
         };
 
+        let result = result.map_err(|error| self.enrich_policy_error(error));
         let message = Self::response(id, result);
         let (dispatch_ok, error, result_ok, result_returncode) = Self::audit_fields(&message);
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1276,7 +1335,7 @@ impl Dispatcher for CoreDispatcher {
 mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath, ServiceSpec};
-    use crate::test_support::{TestResult, TestValue as _};
+    use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -1475,6 +1534,97 @@ mod tests {
         assert!(note.contains("cannot edit its own config remotely"));
         assert!(note.contains("ON the host"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn config_guidance_checks_the_actual_config_path() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let unrelated = dir.path().join("rw");
+        std::fs::create_dir(&unrelated).test_value()?;
+        let config = dir.path().join("etc/config.yaml");
+        let policy = Policy {
+            file_ops_paths: vec![FileOpsPath {
+                path: unrelated,
+                access: FileAccess::ReadWrite,
+            }],
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(policy, config.clone(), "test");
+        assert!(!dispatcher.config_is_writable());
+        assert!(dispatcher.config_edit_step().contains("ON the host"));
+
+        let config_dir = config.parent().test_value()?.to_owned();
+        std::fs::create_dir_all(&config_dir).test_value()?;
+        let policy = Policy {
+            file_ops_paths: vec![FileOpsPath {
+                path: config_dir,
+                access: FileAccess::ReadWrite,
+            }],
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(policy, config.clone(), "test");
+        assert!(dispatcher.config_is_writable());
+        let guidance = dispatcher.config_edit_step();
+        assert!(guidance.contains("sentinel_edit"));
+        assert!(guidance.contains(&config.display().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn allowlist_accepts_allowed_commands_touching_chain_separators() {
+        let dispatcher = CoreDispatcher::new(
+            Policy {
+                allowed_commands: vec!["uptime".into(), "pwd".into(), "ls".into()],
+                ..Policy::default()
+            },
+            PathBuf::from("config.yaml"),
+            "test",
+        );
+        assert!(dispatcher.validate_exec_policy("uptime; ls").is_ok());
+        assert!(dispatcher.validate_exec_policy("pwd&& ls").is_ok());
+    }
+
+    #[test]
+    fn allowlist_rejection_carries_actionable_policy_guidance() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let config = dir.path().join("config.yaml");
+        let policy = Policy {
+            allowed_commands: vec!["uptime".into()],
+            file_ops_paths: vec![FileOpsPath {
+                path: dir.path().to_owned(),
+                access: FileAccess::ReadWrite,
+            }],
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(policy, config, "test");
+        let error = dispatcher.validate_exec_policy("uptime; id").test_error()?;
+        assert_eq!(error.code, "command_not_allowed");
+        let suggestion = error.details["suggestion"].as_str().test_value()?;
+        assert!(suggestion.contains("id"));
+        assert!(suggestion.contains("sentinel_edit"));
+        assert!(suggestion.contains("sentinel_restart"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_refusal_guidance_does_not_recommend_an_impossible_edit() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = Policy {
+            file_ops_paths: vec![FileOpsPath {
+                path: dir.path().join("elsewhere"),
+                access: FileAccess::ReadWrite,
+            }],
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(policy, dir.path().join("config.yaml"), "test");
+        let error = dispatcher
+            .enrich_policy_error(HandlerError::new("path_not_allowed", "fixture refusal"));
+        let guidance = error.details["policy_change_guidance"]
+            .as_str()
+            .test_value()?;
+        assert!(guidance.contains("ON the host"));
+        assert!(!guidance.contains("call sentinel_edit"));
         Ok(())
     }
 
