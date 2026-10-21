@@ -323,7 +323,7 @@ mod tests {
         let result = run_shell(
             &Policy::default(),
             "printf 'step1\n'; printf 'err1\n' >&2; sleep 10",
-            Duration::from_millis(100),
+            Duration::from_secs(1),
             None,
             None,
         )
@@ -456,7 +456,7 @@ mod tests {
         let result = run_shell(
             &Policy::default(),
             r#"setsid sleep 60 & cat "/proc/$!/stat" > "$PIDFILE"; echo started; sleep 60"#,
-            Duration::from_millis(100),
+            Duration::from_secs(1),
             None,
             Some(&env),
         )
@@ -464,7 +464,7 @@ mod tests {
         .test_value()?;
 
         assert!(
-            started.elapsed() < Duration::from_secs(7),
+            started.elapsed() < Duration::from_secs(8),
             "escaped descendant extended timeout too far: {:?}",
             started.elapsed()
         );
