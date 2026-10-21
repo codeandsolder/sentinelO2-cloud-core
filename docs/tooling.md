@@ -31,6 +31,6 @@ The agent decodes this prefix before direct-Python, strict-segmentation, and com
 
 ## Exec allowlist
 
-`allowed_commands` remains accepted for compatibility with existing SentinelX configuration, but it is not enforced by default. Set `exec.enforce_allowlist: true` to opt in. Legacy `exec_strict: true` also implies enforcement and keeps the strict segmentation/substitution checks.
+`exec_mode` is the authoritative command policy. It accepts `allowlist` (the default), `strict`, or `unrestricted`. `allowlist` checks every command segment against `allowed_commands` with whole-word matching; `strict` additionally refuses unsafe shell control characters, substitutions, redirections, and unsafe pipeline-filter forms; `unrestricted` skips the command allowlist.
 
-This preserves old configuration without treating a prefix-based command list as a security boundary.
+Legacy `exec_strict: true` is still accepted when `exec_mode` is absent. The older SentinelO²-only `exec.enforce_allowlist` switch is also accepted for migration when `exec_mode` is absent: `true` maps to `allowlist`, `false` maps to `unrestricted`. An explicit `exec_mode` wins over either legacy switch. `script_run` remains independent of `allowed_commands`.

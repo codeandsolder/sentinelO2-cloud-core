@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.2.
-- `pensados/sentinelx-cloud-core` 0.23.13 behavior at reviewed upstream commit
-  `bc1a81110ecc8020355bd547795fb8393f49949f`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.23.28 behavior at reviewed upstream commit
+  `63bd5ba686b4de8084ccee78fb16223e422e44e0`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -126,6 +126,22 @@ Reference surfaces:
   matches result, while unreadable nested directories/files make list/search
   results explicitly `partial`, with bounded `unreadable_dirs` evidence and a
   warning that absence was not proven.
+- Applicable Linux/cross-platform behavior through upstream 0.23.28 is
+  matched. This includes host-valid config-edit guidance; `exec_mode`
+  (`allowlist` by default, `strict`, `unrestricted`); whole-word command
+  matching and full chain authorization; strict shell grammar/substitution/
+  redirection hardening; Git option-injection checks; upload destination
+  reauthorization and reserved staging protection; atomic cross-filesystem
+  upload finalization; Python validation without `__pycache__`; a 60 s
+  reconnect-delay cap; UTF-8 BOM handling; deny-by-default startup fallback
+  for malformed config while `--check-config` stays strict; and help/
+  capabilities reporting the effective exec policy.
+- Upstream 0.23.20 was reviewed as Windows-only WDAC handling for an unsigned
+  Python console-script launcher that the Rust agent does not have. Upstream
+  0.23.27 was reviewed as macOS LaunchAgent/LaunchDaemon restart guidance that
+  this Linux-first build does not ship. Upstream 0.23.25 is likewise entirely
+  Windows-specific (Scheduled Task / service restart targeting) and is
+  non-applicable to this Linux-first implementation.
 - Linux host/OS/kernel/CPU/memory/uptime/load metadata used by hello/state.
 - Capabilities are derived from the dispatcher surface rather than maintained
   as a second drifting list. Full capabilities include upstream policy evidence
@@ -182,16 +198,23 @@ Reference surfaces:
 - Legacy `script_run.interpreter=python3` remains accepted for the hosted Hub,
   but executes through `uv run`; direct Python/pip `exec` requests can be
   rejected with `use_uv` while preserving the old request schema.
-- `allowed_commands` remains config-compatible but is not treated as a security
-  boundary by default. `exec.enforce_allowlist: true` opts into the legacy
-  prefix check; `exec_strict: true` implies enforcement and adds segment /
-  substitution checks. `script_run` remains independent of this list, matching
-  its historical contract.
+- `exec_mode` is the authoritative command policy: `allowlist` is the default,
+  `strict` adds shell-safety restrictions, and `unrestricted` disables the
+  command allowlist. `allowed_commands` uses whole-word matching (plus explicit
+  path-prefix entries) and chained commands are checked segment by segment.
+  Legacy `exec_strict` remains accepted. The older SentinelO²-only
+  `exec.enforce_allowlist` key is also migration-compatible when `exec_mode` is
+  absent (`true` -> `allowlist`, `false` -> `unrestricted`). `script_run`
+  remains independent of this list, matching its historical contract.
 - `exec` and `script_run` capture child output with bounded head/tail buffers,
   report exact stdout/stderr byte counts when truncated, and kill process
-  groups on timeout. Upstream 0.22.1 cancellation semantics are also matched:
-  cancelling an in-flight `exec` drops a process-group guard that synchronously
-  kills the shell's whole group, so descendants cannot outlive the request.
+  groups on timeout. Upstream 0.23.14 partial-output semantics are matched:
+  bytes written before the deadline remain in the timeout result. Upstream
+  0.23.18 cleanup semantics are also matched: post-timeout process/pipe cleanup
+  is bounded to five seconds and reports `left_running=true` when an escaped
+  descendant survives instead of extending the request indefinitely. Upstream
+  0.22.1 cancellation semantics remain matched: cancelling an in-flight `exec`
+  drops a process-group guard that synchronously kills the shell's whole group.
 - Service actions invoke `systemctl`/`sudo` as argv rather than routing fixed
   operations through a shell.
 - External edit validators have bounded diagnostics, a deadline and process
