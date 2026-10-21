@@ -757,8 +757,20 @@ async fn ls_remote(policy: &Policy, payload: &Map<String, Value>) -> HandlerResu
     } else {
         std::env::current_dir().map_err(|e| HandlerError::new("io_error", e.to_string()))?
     };
-    let mut args = vec!["ls-remote".into(), remote.into()];
+    if remote.starts_with('-') {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            "remote must not start with '-'",
+        ));
+    }
+    let mut args = vec!["ls-remote".into(), "--".into(), remote.into()];
     if let Some(pattern) = payload.get("ref_pattern").and_then(Value::as_str) {
+        if pattern.starts_with('-') {
+            return Err(HandlerError::new(
+                "invalid_payload",
+                "ref_pattern must not start with '-'",
+            ));
+        }
         args.push(pattern.into());
     }
     let (rc, out, err) = run_git(policy, &root, &args, None, NET_TIMEOUT).await?;
@@ -792,8 +804,20 @@ async fn fetch(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("remote")
         .and_then(Value::as_str)
         .unwrap_or("origin");
-    let mut args = vec!["fetch".into(), "--prune".into(), remote.into()];
+    if remote.starts_with('-') {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            "remote must not start with '-'",
+        ));
+    }
+    let mut args = vec!["fetch".into(), "--prune".into(), "--".into(), remote.into()];
     if let Some(reference) = payload.get("ref").and_then(Value::as_str) {
+        if reference.starts_with('-') {
+            return Err(HandlerError::new(
+                "invalid_payload",
+                "ref must not start with '-'",
+            ));
+        }
         args.push(reference.into());
     }
     let (rc, _, err) = run_git(policy, &root, &args, None, NET_TIMEOUT).await?;
@@ -834,6 +858,12 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         ));
     }
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    if url.starts_with('-') {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            "url must not start with '-'",
+        ));
+    }
     let mut args = vec!["clone".into()];
     if let Some(depth) = payload.get("depth").and_then(Value::as_u64) {
         args.extend(["--depth".into(), depth.clamp(1, 1000).to_string()]);
@@ -841,7 +871,7 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     if let Some(branch) = payload.get("branch").and_then(Value::as_str) {
         args.extend(["--branch".into(), branch.into()]);
     }
-    args.extend([url.into(), target.display().to_string()]);
+    args.extend(["--".into(), url.into(), target.display().to_string()]);
     let (rc, _, err) = run_git(policy, parent, &args, None, NET_TIMEOUT).await?;
     if rc != 0 {
         let mut message = scrub(&err, parent);
@@ -874,6 +904,12 @@ async fn push(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .and_then(Value::as_str)
         .unwrap_or("origin");
     let branch = require_str(payload, "branch")?;
+    if remote.starts_with('-') || branch.starts_with('-') {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            "remote and branch must not start with '-'",
+        ));
+    }
     let force = payload
         .get("force")
         .and_then(Value::as_bool)
@@ -889,7 +925,7 @@ async fn push(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     if let Some(expected) = expected.filter(|_| force) {
         args.push(format!("--force-with-lease={branch}:{expected}"));
     }
-    args.extend([remote.into(), branch.into()]);
+    args.extend(["--".into(), remote.into(), branch.into()]);
     let (rc, _, err) = run_git(policy, &root, &args, None, NET_TIMEOUT).await?;
     let output = scrub(&err, &root);
     if rc != 0 {

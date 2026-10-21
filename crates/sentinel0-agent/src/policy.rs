@@ -15,6 +15,24 @@ pub enum FileAccess {
     ReadWrite,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecMode {
+    Allowlist,
+    Strict,
+    Unrestricted,
+}
+
+impl ExecMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowlist => "allowlist",
+            Self::Strict => "strict",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileOpsPath {
     pub path: PathBuf,
@@ -40,6 +58,7 @@ pub struct ServiceSpec {
 
 #[derive(Debug, Clone)]
 pub struct Policy {
+    pub exec_mode: ExecMode,
     pub exec_strict: bool,
     pub exec_enforce_allowlist: bool,
     pub disabled_ops: BTreeSet<String>,
@@ -66,8 +85,9 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
+            exec_mode: ExecMode::Allowlist,
             exec_strict: false,
-            exec_enforce_allowlist: false,
+            exec_enforce_allowlist: true,
             disabled_ops: BTreeSet::new(),
             allowed_commands: Vec::new(),
             services: BTreeMap::new(),
@@ -135,6 +155,7 @@ struct RawPolicy {
     tooling: RawTooling,
     disabled_ops: Vec<String>,
     exec_strict: bool,
+    exec_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -196,7 +217,7 @@ struct RawExec {
     timeout_default: u64,
     timeout_max: u64,
     capture_max_bytes: usize,
-    enforce_allowlist: bool,
+    enforce_allowlist: Option<bool>,
 }
 
 impl Default for RawExec {
@@ -205,7 +226,7 @@ impl Default for RawExec {
             timeout_default: 60,
             timeout_max: 600,
             capture_max_bytes: 4 * 1024 * 1024,
-            enforce_allowlist: false,
+            enforce_allowlist: None,
         }
     }
 }
@@ -534,20 +555,96 @@ fn parse_tooling(raw: RawTooling) -> Tooling {
     }
 }
 
+fn parse_exec_mode(
+    raw: Option<&str>,
+    exec_strict: bool,
+    legacy_enforce_allowlist: Option<bool>,
+) -> ExecMode {
+    if let Some(raw) = raw {
+        let mode = raw.trim().to_ascii_lowercase();
+        let parsed = match mode.as_str() {
+            "allowlist" => ExecMode::Allowlist,
+            "strict" => ExecMode::Strict,
+            "unrestricted" => ExecMode::Unrestricted,
+            _ => {
+                warn!(value = %raw, "invalid exec_mode; falling back to allowlist");
+                ExecMode::Allowlist
+            }
+        };
+        if exec_strict && parsed != ExecMode::Strict {
+            warn!(
+                exec_mode = parsed.as_str(),
+                "exec_mode overrides legacy exec_strict"
+            );
+        }
+        if let Some(legacy) = legacy_enforce_allowlist {
+            let legacy_mode = if legacy {
+                ExecMode::Allowlist
+            } else {
+                ExecMode::Unrestricted
+            };
+            if legacy_mode != parsed {
+                warn!(
+                    exec_mode = parsed.as_str(),
+                    legacy_enforce_allowlist = legacy,
+                    "exec_mode overrides legacy exec.enforce_allowlist"
+                );
+            }
+        }
+        return parsed;
+    }
+
+    if exec_strict {
+        ExecMode::Strict
+    } else if legacy_enforce_allowlist == Some(false) {
+        ExecMode::Unrestricted
+    } else {
+        ExecMode::Allowlist
+    }
+}
+
 impl Policy {
     /// # Errors
-    /// Returns an error when the policy file cannot be read, parsed, or validated.
+    /// Returns an error only when the policy file cannot be read. Invalid text or YAML is logged and
+    /// falls back to the built-in deny-by-default policy so the agent can still come online.
     pub fn from_file(path: &Path) -> Result<Self, PolicyError> {
         if !path.exists() {
             warn!(path = %path.display(), "policy file missing; loading built-in defaults");
             return Ok(Self::default());
         }
-
-        let text = fs::read_to_string(path).map_err(|source| PolicyError::Read {
+        let bytes = fs::read(path).map_err(|source| PolicyError::Read {
             path: path.into(),
             source,
         })?;
-        let raw: RawPolicy = yaml_serde::from_str(&text).map_err(|source| PolicyError::Parse {
+        match Self::from_bytes(path, &bytes) {
+            Ok(policy) => Ok(policy),
+            Err(error) => {
+                warn!(path = %path.display(), %error, "policy is invalid; loading built-in defaults");
+                Ok(Self::default())
+            }
+        }
+    }
+
+    /// # Errors
+    /// Returns an error when the policy file cannot be read, decoded as UTF-8, parsed, or validated.
+    pub fn from_file_strict(path: &Path) -> Result<Self, PolicyError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes = fs::read(path).map_err(|source| PolicyError::Read {
+            path: path.into(),
+            source,
+        })?;
+        Self::from_bytes(path, &bytes)
+    }
+
+    fn from_bytes(path: &Path, bytes: &[u8]) -> Result<Self, PolicyError> {
+        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+        let text = std::str::from_utf8(bytes).map_err(|source| PolicyError::Read {
+            path: path.into(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        })?;
+        let raw: RawPolicy = yaml_serde::from_str(text).map_err(|source| PolicyError::Parse {
             path: path.into(),
             source,
         })?;
@@ -573,6 +670,7 @@ impl Policy {
             tooling,
             disabled_ops,
             exec_strict,
+            exec_mode,
         } = raw;
         let RawAgent {
             hostname_label,
@@ -599,10 +697,12 @@ impl Policy {
             upload_base.unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/uploads"));
         let upload_base = soft_canonicalize(&upload_base).unwrap_or(upload_base);
         let tooling = parse_tooling(tooling);
+        let exec_mode = parse_exec_mode(exec_mode.as_deref(), exec_strict, exec.enforce_allowlist);
 
         let policy = Self {
-            exec_strict,
-            exec_enforce_allowlist: exec.enforce_allowlist || exec_strict,
+            exec_mode,
+            exec_strict: exec_mode == ExecMode::Strict,
+            exec_enforce_allowlist: exec_mode != ExecMode::Unrestricted,
             disabled_ops: disabled_ops
                 .into_iter()
                 .map(|value| value.trim().to_owned())
@@ -628,7 +728,7 @@ impl Policy {
             tooling,
         };
 
-        if policy.exec_enforce_allowlist && policy.allowed_commands.is_empty() {
+        if policy.exec_mode != ExecMode::Unrestricted && policy.allowed_commands.is_empty() {
             warn!(
                 "exec allowlist enforcement is enabled with no allowed_commands; exec is deny-all"
             );
@@ -640,10 +740,18 @@ impl Policy {
     pub fn is_command_allowed(&self, command: &str) -> bool {
         let command = command.trim();
         !command.is_empty()
-            && self
-                .allowed_commands
-                .iter()
-                .any(|allowed| command.starts_with(allowed))
+            && self.allowed_commands.iter().any(|allowed| {
+                let allowed = allowed.trim();
+                if allowed.is_empty() {
+                    return true;
+                }
+                let Some(rest) = command.strip_prefix(allowed) else {
+                    return false;
+                };
+                rest.is_empty()
+                    || allowed.ends_with('/')
+                    || rest.chars().next().is_some_and(char::is_whitespace)
+            })
     }
 
     #[must_use]
@@ -765,7 +873,8 @@ upload_base: /var/lib/sentinelx/uploads
         )?;
         assert_eq!(policy.exec_timeout_default, 30);
         assert_eq!(policy.exec_timeout_max, 3600);
-        assert!(!policy.exec_enforce_allowlist);
+        assert_eq!(policy.exec_mode, ExecMode::Allowlist);
+        assert!(policy.exec_enforce_allowlist);
         assert!(policy.is_command_allowed("git status"));
         assert!(!policy.is_command_allowed("curl example.com"));
         assert!(policy.service_action_allowed("nginx", "restart"));
@@ -794,32 +903,46 @@ services:
     }
 
     #[test]
-    fn allowlist_enforcement_is_opt_in_but_legacy_strict_still_enforces() -> TestResult {
-        let policy = parse(
-            r"
-allowed_commands: [git]
-",
-        )?;
+    fn exec_mode_defaults_to_allowlist_and_explicit_mode_wins() -> TestResult {
+        let policy = parse("allowed_commands: [git]\n")?;
+        assert_eq!(policy.exec_mode, ExecMode::Allowlist);
+        assert!(policy.exec_enforce_allowlist);
+
+        let policy = parse("allowed_commands: [git]\nexec_strict: true\n")?;
+        assert_eq!(policy.exec_mode, ExecMode::Strict);
+
+        let policy =
+            parse("allowed_commands: [git]\nexec_strict: true\nexec_mode: unrestricted\n")?;
+        assert_eq!(policy.exec_mode, ExecMode::Unrestricted);
         assert!(!policy.exec_enforce_allowlist);
 
-        let policy = parse(
-            r"
-allowed_commands: [git]
-exec:
-  enforce_allowlist: true
-",
-        )?;
-        assert!(policy.exec_enforce_allowlist);
+        let policy = parse("allowed_commands: [git]\nexec_mode: nonsense\n")?;
+        assert_eq!(policy.exec_mode, ExecMode::Allowlist);
+
+        let policy = parse("allowed_commands: [git]\nexec:\n  enforce_allowlist: false\n")?;
+        assert_eq!(policy.exec_mode, ExecMode::Unrestricted);
+        assert!(!policy.exec_enforce_allowlist);
+
+        let policy = parse("allowed_commands: [git]\nexec:\n  enforce_allowlist: true\n")?;
+        assert_eq!(policy.exec_mode, ExecMode::Allowlist);
 
         let policy = parse(
-            r"
-allowed_commands: [git]
-exec_strict: true
-",
+            "allowed_commands: [git]\nexec_mode: strict\nexec:\n  enforce_allowlist: false\n",
         )?;
-        assert!(policy.exec_enforce_allowlist);
-
+        assert_eq!(policy.exec_mode, ExecMode::Strict);
         Ok(())
+    }
+
+    #[test]
+    fn allowlist_entries_match_whole_words_not_prefixes() {
+        let policy = Policy {
+            allowed_commands: vec!["ls".into(), "/usr/bin/".into()],
+            ..Policy::default()
+        };
+        assert!(policy.is_command_allowed("ls"));
+        assert!(policy.is_command_allowed("ls -la"));
+        assert!(!policy.is_command_allowed("lsof"));
+        assert!(policy.is_command_allowed("/usr/bin/env"));
     }
 
     #[test]

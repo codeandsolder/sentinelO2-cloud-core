@@ -99,7 +99,11 @@ fn spawn_shutdown_signal(cancel: CancellationToken) {
 }
 
 async fn run_agent(args: Args) -> Result<(), Box<dyn Error>> {
-    let policy = Policy::from_file(&args.config)?;
+    let policy = if args.check_config {
+        Policy::from_file_strict(&args.config)?
+    } else {
+        Policy::from_file(&args.config)?
+    };
     let dispatcher = CoreDispatcher::new(policy.clone(), args.config.clone(), AGENT_VERSION);
 
     if args.check_config {

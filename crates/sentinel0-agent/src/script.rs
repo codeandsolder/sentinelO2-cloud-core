@@ -2,7 +2,10 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     jobs::BACKGROUND_TIMEOUT_MAX_SECS,
     policy::Policy,
-    process_output::{CapturedOutput, WaitOutcome, wait_bounded},
+    process_output::{
+        CapturedOutput, CapturedStream, LEFT_RUNNING_NOTE, POST_TIMEOUT_GRACE, TimedOutCapture,
+        TimedOutOutput, WaitOutcome, wait_bounded,
+    },
     staging,
 };
 use rand::RngExt;
@@ -85,17 +88,46 @@ fn safe_filename(filename: Option<&str>, extension: &str) -> String {
         .map_or_else(|| format!("script.{extension}"), str::to_owned)
 }
 
-fn merged_output(captured: &CapturedOutput) -> String {
-    let stdout = captured.stdout.rendered_trimmed_lossy();
-    let stderr = captured.stderr.rendered_trimmed_lossy();
-    if stdout.is_empty() && stderr.is_empty() {
-        "⚠️ Sin salida".into()
-    } else if stderr.is_empty() {
+fn merge_streams(stdout: &CapturedStream, stderr: &CapturedStream) -> String {
+    let stdout = stdout.rendered_trimmed_lossy();
+    let stderr = stderr.rendered_trimmed_lossy();
+    if stderr.is_empty() {
         stdout
     } else if stdout.is_empty() {
         stderr
     } else {
         format!("{stdout}\n{stderr}")
+    }
+}
+
+fn merged_output(captured: &CapturedOutput) -> String {
+    let output = merge_streams(&captured.stdout, &captured.stderr);
+    if output.is_empty() {
+        "⚠️ Sin salida".into()
+    } else {
+        output
+    }
+}
+
+fn timeout_output(captured: &TimedOutOutput) -> String {
+    let partial = merge_streams(&captured.stdout, &captured.stderr);
+    let mut output = if partial.is_empty() {
+        "⏱️ Timeout".to_owned()
+    } else {
+        format!("⏱️ Timeout. Output written before the timeout:\n{partial}")
+    };
+    if captured.left_running {
+        output.push('\n');
+        output.push_str(LEFT_RUNNING_NOTE);
+    }
+    output
+}
+
+fn combine_cleanup_errors(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
     }
 }
 
@@ -105,6 +137,18 @@ struct ResultMeta<'a> {
     sudo: bool,
     cwd: Option<&'a str>,
     cleanup: bool,
+}
+
+fn add_capture_metadata(
+    out: &mut BTreeMap<String, Value>,
+    stdout: &CapturedStream,
+    stderr: &CapturedStream,
+) {
+    if stdout.truncated() || stderr.truncated() {
+        out.insert("output_truncated".into(), Value::Bool(true));
+        out.insert("stdout_bytes".into(), Value::from(stdout.total_bytes()));
+        out.insert("stderr_bytes".into(), Value::from(stderr.total_bytes()));
+    }
 }
 
 fn result(
@@ -133,18 +177,8 @@ fn result(
         ("duration".into(), Value::from(duration)),
         ("returncode".into(), Value::from(returncode)),
     ]);
-    if let Some(captured) = captured
-        && (captured.stdout.truncated() || captured.stderr.truncated())
-    {
-        out.insert("output_truncated".into(), Value::Bool(true));
-        out.insert(
-            "stdout_bytes".into(),
-            Value::from(captured.stdout.total_bytes()),
-        );
-        out.insert(
-            "stderr_bytes".into(),
-            Value::from(captured.stderr.total_bytes()),
-        );
+    if let Some(captured) = captured {
+        add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
     }
     out
 }
@@ -494,9 +528,11 @@ async fn timed_out_result(
     request: &ScriptRequest<'_>,
     child: &mut tokio::process::Child,
     pid: Option<u32>,
+    pending: TimedOutCapture,
     command_argv: Vec<String>,
     started: Instant,
 ) -> Result<BTreeMap<String, Value>, HandlerError> {
+    let cleanup_started = Instant::now();
     let mut cleanup_error = None;
     #[cfg(unix)]
     if let Some(pid) = pid {
@@ -515,7 +551,7 @@ async fn timed_out_result(
         if child_is_live {
             let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
             if request.sudo {
-                let status = Command::new(policy.tooling.command("sudo"))
+                let kill = Command::new(policy.tooling.command("sudo"))
                     .args([
                         "-n",
                         "kill",
@@ -524,19 +560,24 @@ async fn timed_out_result(
                         &format!("-{}", process_group.as_raw()),
                     ])
                     .env("PATH", policy.tooling.path_env()?)
-                    .status()
-                    .await;
-                match status {
-                    Ok(status) if status.success() => {}
-                    Ok(status) => {
+                    .status();
+                match tokio::time::timeout(POST_TIMEOUT_GRACE, kill).await {
+                    Ok(Ok(status)) if status.success() => {}
+                    Ok(Ok(status)) => {
                         cleanup_error = Some(format!(
                             "sudo kill of timed-out process group {} exited with {status}",
                             process_group.as_raw()
                         ));
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         cleanup_error = Some(format!(
                             "failed killing timed-out sudo process group: {error}"
+                        ));
+                    }
+                    Err(_) => {
+                        cleanup_error = Some(format!(
+                            "timed out killing sudo process group {}",
+                            process_group.as_raw()
                         ));
                     }
                 }
@@ -548,9 +589,9 @@ async fn timed_out_result(
             }
         }
     }
-    if let Err(error) = child.wait().await {
-        cleanup_error.get_or_insert_with(|| format!("failed reaping timed-out script: {error}"));
-    }
+    let remaining = POST_TIMEOUT_GRACE.saturating_sub(cleanup_started.elapsed());
+    let captured = pending.finish_after_kill(child, remaining).await;
+    cleanup_error = combine_cleanup_errors(cleanup_error, captured.capture_error.clone());
     let mut out = result(
         ResultMeta {
             interpreter: request.interpreter,
@@ -559,12 +600,16 @@ async fn timed_out_result(
             cleanup: request.cleanup,
         },
         command_argv,
-        "⏱️ Timeout".into(),
+        timeout_output(&captured),
         (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
         -1,
         None,
     );
     out.insert("timed_out".into(), Value::Bool(true));
+    add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
+    if captured.left_running {
+        out.insert("left_running".into(), Value::Bool(true));
+    }
     if let Some(error) = cleanup_error {
         out.insert("cleanup_error".into(), Value::String(error));
     }
@@ -643,8 +688,17 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         WaitOutcome::Completed(captured) => {
             completed_result(&request, command_argv, started, &captured)
         }
-        WaitOutcome::TimedOut => {
-            timed_out_result(policy, &request, &mut child, pid, command_argv, started).await?
+        WaitOutcome::TimedOut(pending) => {
+            timed_out_result(
+                policy,
+                &request,
+                &mut child,
+                pid,
+                pending,
+                command_argv,
+                started,
+            )
+            .await?
         }
     };
     Ok(finalize_script_result(outcome, &request, &workdir, &script_path).await)
@@ -780,6 +834,38 @@ mod tests {
         .await
         .test_error()?;
         assert_eq!(error.code, "interpreter_missing");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timed_out_script_keeps_flushed_output() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("bash".into())),
+                (
+                    "content".into(),
+                    Value::String(
+                        "printf 'reached step 1\n'; printf 'err1\n' >&2; sleep 10".into(),
+                    ),
+                ),
+                ("timeout".into(), Value::from(1)),
+            ]),
+        )
+        .await
+        .test_value()?;
+        let output = result["output"].as_str().test_value()?;
+        assert_eq!(result["timed_out"], true);
+        assert!(output.starts_with("⏱️ Timeout. Output written before the timeout:"));
+        assert!(output.contains("reached step 1"));
+        assert!(output.contains("err1"));
+        assert!(!result.contains_key("left_running"));
 
         Ok(())
     }
