@@ -241,7 +241,7 @@ cat >"$fake_rustup" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$*" == "show active-toolchain" ]]; then
-    printf '%s\n' '1.99.0-x86_64-unknown-linux-gnu (default)'
+    printf '%s\n' '1.99.1-x86_64-unknown-linux-gnu (default)'
     exit 0
 fi
 exit 64
@@ -340,7 +340,7 @@ wait_for_file "$probe_done"
 [[ -z "$(find "$wrapper_root" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]]
 [[ "$(cat "$cmake_c_probe")" == "$native_launcher" ]]
 [[ "$(cat "$cmake_cxx_probe")" == "$native_launcher" ]]
-[[ "$(cat "$toolchain_probe")" == "1.99.0-x86_64-unknown-linux-gnu" ]]
+[[ "$(cat "$toolchain_probe")" == "1.99.1-x86_64-unknown-linux-gnu" ]]
 
 explicit_toolchain_probe="$tmp/explicit-toolchain-probe"
 (
