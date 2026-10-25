@@ -61,7 +61,7 @@ pub mod pending_results;
 pub mod policy;
 pub mod preflight;
 pub mod process_output;
-pub(crate) mod process_runner;
+mod process_runner;
 pub mod progressive_help;
 pub mod project_snapshot;
 pub mod rotation;

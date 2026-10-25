@@ -16,7 +16,7 @@ use std::{
 use tokio::process::Command;
 
 #[derive(Clone, Debug)]
-pub(crate) enum ProcessGroupKill {
+pub enum ProcessGroupKill {
     Direct,
     Sudo { command: PathBuf, path: OsString },
 }
@@ -24,7 +24,7 @@ pub(crate) enum ProcessGroupKill {
 impl ProcessGroupKill {
     /// # Errors
     /// Returns an error when the configured tool search path cannot be represented safely.
-    pub(crate) fn sudo(policy: &Policy) -> Result<Self, HandlerError> {
+    pub fn sudo(policy: &Policy) -> Result<Self, HandlerError> {
         Ok(Self::Sudo {
             command: policy.tooling.command("sudo"),
             path: policy.tooling.path_env()?,
@@ -122,7 +122,7 @@ struct ProcessGroupGuard {
 }
 
 impl ProcessGroupGuard {
-    fn new(pid: Option<u32>, killer: ProcessGroupKill) -> Self {
+    const fn new(pid: Option<u32>, killer: ProcessGroupKill) -> Self {
         Self {
             pid,
             killer,
@@ -130,7 +130,7 @@ impl ProcessGroupGuard {
         }
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 
@@ -152,7 +152,7 @@ impl Drop for ProcessGroupGuard {
 }
 
 #[derive(Debug)]
-pub(crate) enum ProcessFailure {
+pub enum ProcessFailure {
     Setup(HandlerError),
     Spawn(io::Error),
     Capture {
@@ -162,7 +162,7 @@ pub(crate) enum ProcessFailure {
 }
 
 #[derive(Debug)]
-pub(crate) enum ProcessOutcome {
+pub enum ProcessOutcome {
     Completed {
         captured: CapturedOutput,
         duration: f64,
@@ -181,7 +181,7 @@ fn rounded_seconds(started: Instant) -> f64 {
 
 /// # Errors
 /// Returns a typed failure for setup, spawn, output capture, or process cleanup failures.
-pub(crate) async fn run_argv(
+pub async fn run_argv(
     policy: &Policy,
     argv: &[String],
     timeout_duration: Duration,

@@ -165,8 +165,8 @@ fn build_command(
                 .into_iter()
                 .map(|name| format!("--preserve-env={name}")),
         );
+        let mut command_argv = sudo_prefix;
         if let Some(cwd) = cwd {
-            let mut command_argv = sudo_prefix;
             command_argv.extend([
                 policy.tooling.command("bash").display().to_string(),
                 "-c".into(),
@@ -174,13 +174,9 @@ fn build_command(
                 "bash".into(),
                 cwd.into(),
             ]);
-            command_argv.extend(inner);
-            (command_argv, None)
-        } else {
-            let mut command_argv = sudo_prefix;
-            command_argv.extend(inner);
-            (command_argv, None)
         }
+        command_argv.extend(inner);
+        (command_argv, None)
     } else {
         (inner, cwd.map(PathBuf::from))
     }
@@ -573,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn sudo_command_preserves_env_names_without_putting_values_in_argv() -> TestResult {
+    fn sudo_command_preserves_env_names_without_putting_values_in_argv() {
         let policy = Policy::default();
         let script = Path::new("/tmp/script.sh");
         let env = Map::from_iter([
@@ -591,7 +587,6 @@ mod tests {
         assert_eq!(argv[2], "--preserve-env=ALPHA");
         assert_eq!(argv[3], "--preserve-env=ZED");
         assert!(!argv.iter().any(|arg| arg.contains("secret")));
-        Ok(())
     }
 
     #[tokio::test]
@@ -947,9 +942,7 @@ mod tests {
         }
         assert!(started.exists(), "script never reached its body");
         task.abort();
-        let join_error = task
-            .await
-            .expect_err("cancelled script unexpectedly completed");
+        let join_error = task.await.err().test_value()?;
         assert!(join_error.is_cancelled());
 
         tokio::time::sleep(Duration::from_millis(1200)).await;
