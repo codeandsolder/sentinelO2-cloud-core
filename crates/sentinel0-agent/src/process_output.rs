@@ -1,5 +1,6 @@
+use serde_json::Value;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, Read},
     process::ExitStatus,
     sync::{Arc, Mutex},
@@ -228,6 +229,97 @@ impl Drop for TimedOutCapture {
     fn drop(&mut self) {
         self.stdout_task.abort();
         self.stderr_task.abort();
+    }
+}
+
+#[must_use]
+pub(crate) fn merge_streams(stdout: &CapturedStream, stderr: &CapturedStream) -> String {
+    let stdout = stdout.rendered_trimmed_lossy();
+    let stderr = stderr.rendered_trimmed_lossy();
+    if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    }
+}
+
+#[must_use]
+pub(crate) fn merged_output(captured: &CapturedOutput) -> String {
+    let output = merge_streams(&captured.stdout, &captured.stderr);
+    if output.is_empty() {
+        "⚠️ Sin salida".into()
+    } else {
+        output
+    }
+}
+
+#[must_use]
+pub(crate) fn timeout_output(captured: &TimedOutOutput) -> String {
+    let partial = merge_streams(&captured.stdout, &captured.stderr);
+    let mut output = if partial.is_empty() {
+        "⏱️ Timeout".to_owned()
+    } else {
+        format!("⏱️ Timeout. Output written before the timeout:\n{partial}")
+    };
+    if captured.left_running {
+        output.push('\n');
+        output.push_str(LEFT_RUNNING_NOTE);
+    }
+    output
+}
+
+#[must_use]
+pub(crate) fn process_result(
+    output: String,
+    duration: f64,
+    returncode: i32,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(returncode == 0)),
+        ("output".into(), Value::String(output)),
+        ("duration".into(), Value::from(duration)),
+        ("returncode".into(), Value::from(returncode)),
+    ])
+}
+
+pub(crate) fn add_capture_metadata(
+    out: &mut BTreeMap<String, Value>,
+    stdout: &CapturedStream,
+    stderr: &CapturedStream,
+) {
+    if stdout.truncated() || stderr.truncated() {
+        out.insert("output_truncated".into(), Value::Bool(true));
+        out.insert("stdout_bytes".into(), Value::from(stdout.total_bytes()));
+        out.insert("stderr_bytes".into(), Value::from(stderr.total_bytes()));
+    }
+}
+
+pub(crate) fn add_timeout_metadata(
+    out: &mut BTreeMap<String, Value>,
+    captured: &TimedOutOutput,
+    cleanup_error: Option<String>,
+) {
+    out.insert("timed_out".into(), Value::Bool(true));
+    add_capture_metadata(out, &captured.stdout, &captured.stderr);
+    if captured.left_running {
+        out.insert("left_running".into(), Value::Bool(true));
+    }
+    if let Some(error) = cleanup_error {
+        out.insert("cleanup_error".into(), Value::String(error));
+    }
+}
+
+#[must_use]
+pub(crate) fn combine_cleanup_errors(
+    first: Option<String>,
+    second: Option<String>,
+) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
     }
 }
 

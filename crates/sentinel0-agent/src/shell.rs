@@ -1,150 +1,17 @@
+#[cfg(test)]
+use crate::process_output::LEFT_RUNNING_NOTE;
 use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
     process_output::{
-        CapturedOutput, CapturedStream, LEFT_RUNNING_NOTE, POST_TIMEOUT_GRACE, TimedOutOutput,
-        WaitOutcome, wait_bounded,
+        add_capture_metadata, add_timeout_metadata, merged_output, process_result, timeout_output,
     },
+    process_runner::{self, ProcessFailure, ProcessGroupKill, ProcessOutcome},
 };
 use serde_json::{Map, Value};
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    time::{Duration, Instant},
-};
-use tokio::process::Command;
-
-fn rounded_seconds(start: Instant) -> f64 {
-    let secs = start.elapsed().as_secs_f64();
-    (secs * 100.0).round() / 100.0
-}
-
-fn add_capture_metadata(
-    out: &mut BTreeMap<String, Value>,
-    stdout: &CapturedStream,
-    stderr: &CapturedStream,
-) {
-    if stdout.truncated() || stderr.truncated() {
-        out.insert("output_truncated".into(), Value::Bool(true));
-        out.insert("stdout_bytes".into(), Value::from(stdout.total_bytes()));
-        out.insert("stderr_bytes".into(), Value::from(stderr.total_bytes()));
-    }
-}
-
-fn result(
-    output: String,
-    duration: f64,
-    returncode: i32,
-    timed_out: bool,
-    captured: Option<&CapturedOutput>,
-    cleanup_error: Option<String>,
-) -> BTreeMap<String, Value> {
-    let mut out = BTreeMap::from([
-        ("output".into(), Value::String(output)),
-        ("duration".into(), Value::from(duration)),
-        ("returncode".into(), Value::from(returncode)),
-    ]);
-    if timed_out {
-        out.insert("timed_out".into(), Value::Bool(true));
-    }
-    if let Some(captured) = captured {
-        add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
-    }
-    if let Some(error) = cleanup_error {
-        out.insert("cleanup_error".into(), Value::String(error));
-    }
-    out
-}
-
-fn merge_streams(stdout: &CapturedStream, stderr: &CapturedStream) -> String {
-    let stdout = stdout.rendered_trimmed_lossy();
-    let stderr = stderr.rendered_trimmed_lossy();
-    if stderr.is_empty() {
-        stdout
-    } else if stdout.is_empty() {
-        stderr
-    } else {
-        format!("{stdout}\n{stderr}")
-    }
-}
-
-fn merged_output(captured: &CapturedOutput) -> String {
-    let output = merge_streams(&captured.stdout, &captured.stderr);
-    if output.is_empty() {
-        "⚠️ Sin salida".into()
-    } else {
-        output
-    }
-}
-
-fn timeout_output(captured: &TimedOutOutput) -> String {
-    let partial = merge_streams(&captured.stdout, &captured.stderr);
-    let mut output = if partial.is_empty() {
-        "⏱️ Timeout".to_owned()
-    } else {
-        format!("⏱️ Timeout. Output written before the timeout:\n{partial}")
-    };
-    if captured.left_running {
-        output.push('\n');
-        output.push_str(LEFT_RUNNING_NOTE);
-    }
-    output
-}
-
-fn combine_cleanup_errors(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
-        (Some(error), None) | (None, Some(error)) => Some(error),
-        (None, None) => None,
-    }
-}
-
-#[cfg(unix)]
-fn kill_group(pid: Option<u32>) -> Option<String> {
-    let Some(pid) = pid else {
-        return Some("child PID was unavailable; process group could not be killed".into());
-    };
-    let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
-    match nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => None,
-        Err(error) => {
-            let message = format!("failed killing timed-out process group {pid}: {error}");
-            tracing::warn!(%message);
-            Some(message)
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_group(_pid: Option<u32>) -> Option<String> {
-    None
-}
-
-#[derive(Debug)]
-struct ProcessGroupGuard {
-    pid: Option<u32>,
-    armed: bool,
-}
-
-impl ProcessGroupGuard {
-    const fn new(pid: Option<u32>) -> Self {
-        Self { pid, armed: true }
-    }
-
-    const fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        if self.armed
-            && let Some(error) = kill_group(self.pid)
-        {
-            tracing::warn!(%error, "failed cleaning process group after command cancellation");
-        }
-    }
-}
+#[cfg(test)]
+use std::time::Instant;
+use std::{path::Path, time::Duration};
 
 /// # Errors
 /// Returns an error when process setup, execution, timeout handling, or output capture fails.
@@ -155,91 +22,55 @@ pub async fn run_argv(
     cwd: Option<&Path>,
     env: Option<&Map<String, Value>>,
 ) -> HandlerResult {
-    let Some(program) = argv.first() else {
-        return Err(HandlerError::new("invalid_payload", "empty command argv"));
+    let outcome = process_runner::run_argv(
+        policy,
+        argv,
+        timeout_duration,
+        cwd,
+        env,
+        ProcessGroupKill::Direct,
+    )
+    .await;
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(ProcessFailure::Setup(error)) => return Err(error),
+        Err(ProcessFailure::Spawn(error)) => {
+            return Err(HandlerError::new(
+                "exec_failed",
+                format!("failed starting {:?}: {error}", argv.first()),
+            ));
+        }
+        Err(ProcessFailure::Capture {
+            error,
+            cleanup_error,
+        }) => {
+            let mut details = Map::new();
+            if let Some(cleanup_error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(cleanup_error));
+            }
+            return Err(HandlerError::with_details(
+                "exec_failed",
+                format!("command output capture failed: {error}"),
+                details,
+            ));
+        }
     };
-    let start = Instant::now();
-    let mut cmd = Command::new(program);
-    cmd.args(&argv[1..])
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    policy.tooling.configure_tokio(&mut cmd)?;
 
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    if let Some(env) = env {
-        for (key, value) in env {
-            if let Some(value) = value.as_str() {
-                cmd.env(key, value);
-            }
-        }
-    }
-
-    let mut child = cmd.spawn().map_err(|error| {
-        HandlerError::new(
-            "exec_failed",
-            format!("failed starting {:?}: {error}", argv.first()),
-        )
-    })?;
-    let pid = child.id();
-    let mut process_group_guard = ProcessGroupGuard::new(pid);
-    let wait_outcome =
-        match wait_bounded(&mut child, timeout_duration, policy.exec_capture_max_bytes).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let kill_error = kill_group(pid);
-                process_group_guard.disarm();
-                if let Err(wait_error) = child.wait().await {
-                    tracing::warn!(%wait_error, "failed reaping child after output-capture error");
-                }
-                let mut details = Map::new();
-                if let Some(kill_error) = kill_error {
-                    details.insert("cleanup_error".into(), Value::String(kill_error));
-                }
-                return Err(HandlerError::with_details(
-                    "exec_failed",
-                    format!("command output capture failed: {error}"),
-                    details,
-                ));
-            }
-        };
-
-    match wait_outcome {
-        WaitOutcome::Completed(captured) => {
-            process_group_guard.disarm();
+    match outcome {
+        ProcessOutcome::Completed { captured, duration } => {
             let rc = captured.status.code().unwrap_or(-1);
-            Ok(result(
-                merged_output(&captured),
-                rounded_seconds(start),
-                rc,
-                false,
-                Some(&captured),
-                None,
-            ))
-        }
-        WaitOutcome::TimedOut(pending) => {
-            let kill_error = kill_group(pid);
-            process_group_guard.disarm();
-            let captured = pending
-                .finish_after_kill(&mut child, POST_TIMEOUT_GRACE)
-                .await;
-            let cleanup_error = combine_cleanup_errors(kill_error, captured.capture_error.clone());
-            let mut out = result(
-                timeout_output(&captured),
-                rounded_seconds(start),
-                -1,
-                true,
-                None,
-                cleanup_error,
-            );
+            let mut out = process_result(merged_output(&captured), duration, rc);
             add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
-            if captured.left_running {
-                out.insert("left_running".into(), Value::Bool(true));
-            }
+            Ok(out)
+        }
+        ProcessOutcome::TimedOut {
+            captured,
+            duration,
+            cleanup_error,
+        } => {
+            let mut out = process_result(timeout_output(&captured), duration, -1);
+            add_timeout_metadata(&mut out, &captured, cleanup_error);
             Ok(out)
         }
     }
@@ -285,6 +116,23 @@ mod tests {
         .test_value()?;
         assert_eq!(result["returncode"], 0);
         assert_eq!(result["output"], "out\nerr");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_is_not_reported_as_ok() -> TestResult {
+        let result = run_shell(
+            &Policy::default(),
+            "exit 7",
+            SUCCESS_TEST_TIMEOUT,
+            None,
+            None,
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["returncode"], 7);
+        assert_eq!(result["ok"], false);
 
         Ok(())
     }
