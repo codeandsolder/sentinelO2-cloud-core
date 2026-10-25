@@ -814,9 +814,10 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
         let mut ws = accept_agent(&listener).await?;
         welcome(&mut ws, "sess_app_heartbeat").await?;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(180);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1_600);
+        let mut pings = 0_u32;
         while tokio::time::Instant::now() < deadline {
-            let item = tokio::time::timeout(Duration::from_millis(60), ws.next())
+            let item = tokio::time::timeout(Duration::from_secs(1), ws.next())
                 .await
                 .test_value()?
                 .test_value()?
@@ -828,6 +829,7 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
                 serde_json::from_str::<Message>(&text).test_value()?,
                 Message::Ping { .. }
             ) {
+                pings += 1;
                 ws.send(WsMessage::Text(
                     serde_json::to_string(&Message::Pong {
                         timestamp: Utc::now(),
@@ -839,6 +841,7 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
                 .test_value()?;
             }
         }
+        assert!(pings >= 2, "expected repeated application heartbeat pings");
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
@@ -846,11 +849,11 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
     });
 
     let mut cfg = config(addr);
-    cfg.heartbeat_interval = Duration::from_millis(10);
-    cfg.heartbeat_timeout = Duration::from_millis(30);
+    cfg.heartbeat_interval = Duration::from_millis(100);
+    cfg.heartbeat_timeout = Duration::from_millis(600);
     let agent = Agent::new(cfg, UnsupportedDispatcher).test_value()?;
 
-    tokio::time::timeout(Duration::from_millis(400), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_secs(3), agent.run(cancel.clone()))
         .await
         .test_value()?
         .test_value()?;
