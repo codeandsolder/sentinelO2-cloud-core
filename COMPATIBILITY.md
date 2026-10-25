@@ -198,6 +198,10 @@ Reference surfaces:
 - Legacy `script_run.interpreter=python3` remains accepted for the hosted Hub,
   but executes through `uv run`; direct Python/pip `exec` requests can be
   rejected with `use_uv` while preserving the old request schema.
+  Python `script_run` also stages the version-matched `sentinelx_runtime`
+  helper; its `exec_ssh()` context reuses one multiplexed OpenSSH session and
+  provides argv-safe `run`, stdin-fed `bash`, and stdin-fed `python` remote
+  execution without requiring a separately installed runtime package.
 - `exec_mode` is the authoritative command policy: `allowlist` is the default,
   `strict` adds shell-safety restrictions, and `unrestricted` disables the
   command allowlist. `allowed_commands` uses whole-word matching (plus explicit
