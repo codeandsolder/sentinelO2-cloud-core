@@ -165,30 +165,11 @@ fn maybe_trim(path: &Path) -> std::io::Result<()> {
         retained.push_back(line);
     }
 
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let temp = parent.join(format!(".audit-{:016x}.tmp", rand::random::<u64>()));
-    let replace = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        for line in retained {
-            file.write_all(&line)?;
-        }
-        file.sync_all()?;
-        fs::rename(&temp, path)
-    })();
-    if replace.is_err()
-        && let Err(cleanup) = fs::remove_file(&temp)
-        && cleanup.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            path = %temp.display(),
-            %cleanup,
-            "failed cleaning audit trim temp file"
-        );
+    let mut file = atomic_write_file::AtomicWriteFile::open(path)?;
+    for line in retained {
+        file.write_all(&line)?;
     }
-    replace
+    file.commit()
 }
 
 #[derive(Clone, Copy)]
