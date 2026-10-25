@@ -936,19 +936,32 @@ impl CoreDispatcher {
                         ]),
                     ));
                 }
-                if let Some(offending) = segment::unauthorised_segment(&self.policy, command) {
-                    let suggestion = self.allow_command_guidance(&offending);
-                    return Err(HandlerError::with_details(
-                        "command_not_allowed",
-                        format!(
-                            "strict exec segment {offending:?} is not covered by allowed_commands. {suggestion}"
-                        ),
-                        Map::from_iter([
-                            ("command".into(), Value::String(command.into())),
-                            ("offending_segment".into(), Value::String(offending)),
-                            ("suggestion".into(), Value::String(suggestion)),
-                        ]),
-                    ));
+                match segment::unauthorised_segment(&self.policy, command) {
+                    Ok(None) => {}
+                    Ok(Some(offending)) => {
+                        let suggestion = self.allow_command_guidance(&offending);
+                        return Err(HandlerError::with_details(
+                            "command_not_allowed",
+                            format!(
+                                "strict exec segment {offending:?} is not covered by allowed_commands. {suggestion}"
+                            ),
+                            Map::from_iter([
+                                ("command".into(), Value::String(command.into())),
+                                ("offending_segment".into(), Value::String(offending)),
+                                ("suggestion".into(), Value::String(suggestion)),
+                            ]),
+                        ));
+                    }
+                    Err(segment::UnparseableCommand(reason)) => {
+                        return Err(HandlerError::with_details(
+                            "command_not_allowed",
+                            format!("strict command structure cannot be checked safely: {reason}"),
+                            Map::from_iter([
+                                ("command".into(), Value::String(command.into())),
+                                ("reason".into(), Value::String(reason)),
+                            ]),
+                        ));
+                    }
                 }
             }
             ExecMode::Allowlist => match segment::unauthorised_chain(&self.policy, command) {
@@ -1337,6 +1350,21 @@ mod tests {
     use crate::policy::{FileAccess, FileOpsPath, ServiceSpec};
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
+
+    #[test]
+    fn strict_exec_rejects_unparseable_shell_structure() -> TestResult {
+        let policy = Policy {
+            exec_mode: ExecMode::Strict,
+            allowed_commands: vec!["echo".into()],
+            ..Policy::default()
+        };
+        let dispatcher = CoreDispatcher::new(policy, "/tmp/config".into(), "test");
+        let error = dispatcher.validate_exec_policy("echo '").test_error()?;
+        assert_eq!(error.code, "command_not_allowed");
+        assert!(error.message.contains("cannot be checked safely"));
+        assert_eq!(error.details["command"], "echo '");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn read_does_not_wait_for_scan_permits() -> TestResult {

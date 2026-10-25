@@ -227,5 +227,13 @@ mod tests {
         );
         assert_eq!(tooling.direct_python_violation("uv run python x.py"), None);
         assert_eq!(tooling.direct_python_violation("echo python3"), None);
+        assert_eq!(
+            tooling.direct_python_violation("echo \"$(python3 x.py)\""),
+            Some("python")
+        );
+        assert_eq!(
+            tooling.direct_python_violation("if true; then pip install x; fi"),
+            Some("pip")
+        );
     }
 }
