@@ -10,6 +10,16 @@ const SERVER_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const LOCAL_TIMEOUT_GRACE: u64 = 15;
 const CWD_EXEC: &str = r#"cd -- "$1" || exit 126; shift; exec "$@""#;
 
+fn validate_destination(destination: &str) -> io::Result<()> {
+    if destination.is_empty() || destination.starts_with('-') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH destination must be non-empty and must not look like an option",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RequestKind {
@@ -291,6 +301,7 @@ async fn write_json_line<T: Serialize + Sync>(
 /// # Errors
 /// Returns an error if the OpenSSH session or helper protocol fails.
 pub async fn run_helper(destination: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    validate_destination(destination)?;
     let mut builder = SessionBuilder::default();
     builder
         .known_hosts_check(KnownHosts::Add)
@@ -333,6 +344,13 @@ pub async fn run_helper(destination: &str) -> Result<(), Box<dyn std::error::Err
 mod tests {
     use super::*;
     use crate::test_support::{TestResult, TestValue as _};
+
+    #[test]
+    fn destination_rejects_option_shaped_values() {
+        assert!(validate_destination("").is_err());
+        assert!(validate_destination("-oProxyCommand=oops").is_err());
+        assert!(validate_destination("jan@acer").is_ok());
+    }
 
     #[test]
     fn argv_request_keeps_data_as_argv() -> TestResult {
