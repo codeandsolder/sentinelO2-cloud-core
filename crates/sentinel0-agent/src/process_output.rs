@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt as _},
     process::Child,
     task::JoinHandle,
     time::timeout,
@@ -323,31 +323,6 @@ pub(crate) fn combine_cleanup_errors(
     }
 }
 
-pub(crate) async fn capture_bounded(
-    child: &mut Child,
-    stdout_limit: usize,
-    stderr_limit: usize,
-) -> io::Result<CapturedOutput> {
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
-    let (stdout, stderr, status) = tokio::try_join!(
-        read_bounded_async(stdout, stdout_limit),
-        read_bounded_async(stderr, stderr_limit),
-        child.wait(),
-    )?;
-    Ok(CapturedOutput {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
 pub(crate) async fn wait_bounded_with_limits(
     child: &mut Child,
     timeout_duration: Duration,
@@ -386,21 +361,6 @@ pub async fn wait_bounded(
 ) -> io::Result<WaitOutcome> {
     let per_stream = (capture_limit / 2).max(1024);
     wait_bounded_with_limits(child, timeout_duration, per_stream, per_stream).await
-}
-
-async fn read_bounded_async<R>(mut reader: R, limit: usize) -> io::Result<CapturedStream>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut capture = CapturedStream::new(limit);
-    let mut buffer = vec![0_u8; READ_CHUNK];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            return Ok(capture);
-        }
-        capture.push(&buffer[..read]);
-    }
 }
 
 /// # Errors

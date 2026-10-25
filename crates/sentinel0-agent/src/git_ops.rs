@@ -1,16 +1,15 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
-    process_output::capture_bounded,
+    process_output::CapturedOutput,
+    process_runner::{ProcessFailure, ProcessGroupKill, ProcessOutcome, run_argv_with_limits},
 };
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
 const NET_TIMEOUT: Duration = Duration::from_secs(50);
@@ -19,56 +18,92 @@ const MAX_DIFF_PATCH: usize = 128 * 1024;
 const MAX_GIT_STDOUT: usize = 32 * 1024 * 1024;
 const MAX_GIT_STDERR: usize = 1024 * 1024;
 
-async fn cleanup_git_child(
-    child: &mut tokio::process::Child,
-    pid: Option<u32>,
-    reason: &'static str,
-) -> Option<String> {
-    let mut cleanup_error = None;
-    let should_kill = match child.try_wait() {
-        Ok(Some(_)) => false,
-        Ok(None) => true,
-        Err(error) => {
-            let message = format!(
-                "failed checking git child state after {reason}: {error}; refusing PID-based group signal"
-            );
-            tracing::warn!(%message);
-            cleanup_error = Some(message);
-            false
-        }
-    };
+fn git_argv(policy: &Policy, root: &Path, args: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        policy.tooling.command("git").display().to_string(),
+        "-C".into(),
+        root.display().to_string(),
+        "-c".into(),
+        "core.fsmonitor=false".into(),
+    ];
+    argv.extend(args.iter().cloned());
+    argv
+}
 
-    #[cfg(unix)]
-    if should_kill {
-        if let Some(pid) = pid {
-            let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
-            if let Err(error) =
-                nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
-                && error != nix::errno::Errno::ESRCH
-            {
-                let message = format!("failed killing git process group: {error}");
-                tracing::warn!(pid, %message);
-                cleanup_error.get_or_insert(message);
+fn git_env() -> Map<String, Value> {
+    Map::from_iter([
+        ("GIT_TERMINAL_PROMPT".into(), Value::String("0".into())),
+        ("GIT_OPTIONAL_LOCKS".into(), Value::String("0".into())),
+        ("GIT_PAGER".into(), Value::String("cat".into())),
+        ("GIT_CONFIG_NOSYSTEM".into(), Value::String("1".into())),
+        ("LC_ALL".into(), Value::String("C".into())),
+    ])
+}
+
+fn git_process_failure(failure: ProcessFailure) -> HandlerError {
+    match failure {
+        ProcessFailure::Setup(error) => error,
+        ProcessFailure::Spawn(error) => {
+            HandlerError::new("git_failed", format!("failed to start git: {error}"))
+        }
+        ProcessFailure::Capture {
+            error,
+            cleanup_error,
+        } => {
+            let mut details = Map::new();
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
             }
-        } else {
-            cleanup_error
-                .get_or_insert_with(|| "git PID unavailable; process group not killed".into());
+            HandlerError::with_details("git_failed", format!("git I/O failed: {error}"), details)
         }
     }
+}
 
-    #[cfg(not(unix))]
-    if should_kill && let Err(error) = child.kill().await {
-        let message = format!("failed killing git child: {error}");
-        tracing::warn!(%message);
-        cleanup_error.get_or_insert(message);
-    }
+async fn run_git_capture(
+    policy: &Policy,
+    root: &Path,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    stdout_limit: usize,
+    limit: Duration,
+) -> Result<CapturedOutput, HandlerError> {
+    let argv = git_argv(policy, root, args);
+    let env = git_env();
+    let outcome = run_argv_with_limits(
+        policy,
+        &argv,
+        limit,
+        None,
+        Some(&env),
+        stdin,
+        stdout_limit,
+        MAX_GIT_STDERR,
+        ProcessGroupKill::Direct,
+    )
+    .await
+    .map_err(git_process_failure)?;
 
-    if let Err(error) = child.wait().await {
-        let message = format!("failed reaping git child: {error}");
-        tracing::warn!(%message);
-        cleanup_error.get_or_insert(message);
+    match outcome {
+        ProcessOutcome::Completed { captured, .. } => Ok(captured),
+        ProcessOutcome::TimedOut {
+            captured,
+            cleanup_error,
+            ..
+        } => {
+            let mut details = Map::new();
+            if captured.left_running {
+                details.insert("left_running".into(), Value::Bool(true));
+            }
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
+            }
+            Err(HandlerError::with_details(
+                "git_timeout",
+                format!("git {} timed out", args.first().map_or("?", String::as_str)),
+                details,
+            ))
+        }
     }
-    cleanup_error
 }
 
 async fn run_git(
@@ -78,83 +113,7 @@ async fn run_git(
     stdin: Option<&[u8]>,
     limit: Duration,
 ) -> Result<(i32, Vec<u8>, Vec<u8>), HandlerError> {
-    let mut command = Command::new(policy.tooling.command("git"));
-    command
-        .arg("-C")
-        .arg(root)
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("LC_ALL", "C")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    policy.tooling.configure_tokio(&mut command)?;
-
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    } else {
-        command.stdin(Stdio::null());
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| HandlerError::new("git_failed", format!("failed to start git: {e}")))?;
-    let pid = child.id();
-    let mut stdin_pipe = child.stdin.take();
-
-    let work = async {
-        let capture = capture_bounded(&mut child, MAX_GIT_STDOUT, MAX_GIT_STDERR);
-        if let Some(input) = stdin {
-            let mut pipe = stdin_pipe
-                .take()
-                .ok_or_else(|| std::io::Error::other("git stdin was unavailable"))?;
-            let write = async move {
-                pipe.write_all(input).await?;
-                drop(pipe);
-                Ok::<(), std::io::Error>(())
-            };
-            let ((), captured) = tokio::try_join!(write, capture)?;
-            Ok::<_, std::io::Error>(captured)
-        } else {
-            capture.await
-        }
-    };
-
-    let captured = match timeout(limit, work).await {
-        Ok(Ok(captured)) => captured,
-        Ok(Err(error)) => {
-            let cleanup_error = cleanup_git_child(&mut child, pid, "I/O failure").await;
-            let mut details = Map::new();
-            if let Some(error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(error));
-            }
-            return Err(HandlerError::with_details(
-                "git_failed",
-                format!("git I/O failed: {error}"),
-                details,
-            ));
-        }
-        Err(_) => {
-            let cleanup_error = cleanup_git_child(&mut child, pid, "timeout").await;
-            let mut details = Map::new();
-            if let Some(error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(error));
-            }
-            return Err(HandlerError::with_details(
-                "git_timeout",
-                format!("git {} timed out", args.first().map_or("?", String::as_str)),
-                details,
-            ));
-        }
-    };
-
+    let captured = run_git_capture(policy, root, args, stdin, MAX_GIT_STDOUT, limit).await?;
     if captured.stdout.truncated() {
         return Err(HandlerError::with_details(
             "git_output_too_large",
@@ -183,63 +142,7 @@ async fn run_git_capped_stdout(
     cap: usize,
     limit: Duration,
 ) -> Result<(i32, Vec<u8>, Vec<u8>, bool), HandlerError> {
-    let mut command = Command::new(policy.tooling.command("git"));
-    command
-        .arg("-C")
-        .arg(root)
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    policy.tooling.configure_tokio(&mut command)?;
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| HandlerError::new("git_failed", format!("failed to start git: {e}")))?;
-    let pid = child.id();
-    let captured = match timeout(
-        limit,
-        capture_bounded(&mut child, cap.saturating_add(1), MAX_GIT_STDERR),
-    )
-    .await
-    {
-        Ok(Ok(captured)) => captured,
-        Ok(Err(error)) => {
-            let cleanup_error = cleanup_git_child(&mut child, pid, "I/O failure").await;
-            let mut details = Map::new();
-            if let Some(error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(error));
-            }
-            return Err(HandlerError::with_details(
-                "git_failed",
-                format!("git I/O failed: {error}"),
-                details,
-            ));
-        }
-        Err(_) => {
-            let cleanup_error = cleanup_git_child(&mut child, pid, "timeout").await;
-            let mut details = Map::new();
-            if let Some(error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(error));
-            }
-            return Err(HandlerError::with_details(
-                "git_timeout",
-                format!("git {} timed out", args.first().map_or("?", String::as_str)),
-                details,
-            ));
-        }
-    };
-
+    let captured = run_git_capture(policy, root, args, None, cap.saturating_add(1), limit).await?;
     let exceeded = captured.stdout.total_bytes() > cap as u64;
     Ok((
         captured.status.code().unwrap_or(-1),

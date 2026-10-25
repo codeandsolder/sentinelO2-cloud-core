@@ -2,7 +2,7 @@ use crate::{
     handler_error::HandlerError,
     policy::Policy,
     process_output::{
-        CapturedOutput, POST_TIMEOUT_GRACE, TimedOutOutput, WaitOutcome, wait_bounded,
+        CapturedOutput, POST_TIMEOUT_GRACE, TimedOutOutput, WaitOutcome, wait_bounded_with_limits,
     },
 };
 use serde_json::{Map, Value};
@@ -13,7 +13,7 @@ use std::{
     process::Stdio,
     time::{Duration, Instant},
 };
-use tokio::process::Command;
+use tokio::{io::AsyncWriteExt as _, process::Command, task::JoinHandle};
 
 #[derive(Clone, Debug)]
 pub enum ProcessGroupKill {
@@ -179,14 +179,25 @@ fn rounded_seconds(started: Instant) -> f64 {
     (seconds * 100.0).round() / 100.0
 }
 
+async fn finish_stdin_write(task: Option<JoinHandle<io::Result<()>>>) -> io::Result<()> {
+    let Some(task) = task else {
+        return Ok(());
+    };
+    task.await
+        .map_err(|error| io::Error::other(format!("stdin writer task failed: {error}")))?
+}
+
 /// # Errors
-/// Returns a typed failure for setup, spawn, output capture, or process cleanup failures.
-pub async fn run_argv(
+/// Returns a typed failure for setup, spawn, input/output I/O, or process cleanup failures.
+pub async fn run_argv_with_limits(
     policy: &Policy,
     argv: &[String],
     timeout_duration: Duration,
     cwd: Option<&Path>,
     env: Option<&Map<String, Value>>,
+    stdin: Option<&[u8]>,
+    stdout_limit: usize,
+    stderr_limit: usize,
     killer: ProcessGroupKill,
 ) -> Result<ProcessOutcome, ProcessFailure> {
     let Some(program) = argv.first() else {
@@ -200,6 +211,11 @@ pub async fn run_argv(
     command
         .args(&argv[1..])
         .kill_on_drop(true)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -222,16 +238,33 @@ pub async fn run_argv(
     let started = Instant::now();
     let mut child = command.spawn().map_err(ProcessFailure::Spawn)?;
     let mut group = ProcessGroupGuard::new(child.id(), killer);
-    let wait_outcome = match wait_bounded(
+    let stdin_task = if let Some(input) = stdin {
+        let mut pipe = child.stdin.take().ok_or_else(|| ProcessFailure::Capture {
+            error: io::Error::other("child stdin was not piped"),
+            cleanup_error: None,
+        })?;
+        let input = input.to_vec();
+        Some(tokio::spawn(async move {
+            pipe.write_all(&input).await?;
+            drop(pipe);
+            Ok(())
+        }))
+    } else {
+        None
+    };
+
+    let wait_outcome = match wait_bounded_with_limits(
         &mut child,
         timeout_duration,
-        policy.exec_capture_max_bytes,
+        stdout_limit,
+        stderr_limit,
     )
     .await
     {
         Ok(outcome) => outcome,
         Err(error) => {
             let kill_error = group.kill().await;
+            let _ = finish_stdin_write(stdin_task).await;
             let reap_error = match tokio::time::timeout(POST_TIMEOUT_GRACE, child.wait()).await {
                 Ok(Ok(_)) => None,
                 Ok(Err(wait_error)) => {
@@ -254,6 +287,12 @@ pub async fn run_argv(
     match wait_outcome {
         WaitOutcome::Completed(captured) => {
             group.disarm();
+            if let Err(error) = finish_stdin_write(stdin_task).await {
+                return Err(ProcessFailure::Capture {
+                    error,
+                    cleanup_error: None,
+                });
+            }
             Ok(ProcessOutcome::Completed {
                 captured,
                 duration: rounded_seconds(started),
@@ -262,6 +301,7 @@ pub async fn run_argv(
         WaitOutcome::TimedOut(pending) => {
             let cleanup_started = Instant::now();
             let kill_error = group.kill().await;
+            let _ = finish_stdin_write(stdin_task).await;
             let remaining = POST_TIMEOUT_GRACE.saturating_sub(cleanup_started.elapsed());
             let captured = pending.finish_after_kill(&mut child, remaining).await;
             Ok(ProcessOutcome::TimedOut {
@@ -274,4 +314,29 @@ pub async fn run_argv(
             })
         }
     }
+}
+
+/// # Errors
+/// Returns a typed failure for setup, spawn, output capture, or process cleanup failures.
+pub async fn run_argv(
+    policy: &Policy,
+    argv: &[String],
+    timeout_duration: Duration,
+    cwd: Option<&Path>,
+    env: Option<&Map<String, Value>>,
+    killer: ProcessGroupKill,
+) -> Result<ProcessOutcome, ProcessFailure> {
+    let per_stream = (policy.exec_capture_max_bytes / 2).max(1024);
+    run_argv_with_limits(
+        policy,
+        argv,
+        timeout_duration,
+        cwd,
+        env,
+        None,
+        per_stream,
+        per_stream,
+        killer,
+    )
+    .await
 }
