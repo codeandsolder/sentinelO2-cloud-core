@@ -562,24 +562,6 @@ async fn held_job_completion_replays_after_welcome_and_is_cleared() -> TestResul
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct JobDispatcher;
-
-impl Dispatcher for JobDispatcher {
-    async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> DispatchResponse {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        DispatchResponse::message(Message::Response {
-            id: id.into(),
-            ok: true,
-            result: Some(BTreeMap::from([
-                ("returncode".into(), Value::from(0)),
-                ("output".into(), Value::String("job done".into())),
-            ])),
-            error: None,
-        })
-    }
-}
-
 #[tokio::test]
 async fn background_job_acks_immediately_then_emits_completion_without_litter() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
@@ -590,6 +572,8 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
 
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server_release = Arc::clone(&release);
 
     let server = tokio::spawn(async move {
         let mut ws = accept_agent(&listener).await?;
@@ -631,7 +615,8 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
         assert_eq!(result["tool"], "exec");
         assert_eq!(result["host"], "host_compat");
 
-        let completion = tokio::time::timeout(Duration::from_millis(800), ws.next())
+        server_release.notify_one();
+        let completion = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
             .test_value()?
             .test_value()?
@@ -657,8 +642,8 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
 
     let mut cfg = config(addr);
     cfg.upload_base = upload_base.clone();
-    let agent = Agent::new(cfg, JobDispatcher).test_value()?;
-    tokio::time::timeout(Duration::from_millis(1200), agent.run(cancel.clone()))
+    let agent = Agent::new(cfg, ControlledJobDispatcher { release }).test_value()?;
+    tokio::time::timeout(Duration::from_secs(3), agent.run(cancel.clone()))
         .await
         .test_value()?
         .test_value()?;
