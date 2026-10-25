@@ -68,6 +68,7 @@ pub mod rotation;
 pub mod script;
 pub mod segment;
 pub mod shell;
+pub mod ssh_target;
 pub mod staging;
 pub mod tooling;
 pub mod upload;

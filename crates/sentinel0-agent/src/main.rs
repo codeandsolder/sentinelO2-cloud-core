@@ -36,6 +36,8 @@ struct Args {
     local_api_relay: Option<PathBuf>,
     #[arg(long, hide = true, default_value_t = 30.0)]
     relay_timeout: f64,
+    #[arg(long, hide = true)]
+    ssh_execution_target: Option<String>,
 }
 
 fn ws_base(hub: &str) -> String {
@@ -98,7 +100,7 @@ fn spawn_shutdown_signal(cancel: CancellationToken) {
     });
 }
 
-async fn run_agent(args: Args) -> Result<(), Box<dyn Error>> {
+async fn run_agent(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     let policy = if args.check_config {
         Policy::from_file_strict(&args.config)?
     } else {
@@ -199,13 +201,17 @@ async fn run_agent(args: Args) -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
     if let Some(path) = args.local_api_relay.as_deref() {
         std::process::exit(sentinel0_agent::local_api::run_local_api_relay(
             path,
             args.relay_timeout,
         ));
+    }
+    if let Some(destination) = args.ssh_execution_target.as_deref() {
+        sentinel0_agent::ssh_target::run_helper(destination).await?;
+        return Ok(());
     }
     init_tracing(&args.log_level);
     run_agent(args).await

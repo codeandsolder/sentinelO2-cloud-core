@@ -187,31 +187,32 @@ async fn finish_stdin_write(task: Option<JoinHandle<io::Result<()>>>) -> io::Res
         .map_err(|error| io::Error::other(format!("stdin writer task failed: {error}")))?
 }
 
-/// # Errors
-/// Returns a typed failure for setup, spawn, input/output I/O, or process cleanup failures.
-pub async fn run_argv_with_limits(
+#[derive(Debug)]
+pub struct RunOptions<'a> {
+    pub cwd: Option<&'a Path>,
+    pub env: Option<&'a Map<String, Value>>,
+    pub stdin: Option<&'a [u8]>,
+    pub stdout_limit: usize,
+    pub stderr_limit: usize,
+    pub killer: ProcessGroupKill,
+}
+
+fn configure_command(
     policy: &Policy,
     argv: &[String],
-    timeout_duration: Duration,
-    cwd: Option<&Path>,
-    env: Option<&Map<String, Value>>,
-    stdin: Option<&[u8]>,
-    stdout_limit: usize,
-    stderr_limit: usize,
-    killer: ProcessGroupKill,
-) -> Result<ProcessOutcome, ProcessFailure> {
+    options: &RunOptions<'_>,
+) -> Result<Command, ProcessFailure> {
     let Some(program) = argv.first() else {
         return Err(ProcessFailure::Setup(HandlerError::new(
             "invalid_payload",
             "empty command argv",
         )));
     };
-
     let mut command = Command::new(program);
     command
         .args(&argv[1..])
         .kill_on_drop(true)
-        .stdin(if stdin.is_some() {
+        .stdin(if options.stdin.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -224,21 +225,32 @@ pub async fn run_argv_with_limits(
         .tooling
         .configure_tokio(&mut command)
         .map_err(ProcessFailure::Setup)?;
-    if let Some(cwd) = cwd {
+    if let Some(cwd) = options.cwd {
         command.current_dir(cwd);
     }
-    if let Some(env) = env {
+    if let Some(env) = options.env {
         for (key, value) in env {
             if let Some(value) = value.as_str() {
                 command.env(key, value);
             }
         }
     }
+    Ok(command)
+}
 
+/// # Errors
+/// Returns a typed failure for setup, spawn, input/output I/O, or process cleanup failures.
+pub async fn run_argv_with_limits(
+    policy: &Policy,
+    argv: &[String],
+    timeout_duration: Duration,
+    options: RunOptions<'_>,
+) -> Result<ProcessOutcome, ProcessFailure> {
+    let mut command = configure_command(policy, argv, &options)?;
     let started = Instant::now();
     let mut child = command.spawn().map_err(ProcessFailure::Spawn)?;
-    let mut group = ProcessGroupGuard::new(child.id(), killer);
-    let stdin_task = if let Some(input) = stdin {
+    let mut group = ProcessGroupGuard::new(child.id(), options.killer);
+    let stdin_task = if let Some(input) = options.stdin {
         let mut pipe = child.stdin.take().ok_or_else(|| ProcessFailure::Capture {
             error: io::Error::other("child stdin was not piped"),
             cleanup_error: None,
@@ -256,8 +268,8 @@ pub async fn run_argv_with_limits(
     let wait_outcome = match wait_bounded_with_limits(
         &mut child,
         timeout_duration,
-        stdout_limit,
-        stderr_limit,
+        options.stdout_limit,
+        options.stderr_limit,
     )
     .await
     {
@@ -331,12 +343,14 @@ pub async fn run_argv(
         policy,
         argv,
         timeout_duration,
-        cwd,
-        env,
-        None,
-        per_stream,
-        per_stream,
-        killer,
+        RunOptions {
+            cwd,
+            env,
+            stdin: None,
+            stdout_limit: per_stream,
+            stderr_limit: per_stream,
+            killer,
+        },
     )
     .await
 }

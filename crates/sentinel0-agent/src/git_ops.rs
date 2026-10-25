@@ -2,7 +2,9 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
     process_output::CapturedOutput,
-    process_runner::{ProcessFailure, ProcessGroupKill, ProcessOutcome, run_argv_with_limits},
+    process_runner::{
+        ProcessFailure, ProcessGroupKill, ProcessOutcome, RunOptions, run_argv_with_limits,
+    },
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -18,16 +20,16 @@ const MAX_DIFF_PATCH: usize = 128 * 1024;
 const MAX_GIT_STDOUT: usize = 32 * 1024 * 1024;
 const MAX_GIT_STDERR: usize = 1024 * 1024;
 
-fn git_argv(policy: &Policy, root: &Path, args: &[String]) -> Vec<String> {
-    let mut argv = vec![
+fn git_argv(policy: &Policy, root: &Path, arguments: &[String]) -> Vec<String> {
+    let mut command = vec![
         policy.tooling.command("git").display().to_string(),
         "-C".into(),
         root.display().to_string(),
         "-c".into(),
         "core.fsmonitor=false".into(),
     ];
-    argv.extend(args.iter().cloned());
-    argv
+    command.extend(arguments.iter().cloned());
+    command
 }
 
 fn git_env() -> Map<String, Value> {
@@ -62,23 +64,25 @@ fn git_process_failure(failure: ProcessFailure) -> HandlerError {
 async fn run_git_capture(
     policy: &Policy,
     root: &Path,
-    args: &[String],
+    arguments: &[String],
     stdin: Option<&[u8]>,
     stdout_limit: usize,
     limit: Duration,
 ) -> Result<CapturedOutput, HandlerError> {
-    let argv = git_argv(policy, root, args);
+    let command = git_argv(policy, root, arguments);
     let env = git_env();
     let outcome = run_argv_with_limits(
         policy,
-        &argv,
+        &command,
         limit,
-        None,
-        Some(&env),
-        stdin,
-        stdout_limit,
-        MAX_GIT_STDERR,
-        ProcessGroupKill::Direct,
+        RunOptions {
+            cwd: None,
+            env: Some(&env),
+            stdin,
+            stdout_limit,
+            stderr_limit: MAX_GIT_STDERR,
+            killer: ProcessGroupKill::Direct,
+        },
     )
     .await
     .map_err(git_process_failure)?;
@@ -99,7 +103,10 @@ async fn run_git_capture(
             }
             Err(HandlerError::with_details(
                 "git_timeout",
-                format!("git {} timed out", args.first().map_or("?", String::as_str)),
+                format!(
+                    "git {} timed out",
+                    arguments.first().map_or("?", String::as_str)
+                ),
                 details,
             ))
         }

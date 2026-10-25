@@ -364,6 +364,23 @@ pub async fn wait_bounded(
 }
 
 /// # Errors
+/// Returns an I/O error when reading from the supplied async stream fails.
+pub(crate) async fn read_bounded_async<R>(mut reader: R, limit: usize) -> io::Result<CapturedStream>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut capture = CapturedStream::new(limit);
+    let mut buffer = vec![0_u8; READ_CHUNK];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(capture);
+        }
+        capture.push(&buffer[..read]);
+    }
+}
+
+/// # Errors
 /// Returns an I/O error when reading from the supplied stream fails.
 pub fn read_bounded_sync<R: Read>(mut reader: R, limit: usize) -> io::Result<CapturedStream> {
     let mut capture = CapturedStream::new(limit);

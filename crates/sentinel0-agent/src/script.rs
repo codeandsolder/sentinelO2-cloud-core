@@ -22,6 +22,8 @@ use tokio::fs as async_fs;
 
 const TIMEOUT_MIN: u64 = 1;
 const TIMEOUT_MAX: u64 = 600;
+const PYTHON_RUNTIME_NAME: &str = "sentinelx_runtime.py";
+const PYTHON_RUNTIME_SOURCE: &str = include_str!("python_runtime.py");
 
 fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
     match error.raw_os_error() {
@@ -75,7 +77,7 @@ fn safe_filename(filename: Option<&str>, extension: &str) -> String {
     filename
         .and_then(|name| Path::new(name).file_name())
         .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty() && !name.starts_with('.'))
+        .filter(|name| !name.is_empty() && !name.starts_with('.') && *name != PYTHON_RUNTIME_NAME)
         .map_or_else(|| format!("script.{extension}"), str::to_owned)
 }
 
@@ -334,6 +336,32 @@ impl StagedScript {
     }
 }
 
+async fn stage_python_runtime(workdir: &Path) -> Result<(), HandlerError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        HandlerError::new(
+            "internal_error",
+            format!("cannot resolve SentinelO2 executable for Python runtime: {error}"),
+        )
+    })?;
+    let executable_literal =
+        serde_json::to_string(&executable.display().to_string()).map_err(|error| {
+            HandlerError::new(
+                "internal_error",
+                format!("cannot encode SentinelO2 executable path for Python runtime: {error}"),
+            )
+        })?;
+    let source =
+        PYTHON_RUNTIME_SOURCE.replace("__SENTINELX_AGENT_EXECUTABLE__", &executable_literal);
+    let path = workdir.join(PYTHON_RUNTIME_NAME);
+    async_fs::write(&path, source)
+        .await
+        .map_err(|error| staging_oserror(&error, &path))?;
+    async_fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|error| staging_oserror(&error, &path))?;
+    Ok(())
+}
+
 async fn prepare_script(
     policy: &Policy,
     request: &ScriptRequest<'_>,
@@ -377,6 +405,11 @@ async fn prepare_script(
         async_fs::set_permissions(staged.script_path(), fs::Permissions::from_mode(0o700)).await
     {
         let error = staging_oserror(&error, staged.script_path());
+        return Err(staged.finish_error(error, request.cleanup));
+    }
+    if matches!(request.interpreter, "python" | "python3")
+        && let Err(error) = stage_python_runtime(staged.workdir.path()).await
+    {
         return Err(staged.finish_error(error, request.cleanup));
     }
     Ok(staged)
@@ -566,6 +599,7 @@ mod tests {
         assert_eq!(safe_filename(Some(".hidden"), "sh"), "script.sh");
         assert_eq!(safe_filename(Some("../../"), "sh"), "script.sh");
         assert_eq!(safe_filename(None, "py"), "script.py");
+        assert_eq!(safe_filename(Some(PYTHON_RUNTIME_NAME), "py"), "script.py");
     }
 
     #[test]
@@ -613,6 +647,33 @@ mod tests {
         assert!(result["output"].as_str().test_value()?.contains("hello"));
         assert!(result["output"].as_str().test_value()?.contains("err"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn python_script_can_import_staged_runtime() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("python3".into())),
+                (
+                    "content".into(),
+                    Value::String(
+                        "from sentinelx_runtime import RunResult\nprint(RunResult('x', 0, 'out', '').ok)"
+                            .into(),
+                    ),
+                ),
+            ]),
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["returncode"], 0);
+        assert_eq!(result["output"], "True");
         Ok(())
     }
 

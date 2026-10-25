@@ -2,7 +2,9 @@ use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
     process_output::CapturedOutput,
-    process_runner::{ProcessFailure, ProcessGroupKill, ProcessOutcome, run_argv_with_limits},
+    process_runner::{
+        ProcessFailure, ProcessGroupKill, ProcessOutcome, RunOptions, run_argv_with_limits,
+    },
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -611,7 +613,7 @@ where
     }
 }
 
-fn http_error(endpoint: &Endpoint, error: reqwest::Error) -> HandlerError {
+fn http_error(endpoint: &Endpoint, error: &reqwest::Error) -> HandlerError {
     if error.is_timeout() {
         HandlerError::new(
             "timeout",
@@ -646,7 +648,7 @@ async fn decode_http_response(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| http_error(endpoint, error))?
+        .map_err(|error| http_error(endpoint, &error))?
     {
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(HandlerError::new(
@@ -719,7 +721,7 @@ async fn call_http(
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|error| http_error(endpoint, error))?;
+        .map_err(|error| http_error(endpoint, &error))?;
     decode_http_response(endpoint, response).await
 }
 
@@ -790,12 +792,14 @@ async fn call_via_run_as(
         policy,
         &argv,
         endpoint.timeout + Duration::from_secs(5),
-        None,
-        None,
-        Some(payload),
-        MAX_RESPONSE_BYTES,
-        RELAY_STDERR_BYTES,
-        ProcessGroupKill::Direct,
+        RunOptions {
+            cwd: None,
+            env: None,
+            stdin: Some(payload),
+            stdout_limit: MAX_RESPONSE_BYTES,
+            stderr_limit: RELAY_STDERR_BYTES,
+            killer: ProcessGroupKill::Direct,
+        },
     )
     .await;
 

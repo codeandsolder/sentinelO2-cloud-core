@@ -1,7 +1,9 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
-    process_runner::{ProcessFailure, ProcessGroupKill, ProcessOutcome, run_argv_with_limits},
+    process_runner::{
+        ProcessFailure, ProcessGroupKill, ProcessOutcome, RunOptions, run_argv_with_limits,
+    },
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -42,16 +44,16 @@ fn git_process_failure(failure: ProcessFailure) -> HandlerError {
 async fn run_git(
     policy: &Policy,
     root: &Path,
-    args: &[&str],
+    arguments: &[&str],
 ) -> Result<(i32, Vec<u8>, Vec<u8>), HandlerError> {
-    let mut argv = vec![
+    let mut command = vec![
         policy.tooling.command("git").display().to_string(),
         "-C".into(),
         root.display().to_string(),
         "-c".into(),
         "core.fsmonitor=false".into(),
     ];
-    argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+    command.extend(arguments.iter().map(|argument| (*argument).to_owned()));
     let env = Map::from_iter([
         ("GIT_TERMINAL_PROMPT".into(), Value::String("0".into())),
         ("GIT_OPTIONAL_LOCKS".into(), Value::String("0".into())),
@@ -61,14 +63,16 @@ async fn run_git(
     ]);
     let outcome = run_argv_with_limits(
         policy,
-        &argv,
+        &command,
         GIT_TIMEOUT,
-        None,
-        Some(&env),
-        None,
-        MAX_GIT_STDOUT,
-        MAX_GIT_STDERR,
-        ProcessGroupKill::Direct,
+        RunOptions {
+            cwd: None,
+            env: Some(&env),
+            stdin: None,
+            stdout_limit: MAX_GIT_STDOUT,
+            stderr_limit: MAX_GIT_STDERR,
+            killer: ProcessGroupKill::Direct,
+        },
     )
     .await
     .map_err(git_process_failure)?;
@@ -100,7 +104,7 @@ async fn run_git(
             "git_output_too_large",
             format!(
                 "git {} output exceeded capture ceiling",
-                args.first().unwrap_or(&"?")
+                arguments.first().unwrap_or(&"?")
             ),
             Map::from_iter([(
                 "stdout_bytes".into(),

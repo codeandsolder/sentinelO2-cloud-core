@@ -648,7 +648,7 @@ impl CoreDispatcher {
         if self.help_ops_live(&[Op::ScriptRun]) {
             navigation.insert(
                 "script_run".into(),
-                Value::String("run a multi-step bash/python script for complex tasks".into()),
+                Value::String("run a multi-step bash/python script; Python gets sentinelx_runtime.exec_ssh() for multiplexed remote execution".into()),
             );
         }
         if self.help_ops_live(&[Op::Service, Op::Restart]) && has_services {
