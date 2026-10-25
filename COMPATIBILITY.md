@@ -248,8 +248,8 @@ Reference surfaces:
 
 ### Verification
 
-- The full workspace suite is required to pass in GitHub Actions on both the
-  current pinned toolchain and the declared Rust 1.88 MSRV.
+- The full workspace suite is required to pass in GitHub Actions on the pinned
+  Rust 1.99.1 toolchain. This application does not maintain a separate older MSRV.
 - Real local WebSocket tests cover reconnect/liveness and binary transfer.
 - Property tests cover protocol parsing/bounding behavior.
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.

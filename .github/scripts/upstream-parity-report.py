@@ -227,7 +227,7 @@ def markdown_for_release(release: dict, delta: dict, changelog: str) -> str:
         "- Port Linux/cross-platform behavior unless there is a documented intentional divergence.",
         "- Platform-specific changes may be marked not-applicable only after checking shared wire/config semantics.",
         "- Prefer translating upstream regression tests with each behavior port.",
-        "- Re-run protocol fixtures/differentials, stable CI, MSRV, fuzz and real-WebSocket tests.",
+        "- Re-run protocol fixtures/differentials, pinned Rust CI, fuzz and real-WebSocket tests.",
         "- Update COMPATIBILITY.md and the project Notion summary for material differences.",
         f"- Advance only the `{component}` entry in `.github/upstream-parity.json` "
         f"to version `{version}` and SHA `{new}` in the commit that resolves this issue.",

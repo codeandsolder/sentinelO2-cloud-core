@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.99.1"
 
 [workspace.dependencies]
 atomic-write-file = { version = "0.3.1", features = ["unnamed-tmpfile"] }
