@@ -562,24 +562,6 @@ async fn held_job_completion_replays_after_welcome_and_is_cleared() -> TestResul
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct JobDispatcher;
-
-impl Dispatcher for JobDispatcher {
-    async fn dispatch(&self, id: &str, _op: Op, _payload: Map<String, Value>) -> DispatchResponse {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        DispatchResponse::message(Message::Response {
-            id: id.into(),
-            ok: true,
-            result: Some(BTreeMap::from([
-                ("returncode".into(), Value::from(0)),
-                ("output".into(), Value::String("job done".into())),
-            ])),
-            error: None,
-        })
-    }
-}
-
 #[tokio::test]
 async fn background_job_acks_immediately_then_emits_completion_without_litter() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await.test_value()?;
@@ -590,6 +572,8 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
 
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server_release = Arc::clone(&release);
 
     let server = tokio::spawn(async move {
         let mut ws = accept_agent(&listener).await?;
@@ -631,7 +615,8 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
         assert_eq!(result["tool"], "exec");
         assert_eq!(result["host"], "host_compat");
 
-        let completion = tokio::time::timeout(Duration::from_millis(800), ws.next())
+        server_release.notify_one();
+        let completion = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
             .test_value()?
             .test_value()?
@@ -657,8 +642,8 @@ async fn background_job_acks_immediately_then_emits_completion_without_litter() 
 
     let mut cfg = config(addr);
     cfg.upload_base = upload_base.clone();
-    let agent = Agent::new(cfg, JobDispatcher).test_value()?;
-    tokio::time::timeout(Duration::from_millis(1200), agent.run(cancel.clone()))
+    let agent = Agent::new(cfg, ControlledJobDispatcher { release }).test_value()?;
+    tokio::time::timeout(Duration::from_secs(3), agent.run(cancel.clone()))
         .await
         .test_value()?
         .test_value()?;
@@ -829,9 +814,10 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
         let mut ws = accept_agent(&listener).await?;
         welcome(&mut ws, "sess_app_heartbeat").await?;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(180);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1_600);
+        let mut pings = 0_u32;
         while tokio::time::Instant::now() < deadline {
-            let item = tokio::time::timeout(Duration::from_millis(60), ws.next())
+            let item = tokio::time::timeout(Duration::from_secs(1), ws.next())
                 .await
                 .test_value()?
                 .test_value()?
@@ -843,6 +829,7 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
                 serde_json::from_str::<Message>(&text).test_value()?,
                 Message::Ping { .. }
             ) {
+                pings += 1;
                 ws.send(WsMessage::Text(
                     serde_json::to_string(&Message::Pong {
                         timestamp: Utc::now(),
@@ -854,6 +841,7 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
                 .test_value()?;
             }
         }
+        assert!(pings >= 2, "expected repeated application heartbeat pings");
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
@@ -861,11 +849,11 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
     });
 
     let mut cfg = config(addr);
-    cfg.heartbeat_interval = Duration::from_millis(10);
-    cfg.heartbeat_timeout = Duration::from_millis(30);
+    cfg.heartbeat_interval = Duration::from_millis(100);
+    cfg.heartbeat_timeout = Duration::from_millis(600);
     let agent = Agent::new(cfg, UnsupportedDispatcher).test_value()?;
 
-    tokio::time::timeout(Duration::from_millis(400), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_secs(3), agent.run(cancel.clone()))
         .await
         .test_value()?
         .test_value()?;

@@ -1,4 +1,14 @@
 use crate::policy::Policy;
+use brush_parser::{
+    ParserOptions,
+    ast::{
+        AndOr, AndOrList, Command, CommandPrefixOrSuffixItem, CompoundCommand, CompoundList,
+        ExtendedTestExpr, IoFileRedirectTarget, IoRedirect, Pipeline, ProcessSubstitutionKind,
+        Program, RedirectList, SimpleCommand, Word,
+    },
+    parse_tokens, tokenize_str, unquote_str,
+    word::{self, Parameter, ParameterExpr, WordPiece, WordPieceWithSource},
+};
 
 const READ_ONLY_FILTERS: &[&str] = &[
     "head",
@@ -40,270 +50,387 @@ const SAFE_BUILTINS: &[&str] = &[
     "set", "test", "[", "[[", "true", "false", ":", "read", "shift", "break", "continue", "exit",
     "return", "wait",
 ];
-const LEADING_KEYWORDS: &[&str] = &[
-    "do", "then", "else", "elif", "if", "while", "until", "!", "{", "time",
-];
-const CLOSING_KEYWORDS: &[&str] = &["done", "fi", "}"];
-const HEADER_KEYWORDS: &[&str] = &["for", "select"];
 const MAX_NESTING: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnparseableCommand(pub String);
 
-fn first_word(segment: &str) -> &str {
-    segment.split_whitespace().next().unwrap_or("")
+#[derive(Debug)]
+struct CommandInfo {
+    rendered: String,
+    program: String,
+    arguments: Vec<String>,
+    filter_position: bool,
+    assignments_only: bool,
+    has_unsafe_redirection: bool,
 }
 
-#[must_use]
-pub fn split_top_level(command: &str) -> Vec<String> {
-    let chars: Vec<char> = command.chars().collect();
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut i = 0;
-    let mut quote: Option<char> = None;
-    while i < chars.len() {
-        let ch = chars[i];
-        if let Some(active) = quote {
-            buf.push(ch);
-            if ch == '\\' && active == '"' && i + 1 < chars.len() {
-                i += 1;
-                buf.push(chars[i]);
-            } else if ch == active {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        if matches!(ch, '\'' | '"') {
-            quote = Some(ch);
-            buf.push(ch);
-            i += 1;
-            continue;
-        }
-        if ch == '\\' && i + 1 < chars.len() {
-            buf.push(ch);
-            i += 1;
-            buf.push(chars[i]);
-            i += 1;
-            continue;
-        }
-        if chars
-            .get(i + 1)
-            .is_some_and(|next| (ch == '&' && *next == '&') || (ch == '|' && *next == '|'))
-        {
-            if !buf.trim().is_empty() {
-                out.push(buf.trim().to_owned());
-            }
-            buf.clear();
-            i += 2;
-            continue;
-        }
-        if ch == '&' {
-            let next = chars.get(i + 1).copied().unwrap_or('\0');
-            let prev = buf.chars().last().unwrap_or('\0');
-            if next == '>' || matches!(prev, '<' | '>') {
-                buf.push(ch);
-                i += 1;
-                continue;
-            }
-            if !buf.trim().is_empty() {
-                out.push(buf.trim().to_owned());
-            }
-            buf.clear();
-            i += 1;
-            continue;
-        }
-        if matches!(ch, ';' | '|' | '\n') {
-            if !buf.trim().is_empty() {
-                out.push(buf.trim().to_owned());
-            }
-            buf.clear();
-            i += 1;
-            continue;
-        }
-        buf.push(ch);
-        i += 1;
+#[derive(Debug, Default)]
+struct Analysis {
+    commands: Vec<CommandInfo>,
+    substitution: Option<&'static str>,
+    file_redirection: Option<String>,
+    seen_top_level_command: bool,
+}
+
+fn parse_program(source: &str) -> Result<Program, UnparseableCommand> {
+    let tokens = tokenize_str(source)
+        .map_err(|error| UnparseableCommand(format!("shell tokenization failed: {error}")))?;
+    parse_tokens(&tokens, &ParserOptions::default())
+        .map_err(|error| UnparseableCommand(format!("shell parsing failed: {error}")))
+}
+
+fn check_nesting(depth: usize) -> Result<(), UnparseableCommand> {
+    if depth > MAX_NESTING {
+        return Err(UnparseableCommand("substitutions nested too deeply".into()));
     }
-    if !buf.trim().is_empty() {
-        out.push(buf.trim().to_owned());
+    Ok(())
+}
+
+fn scan_nested_source(
+    source: &str,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    check_nesting(depth)?;
+    let program = parse_program(source)?;
+    walk_program(&program, analysis, depth)
+}
+
+fn scan_parameter(
+    parameter: &Parameter,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    if let Parameter::NamedWithIndex { index, .. } = parameter {
+        scan_word_text(index, analysis, depth)?;
     }
-    out
+    Ok(())
 }
 
-#[must_use]
-pub fn has_substitution(command: &str) -> Option<&'static str> {
-    let bytes = command.as_bytes();
-    let mut i = 0;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let ch = bytes[i];
-        if quote == Some(b'\'') {
-            if ch == b'\'' {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        if ch == b'\\' && i + 1 < bytes.len() {
-            i += 2;
-            continue;
-        }
-        if quote == Some(b'"') {
-            if ch == b'"' {
-                quote = None;
-            } else if bytes[i..].starts_with(b"$(") {
-                return Some("$(");
-            } else if ch == b'`' {
-                return Some("`");
-            }
-            i += 1;
-            continue;
-        }
-        if matches!(ch, b'\'' | b'"') {
-            quote = Some(ch);
-            i += 1;
-            continue;
-        }
-        if bytes[i..].starts_with(b"$(") {
-            return Some("$(");
-        }
-        if ch == b'`' {
-            return Some("`");
-        }
-        if bytes[i..].starts_with(b"<(") {
-            return Some("<(");
-        }
-        if bytes[i..].starts_with(b">(") {
-            return Some(">(");
-        }
-        i += 1;
+fn scan_optional_text(
+    value: Option<&String>,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    if let Some(value) = value {
+        scan_word_text(value, analysis, depth)?;
     }
-    None
+    Ok(())
 }
 
-#[must_use]
-pub fn control_character(command: &str) -> Option<char> {
-    command
-        .chars()
-        .find(|ch| ((*ch as u32) < 32 && *ch != '\t') || *ch as u32 == 127)
-}
-
-#[must_use]
-pub fn file_redirection(command: &str) -> Option<String> {
-    let bytes = command.as_bytes();
-    let mut i = 0;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let ch = bytes[i];
-        if let Some(active) = quote {
-            if ch == b'\\' && active == b'"' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
+fn scan_parameter_expr(
+    expression: &ParameterExpr,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    match expression {
+        ParameterExpr::Parameter { parameter, .. }
+        | ParameterExpr::ParameterLength { parameter, .. }
+        | ParameterExpr::Transform { parameter, .. } => scan_parameter(parameter, analysis, depth),
+        ParameterExpr::UseDefaultValues {
+            parameter,
+            default_value,
+            ..
+        }
+        | ParameterExpr::AssignDefaultValues {
+            parameter,
+            default_value,
+            ..
+        } => {
+            scan_parameter(parameter, analysis, depth)?;
+            scan_optional_text(default_value.as_ref(), analysis, depth)
+        }
+        ParameterExpr::IndicateErrorIfNullOrUnset {
+            parameter,
+            error_message,
+            ..
+        } => {
+            scan_parameter(parameter, analysis, depth)?;
+            scan_optional_text(error_message.as_ref(), analysis, depth)
+        }
+        ParameterExpr::UseAlternativeValue {
+            parameter,
+            alternative_value,
+            ..
+        } => {
+            scan_parameter(parameter, analysis, depth)?;
+            scan_optional_text(alternative_value.as_ref(), analysis, depth)
+        }
+        ParameterExpr::RemoveSmallestSuffixPattern {
+            parameter, pattern, ..
+        }
+        | ParameterExpr::RemoveLargestSuffixPattern {
+            parameter, pattern, ..
+        }
+        | ParameterExpr::RemoveSmallestPrefixPattern {
+            parameter, pattern, ..
+        }
+        | ParameterExpr::RemoveLargestPrefixPattern {
+            parameter, pattern, ..
+        }
+        | ParameterExpr::UppercaseFirstChar {
+            parameter, pattern, ..
+        }
+        | ParameterExpr::UppercasePattern {
+            parameter, pattern, ..
+        }
+        | ParameterExpr::LowercaseFirstChar {
+            parameter, pattern, ..
+        }
+        | ParameterExpr::LowercasePattern {
+            parameter, pattern, ..
+        } => {
+            scan_parameter(parameter, analysis, depth)?;
+            scan_optional_text(pattern.as_ref(), analysis, depth)
+        }
+        ParameterExpr::Substring {
+            parameter,
+            offset,
+            length,
+            ..
+        } => {
+            scan_parameter(parameter, analysis, depth)?;
+            scan_word_text(&offset.value, analysis, depth)?;
+            if let Some(length) = length {
+                scan_word_text(&length.value, analysis, depth)?;
             }
-            if ch == active {
-                quote = None;
-            }
-            i += 1;
-            continue;
+            Ok(())
         }
-        if ch == b'\\' && i + 1 < bytes.len() {
-            i += 2;
-            continue;
+        ParameterExpr::ReplaceSubstring {
+            parameter,
+            pattern,
+            replacement,
+            ..
+        } => {
+            scan_parameter(parameter, analysis, depth)?;
+            scan_word_text(pattern, analysis, depth)?;
+            scan_optional_text(replacement.as_ref(), analysis, depth)
         }
-        if matches!(ch, b'\'' | b'"') {
-            quote = Some(ch);
-            i += 1;
-            continue;
-        }
-        if !matches!(ch, b'<' | b'>') {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        if bytes[i..].starts_with(b"<<") {
-            i += if bytes[i..].starts_with(b"<<<") { 3 } else { 2 };
-            continue;
-        }
-        if bytes[i..].starts_with(b"<(") || bytes[i..].starts_with(b">(") {
-            i += 2;
-            continue;
-        }
-        let mut j = i + 1;
-        while j < bytes.len() && matches!(bytes[j], b'>' | b'|') {
-            j += 1;
-        }
-        if j < bytes.len() && bytes[j] == b'&' {
-            let mut k = j + 1;
-            while k < bytes.len() && (bytes[k].is_ascii_digit() || bytes[k] == b'-') {
-                k += 1;
-            }
-            if k > j + 1 {
-                i = k;
-                continue;
-            }
-            j += 1;
-        }
-        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
-            j += 1;
-        }
-        let mut k = j;
-        while k < bytes.len()
-            && !matches!(
-                bytes[k],
-                b' ' | b'\t' | b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')'
-            )
-        {
-            k += 1;
-        }
-        if command[j..k].trim_matches(['\'', '"']) == "/dev/null" {
-            i = k;
-            continue;
-        }
-        return Some(command[start..k].trim().to_owned());
+        ParameterExpr::VariableNames { .. } | ParameterExpr::MemberKeys { .. } => Ok(()),
     }
-    None
 }
 
-fn shell_words(segment: &str) -> Result<Vec<String>, ()> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut chars = segment.chars();
-    let mut quote: Option<char> = None;
-    while let Some(ch) = chars.next() {
-        if let Some(active) = quote {
-            if ch == active {
-                quote = None;
-            } else if ch == '\\' && active == '"' {
-                if let Some(next) = chars.next() {
-                    current.push(next);
+fn scan_word_pieces(
+    pieces: &[WordPieceWithSource],
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    for piece in pieces {
+        match &piece.piece {
+            WordPiece::CommandSubstitution(source) => {
+                analysis.substitution.get_or_insert("$(");
+                scan_nested_source(source, analysis, depth + 1)?;
+            }
+            WordPiece::BackquotedCommandSubstitution(source) => {
+                analysis.substitution.get_or_insert("`");
+                scan_nested_source(source, analysis, depth + 1)?;
+            }
+            WordPiece::DoubleQuotedSequence(nested)
+            | WordPiece::GettextDoubleQuotedSequence(nested) => {
+                scan_word_pieces(nested, analysis, depth)?;
+            }
+            WordPiece::ParameterExpansion(expression) => {
+                scan_parameter_expr(expression, analysis, depth)?;
+            }
+            WordPiece::ArithmeticExpression(expression) => {
+                scan_word_text(&expression.value, analysis, depth)?;
+            }
+            WordPiece::Text(_)
+            | WordPiece::SingleQuotedText(_)
+            | WordPiece::AnsiCQuotedText(_)
+            | WordPiece::TildeExpansion(_)
+            | WordPiece::EscapeSequence(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn scan_word_text(
+    text: &str,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    let pieces = word::parse(text, &ParserOptions::default())
+        .map_err(|error| UnparseableCommand(format!("shell word parsing failed: {error}")))?;
+    scan_word_pieces(&pieces, analysis, depth)
+}
+
+fn scan_word(
+    value: &Word,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    scan_word_text(&value.value, analysis, depth)
+}
+
+fn scan_extended_test(
+    expression: &ExtendedTestExpr,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    match expression {
+        ExtendedTestExpr::And(left, right) | ExtendedTestExpr::Or(left, right) => {
+            scan_extended_test(left, analysis, depth)?;
+            scan_extended_test(right, analysis, depth)
+        }
+        ExtendedTestExpr::Not(inner) | ExtendedTestExpr::Parenthesized(inner) => {
+            scan_extended_test(inner, analysis, depth)
+        }
+        ExtendedTestExpr::UnaryTest(_, word) => scan_word(word, analysis, depth),
+        ExtendedTestExpr::BinaryTest(_, left, right) => {
+            scan_word(left, analysis, depth)?;
+            scan_word(right, analysis, depth)
+        }
+    }
+}
+
+const fn process_substitution_marker(kind: &ProcessSubstitutionKind) -> &'static str {
+    match kind {
+        ProcessSubstitutionKind::Read => "<(",
+        ProcessSubstitutionKind::Write => ">(",
+    }
+}
+
+fn scan_redirect(
+    redirect: &IoRedirect,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<bool, UnparseableCommand> {
+    match redirect {
+        IoRedirect::File(_, _, target) => match target {
+            IoFileRedirectTarget::Filename(word) => {
+                scan_word(word, analysis, depth)?;
+                let target = unquote_str(&word.value);
+                if target != "/dev/null" {
+                    analysis
+                        .file_redirection
+                        .get_or_insert_with(|| redirect.to_string());
+                    return Ok(true);
                 }
-            } else {
-                current.push(ch);
+                Ok(false)
             }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => quote = Some(ch),
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
+            IoFileRedirectTarget::Fd(_) => Ok(false),
+            IoFileRedirectTarget::Duplicate(word) => {
+                scan_word(word, analysis, depth)?;
+                let target = unquote_str(&word.value);
+                if target == "-" || target.chars().all(|ch| ch.is_ascii_digit()) {
+                    Ok(false)
+                } else {
+                    analysis
+                        .file_redirection
+                        .get_or_insert_with(|| redirect.to_string());
+                    Ok(true)
                 }
             }
-            c if c.is_whitespace() => {
-                if !current.is_empty() {
-                    out.push(std::mem::take(&mut current));
-                }
+            IoFileRedirectTarget::ProcessSubstitution(kind, command) => {
+                analysis
+                    .substitution
+                    .get_or_insert_with(|| process_substitution_marker(kind));
+                walk_compound_list(&command.list, analysis, depth + 1)?;
+                Ok(false)
             }
-            _ => current.push(ch),
+        },
+        IoRedirect::HereDocument(_, here_document) => {
+            if here_document.requires_expansion {
+                let pieces =
+                    word::parse_heredoc(&here_document.doc.value, &ParserOptions::default())
+                        .map_err(|error| {
+                            UnparseableCommand(format!("here-document parsing failed: {error}"))
+                        })?;
+                scan_word_pieces(&pieces, analysis, depth)?;
+            }
+            Ok(false)
+        }
+        IoRedirect::HereString(_, word) => {
+            scan_word(word, analysis, depth)?;
+            Ok(false)
+        }
+        IoRedirect::OutputAndError(word, _) => {
+            scan_word(word, analysis, depth)?;
+            let target = unquote_str(&word.value);
+            if target != "/dev/null" {
+                analysis
+                    .file_redirection
+                    .get_or_insert_with(|| redirect.to_string());
+                return Ok(true);
+            }
+            Ok(false)
         }
     }
-    if quote.is_some() {
-        return Err(());
+}
+
+fn scan_redirects(
+    redirects: Option<&RedirectList>,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<bool, UnparseableCommand> {
+    let Some(redirects) = redirects else {
+        return Ok(false);
+    };
+    let mut unsafe_redirection = false;
+    for redirect in &redirects.0 {
+        unsafe_redirection |= scan_redirect(redirect, analysis, depth)?;
     }
-    if !current.is_empty() {
-        out.push(current);
+    Ok(unsafe_redirection)
+}
+
+fn scan_item(
+    item: &CommandPrefixOrSuffixItem,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<bool, UnparseableCommand> {
+    match item {
+        CommandPrefixOrSuffixItem::IoRedirect(redirect) => scan_redirect(redirect, analysis, depth),
+        CommandPrefixOrSuffixItem::Word(word)
+        | CommandPrefixOrSuffixItem::AssignmentWord(_, word) => {
+            scan_word(word, analysis, depth)?;
+            Ok(false)
+        }
+        CommandPrefixOrSuffixItem::ProcessSubstitution(kind, command) => {
+            analysis
+                .substitution
+                .get_or_insert_with(|| process_substitution_marker(kind));
+            walk_compound_list(&command.list, analysis, depth + 1)?;
+            Ok(false)
+        }
     }
-    Ok(out)
+}
+
+fn command_arguments(simple: &SimpleCommand) -> Vec<String> {
+    simple
+        .suffix
+        .as_ref()
+        .into_iter()
+        .flat_map(|suffix| suffix.0.iter())
+        .filter_map(|item| match item {
+            CommandPrefixOrSuffixItem::Word(word) => Some(unquote_str(&word.value)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn only_assignments(simple: &SimpleCommand) -> bool {
+    if simple.word_or_name.is_some() {
+        return false;
+    }
+    let items = simple
+        .prefix
+        .as_ref()
+        .into_iter()
+        .flat_map(|prefix| prefix.0.iter())
+        .chain(
+            simple
+                .suffix
+                .as_ref()
+                .into_iter()
+                .flat_map(|suffix| suffix.0.iter()),
+        )
+        .collect::<Vec<_>>();
+    !items.is_empty()
+        && items
+            .iter()
+            .all(|item| matches!(item, CommandPrefixOrSuffixItem::AssignmentWord(_, _)))
 }
 
 fn looks_like_path(token: &str) -> bool {
@@ -325,14 +452,11 @@ fn option_takes_value(name: &str, option: &str) -> bool {
     }
 }
 
-fn filter_unsafe(segment: &str) -> bool {
-    let Ok(tokens) = shell_words(segment) else {
+fn filter_unsafe(name: &str, arguments: &[String], has_unsafe_redirection: bool) -> bool {
+    if has_unsafe_redirection {
         return true;
-    };
-    let Some(name) = tokens.first().map(String::as_str) else {
-        return false;
-    };
-    if tokens.iter().skip(1).any(|token| {
+    }
+    if arguments.iter().any(|token| {
         let head = token.split('=').next().unwrap_or(token);
         name == "sort" && matches!(head, "-o" | "--output" | "--compress-program" | "-S")
     }) {
@@ -340,7 +464,7 @@ fn filter_unsafe(segment: &str) -> bool {
     }
     let mut operands = Vec::new();
     let mut expecting_value = false;
-    for token in tokens.iter().skip(1) {
+    for token in arguments {
         if expecting_value {
             expecting_value = false;
             continue;
@@ -363,332 +487,274 @@ fn filter_unsafe(segment: &str) -> bool {
     operands.into_iter().any(looks_like_path)
 }
 
-fn command_part(segment: &str) -> Result<Option<String>, UnparseableCommand> {
-    let mut rest = segment.trim();
-    loop {
-        rest = rest.trim_start_matches('(').trim();
-        let word = first_word(rest);
-        if LEADING_KEYWORDS.contains(&word) {
-            rest = rest[word.len()..].trim();
-        } else {
-            break;
-        }
-    }
-    let word = first_word(rest);
-    if word.is_empty() || CLOSING_KEYWORDS.contains(&word) || HEADER_KEYWORDS.contains(&word) {
-        return Ok(None);
-    }
-    if matches!(word, "case" | "esac") {
-        return Err(UnparseableCommand("a case statement".into()));
-    }
-    while rest.ends_with(')') && rest.matches(')').count() > rest.matches('(').count() {
-        rest = rest[..rest.len() - 1].trim_end();
-    }
-    Ok((!rest.is_empty()).then(|| rest.to_owned()))
+fn push_before_nested(analysis: &mut Analysis, nested_start: usize, command: CommandInfo) {
+    let nested = analysis.commands.split_off(nested_start);
+    analysis.commands.push(command);
+    analysis.commands.extend(nested);
 }
 
-fn only_assignments(segment: &str) -> bool {
-    let tokens: Vec<&str> = segment.split_whitespace().collect();
-    !tokens.is_empty()
-        && tokens.into_iter().all(|token| {
-            token.split_once('=').is_some_and(|(name, _)| {
-                let mut chars = name.chars();
-                chars
-                    .next()
-                    .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-                    && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-            })
-        })
-}
-
-fn matching_paren(command: &str, mut index: usize) -> Result<usize, UnparseableCommand> {
-    let bytes = command.as_bytes();
-    let mut depth = 1usize;
-    let mut quote: Option<u8> = None;
-    while index < bytes.len() {
-        let ch = bytes[index];
-        if let Some(active) = quote {
-            if ch == b'\\' && active == b'"' && index + 1 < bytes.len() {
-                index += 2;
-                continue;
-            }
-            if ch == active {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if ch == b'\\' && index + 1 < bytes.len() {
-            index += 2;
-            continue;
-        }
-        if matches!(ch, b'\'' | b'"') {
-            quote = Some(ch);
-        } else if ch == b'(' {
-            depth += 1;
-        } else if ch == b')' {
-            depth -= 1;
-            if depth == 0 {
-                return Ok(index);
-            }
-        }
-        index += 1;
+fn walk_simple(
+    simple: &SimpleCommand,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    let filter_position = depth > 0 || analysis.seen_top_level_command;
+    if depth == 0 {
+        analysis.seen_top_level_command = true;
     }
-    Err(UnparseableCommand(
-        "unbalanced parentheses in a substitution".into(),
-    ))
-}
-
-fn mask_substitutions(
-    command: &str,
-    literal_quotes: bool,
-) -> Result<(String, Vec<String>), UnparseableCommand> {
-    let bytes = command.as_bytes();
-    let mut masked = Vec::with_capacity(bytes.len());
-    let mut bodies = Vec::new();
-    let mut i = 0usize;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let ch = bytes[i];
-        if !literal_quotes {
-            if quote == Some(b'\'') {
-                masked.push(ch);
-                if ch == b'\'' {
-                    quote = None;
-                }
-                i += 1;
-                continue;
-            }
-            if ch == b'\\' && i + 1 < bytes.len() {
-                masked.extend_from_slice(&bytes[i..i + 2]);
-                i += 2;
-                continue;
-            }
-            if quote == Some(b'"') && ch == b'"' {
-                quote = None;
-                masked.push(ch);
-                i += 1;
-                continue;
-            }
-            if quote.is_none() && matches!(ch, b'\'' | b'"') {
-                quote = Some(ch);
-                masked.push(ch);
-                i += 1;
-                continue;
-            }
-        } else if ch == b'\\' && i + 1 < bytes.len() {
-            masked.extend_from_slice(&bytes[i..i + 2]);
-            i += 2;
-            continue;
+    let nested_start = analysis.commands.len();
+    let mut unsafe_redirection = false;
+    if let Some(prefix) = &simple.prefix {
+        for item in &prefix.0 {
+            unsafe_redirection |= scan_item(item, analysis, depth)?;
         }
-
-        if bytes[i..].starts_with(b"$((") {
-            let close = matching_paren(command, i + 2)?;
-            if close <= i + 3 {
-                return Err(UnparseableCommand("empty arithmetic expansion".into()));
-            }
-            let (_, nested) = mask_substitutions(&command[i + 3..close - 1], literal_quotes)?;
-            bodies.extend(nested);
-            masked.push(b'0');
-            i = close + 1;
-            continue;
-        }
-
-        let process = !literal_quotes
-            && quote.is_none()
-            && (bytes[i..].starts_with(b"<(") || bytes[i..].starts_with(b">("));
-        if bytes[i..].starts_with(b"$(") || process {
-            let close = matching_paren(command, i + 2)?;
-            bodies.push(command[i + 2..close].to_owned());
-            masked.extend_from_slice(b"__SX_SUBST__");
-            i = close + 1;
-            continue;
-        }
-
-        if ch == b'`' {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] != b'`' {
-                j += if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                    2
-                } else {
-                    1
-                };
-            }
-            if j >= bytes.len() {
-                return Err(UnparseableCommand("unbalanced backtick".into()));
-            }
-            bodies.push(command[i + 1..j].replace("\\`", "`"));
-            masked.extend_from_slice(b"__SX_SUBST__");
-            i = j + 1;
-            continue;
-        }
-
-        masked.push(ch);
-        i += 1;
     }
-    let masked = String::from_utf8(masked)
-        .map_err(|_| UnparseableCommand("command stopped being valid UTF-8".into()))?;
-    Ok((masked, bodies))
-}
-
-#[derive(Debug)]
-struct HeredocSpec {
-    delimiter: String,
-    strip_tabs: bool,
-    live: bool,
-}
-
-fn heredoc_stop(ch: u8) -> bool {
-    ch.is_ascii_whitespace() || b";&|<>()'\"".contains(&ch)
-}
-
-fn parse_heredoc_operator(
-    command: &str,
-    start: usize,
-) -> Result<(usize, HeredocSpec), UnparseableCommand> {
-    let bytes = command.as_bytes();
-    let mut i = start + 2;
-    let strip_tabs = bytes.get(i) == Some(&b'-');
-    if strip_tabs {
-        i += 1;
+    if let Some(word) = &simple.word_or_name {
+        scan_word(word, analysis, depth)?;
     }
-    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
-        i += 1;
+    if let Some(suffix) = &simple.suffix {
+        for item in &suffix.0 {
+            unsafe_redirection |= scan_item(item, analysis, depth)?;
+        }
     }
-    let Some(&first) = bytes.get(i) else {
-        return Err(UnparseableCommand(
-            "a here-document whose delimiter can't be read".into(),
-        ));
+
+    let assignments_only = only_assignments(simple);
+    let Some(program) = simple.word_or_name.as_ref() else {
+        push_before_nested(
+            analysis,
+            nested_start,
+            CommandInfo {
+                rendered: simple.to_string(),
+                program: String::new(),
+                arguments: Vec::new(),
+                filter_position,
+                assignments_only,
+                has_unsafe_redirection: unsafe_redirection,
+            },
+        );
+        return Ok(());
     };
-
-    let (delimiter, live, end) = if matches!(first, b'\'' | b'"') {
-        let quote = first;
-        let body_start = i + 1;
-        let mut j = body_start;
-        while j < bytes.len() && bytes[j] != quote && bytes[j] != b'\n' {
-            j += 1;
-        }
-        if j >= bytes.len() || bytes[j] != quote {
-            return Err(UnparseableCommand(
-                "a here-document whose delimiter can't be read".into(),
-            ));
-        }
-        (command[body_start..j].to_owned(), false, j + 1)
-    } else {
-        let escaped = first == b'\\';
-        if escaped {
-            i += 1;
-        }
-        let body_start = i;
-        while i < bytes.len() && !heredoc_stop(bytes[i]) {
-            i += 1;
-        }
-        if i == body_start {
-            return Err(UnparseableCommand(
-                "a here-document whose delimiter can't be read".into(),
-            ));
-        }
-        (command[body_start..i].to_owned(), !escaped, i)
-    };
-
-    Ok((
-        end,
-        HeredocSpec {
-            delimiter,
-            strip_tabs,
-            live,
+    push_before_nested(
+        analysis,
+        nested_start,
+        CommandInfo {
+            rendered: simple.to_string(),
+            program: unquote_str(&program.value),
+            arguments: command_arguments(simple),
+            filter_position,
+            assignments_only,
+            has_unsafe_redirection: unsafe_redirection,
         },
-    ))
+    );
+    Ok(())
 }
 
-fn strip_heredoc_bodies(command: &str) -> Result<(String, Vec<String>), UnparseableCommand> {
-    let bytes = command.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut live_bodies = Vec::new();
-    let mut pending = Vec::<HeredocSpec>::new();
-    let mut i = 0usize;
-    let mut quote: Option<u8> = None;
-
-    while i < bytes.len() {
-        let ch = bytes[i];
-        if let Some(active) = quote {
-            out.push(ch);
-            if ch == b'\\' && active == b'"' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1]);
-                i += 2;
-                continue;
+fn walk_command(
+    command: &Command,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    match command {
+        Command::Simple(simple) => walk_simple(simple, analysis, depth),
+        Command::Compound(compound, redirects) => {
+            scan_redirects(redirects.as_ref(), analysis, depth)?;
+            walk_compound(compound, analysis, depth)
+        }
+        Command::Function(_) => Err(UnparseableCommand(
+            "function definitions are not supported by exec policy".into(),
+        )),
+        Command::ExtendedTest(test, redirects) => {
+            let filter_position = depth > 0 || analysis.seen_top_level_command;
+            if depth == 0 {
+                analysis.seen_top_level_command = true;
             }
-            if ch == active {
-                quote = None;
-            }
-            i += 1;
-            continue;
+            let nested_start = analysis.commands.len();
+            scan_extended_test(&test.expr, analysis, depth)?;
+            let unsafe_redirection = scan_redirects(redirects.as_ref(), analysis, depth)?;
+            push_before_nested(
+                analysis,
+                nested_start,
+                CommandInfo {
+                    rendered: format!("[[ {test} ]]"),
+                    program: "[[".into(),
+                    arguments: Vec::new(),
+                    filter_position,
+                    assignments_only: false,
+                    has_unsafe_redirection: unsafe_redirection,
+                },
+            );
+            Ok(())
         }
-        if ch == b'\\' && i + 1 < bytes.len() {
-            out.extend_from_slice(&bytes[i..i + 2]);
-            i += 2;
-            continue;
-        }
-        if matches!(ch, b'\'' | b'"') {
-            quote = Some(ch);
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        if bytes[i..].starts_with(b"<<") && !bytes[i..].starts_with(b"<<<") {
-            let (end, spec) = parse_heredoc_operator(command, i)?;
-            out.extend_from_slice(&bytes[i..end]);
-            pending.push(spec);
-            i = end;
-            continue;
-        }
-        if ch == b'\n' && !pending.is_empty() {
-            out.push(ch);
-            i += 1;
-            for spec in std::mem::take(&mut pending) {
-                let mut body = Vec::<String>::new();
-                loop {
-                    if i >= bytes.len() {
-                        return Err(UnparseableCommand(format!(
-                            "here-document not terminated (missing {:?})",
-                            spec.delimiter
-                        )));
-                    }
-                    let relative_end = bytes[i..].iter().position(|byte| *byte == b'\n');
-                    let line_end = relative_end.map_or(bytes.len(), |offset| i + offset);
-                    let line = &command[i..line_end];
-                    i = if line_end < bytes.len() {
-                        line_end + 1
-                    } else {
-                        bytes.len()
-                    };
-                    let candidate = if spec.strip_tabs {
-                        line.trim_start_matches('\t')
-                    } else {
-                        line
-                    }
-                    .trim_end_matches('\r');
-                    if candidate == spec.delimiter {
-                        break;
-                    }
-                    body.push(line.to_owned());
-                }
-                if spec.live {
-                    live_bodies.push(body.join("\n"));
-                }
-            }
-            continue;
-        }
-        out.push(ch);
-        i += 1;
     }
+}
 
-    if !pending.is_empty() {
-        return Err(UnparseableCommand("a here-document with no body".into()));
+fn walk_pipeline(
+    pipeline: &Pipeline,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    for command in &pipeline.seq {
+        walk_command(command, analysis, depth)?;
     }
-    let stripped = String::from_utf8(out)
-        .map_err(|_| UnparseableCommand("command stopped being valid UTF-8".into()))?;
-    Ok((stripped, live_bodies))
+    Ok(())
+}
+
+fn walk_and_or(
+    list: &AndOrList,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    walk_pipeline(&list.first, analysis, depth)?;
+    for additional in &list.additional {
+        match additional {
+            AndOr::And(pipeline) | AndOr::Or(pipeline) => {
+                walk_pipeline(pipeline, analysis, depth)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn walk_compound_list(
+    list: &CompoundList,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    check_nesting(depth)?;
+    for item in &list.0 {
+        walk_and_or(&item.0, analysis, depth)?;
+    }
+    Ok(())
+}
+
+fn scan_words<'a>(
+    words: impl IntoIterator<Item = &'a Word>,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    for word in words {
+        scan_word(word, analysis, depth)?;
+    }
+    Ok(())
+}
+
+fn walk_compound(
+    command: &CompoundCommand,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    match command {
+        CompoundCommand::Arithmetic(_) => Err(UnparseableCommand(
+            "arithmetic commands are not supported by exec policy".into(),
+        )),
+        CompoundCommand::ArithmeticForClause(_) => Err(UnparseableCommand(
+            "arithmetic for clauses are not supported by exec policy".into(),
+        )),
+        CompoundCommand::BraceGroup(command) => walk_compound_list(&command.list, analysis, depth),
+        CompoundCommand::Subshell(command) => walk_compound_list(&command.list, analysis, depth),
+        CompoundCommand::ForClause(command) => {
+            if let Some(values) = &command.values {
+                scan_words(values, analysis, depth)?;
+            }
+            walk_compound_list(&command.body.list, analysis, depth)
+        }
+        CompoundCommand::CaseClause(_) => Err(UnparseableCommand(
+            "case clauses are not supported by exec policy".into(),
+        )),
+        CompoundCommand::IfClause(command) => {
+            walk_compound_list(&command.condition, analysis, depth)?;
+            walk_compound_list(&command.then, analysis, depth)?;
+            if let Some(elses) = &command.elses {
+                for branch in elses {
+                    if let Some(condition) = &branch.condition {
+                        walk_compound_list(condition, analysis, depth)?;
+                    }
+                    walk_compound_list(&branch.body, analysis, depth)?;
+                }
+            }
+            Ok(())
+        }
+        CompoundCommand::WhileClause(command) | CompoundCommand::UntilClause(command) => {
+            walk_compound_list(&command.0, analysis, depth)?;
+            walk_compound_list(&command.1.list, analysis, depth)
+        }
+        CompoundCommand::Coprocess(_) => Err(UnparseableCommand(
+            "coprocesses are not supported by exec policy".into(),
+        )),
+    }
+}
+
+fn walk_program(
+    program: &Program,
+    analysis: &mut Analysis,
+    depth: usize,
+) -> Result<(), UnparseableCommand> {
+    for command in &program.complete_commands {
+        walk_compound_list(command, analysis, depth)?;
+    }
+    Ok(())
+}
+
+fn analyze(command: &str) -> Result<Analysis, UnparseableCommand> {
+    let mut analysis = Analysis::default();
+    scan_nested_source(command, &mut analysis, 0)?;
+    Ok(analysis)
+}
+
+#[must_use]
+pub fn split_top_level(command: &str) -> Vec<String> {
+    analyze(command).map_or_else(
+        |_| vec![command.trim().to_owned()],
+        |analysis| {
+            analysis
+                .commands
+                .into_iter()
+                .filter(|command| !command.assignments_only)
+                .map(|command| command.rendered)
+                .collect()
+        },
+    )
+}
+
+#[must_use]
+pub fn has_substitution(command: &str) -> Option<&'static str> {
+    analyze(command)
+        .ok()
+        .and_then(|analysis| analysis.substitution)
+}
+
+#[must_use]
+pub fn control_character(command: &str) -> Option<char> {
+    command
+        .chars()
+        .find(|ch| ((*ch as u32) < 32 && *ch != '\t') || *ch as u32 == 127)
+}
+
+#[must_use]
+pub fn file_redirection(command: &str) -> Option<String> {
+    analyze(command)
+        .ok()
+        .and_then(|analysis| analysis.file_redirection)
+}
+
+fn first_unauthorised(policy: &Policy, analysis: Analysis, chain: bool) -> Option<String> {
+    for command in analysis.commands {
+        if command.assignments_only || policy.is_command_allowed(&command.rendered) {
+            continue;
+        }
+        let name = command.program.as_str();
+        if POSITION_FREE.contains(&name) || (chain && SAFE_BUILTINS.contains(&name)) {
+            continue;
+        }
+        if command.filter_position && READ_ONLY_FILTERS.contains(&name) {
+            if filter_unsafe(name, &command.arguments, command.has_unsafe_redirection) {
+                return Some(command.rendered);
+            }
+            continue;
+        }
+        return Some(command.rendered);
+    }
+    None
 }
 
 /// Returns the first command segment not authorised by policy.
@@ -699,70 +765,18 @@ pub fn unauthorised_chain(
     policy: &Policy,
     command: &str,
 ) -> Result<Option<String>, UnparseableCommand> {
-    unauthorised_chain_inner(policy, command, 0)
+    analyze(command).map(|analysis| first_unauthorised(policy, analysis, true))
 }
 
-fn unauthorised_chain_inner(
+/// Returns the first command segment not authorised by strict policy.
+///
+/// # Errors
+/// Returns [`UnparseableCommand`] when shell structure cannot be checked safely.
+pub fn unauthorised_segment(
     policy: &Policy,
     command: &str,
-    depth: usize,
 ) -> Result<Option<String>, UnparseableCommand> {
-    if depth > MAX_NESTING {
-        return Err(UnparseableCommand("substitutions nested too deeply".into()));
-    }
-    let (stripped, live_bodies) = strip_heredoc_bodies(command)?;
-    let (masked, mut bodies) = mask_substitutions(&stripped, false)?;
-    for body in live_bodies {
-        let (_, nested) = mask_substitutions(&body, true)?;
-        bodies.extend(nested);
-    }
-    for (index, raw) in split_top_level(&masked).into_iter().enumerate() {
-        let Some(segment) = command_part(&raw)? else {
-            continue;
-        };
-        if only_assignments(&segment) || policy.is_command_allowed(&segment) {
-            continue;
-        }
-        let word = first_word(&segment);
-        if POSITION_FREE.contains(&word) || SAFE_BUILTINS.contains(&word) {
-            continue;
-        }
-        let filter_position = index > 0 || depth > 0;
-        if filter_position && READ_ONLY_FILTERS.contains(&word) {
-            if filter_unsafe(&segment) {
-                return Ok(Some(segment));
-            }
-            continue;
-        }
-        return Ok(Some(segment));
-    }
-    for body in bodies {
-        if let Some(offending) = unauthorised_chain_inner(policy, &body, depth + 1)? {
-            return Ok(Some(offending));
-        }
-    }
-    Ok(None)
-}
-
-#[must_use]
-pub fn unauthorised_segment(policy: &Policy, command: &str) -> Option<String> {
-    for (index, segment) in split_top_level(command).into_iter().enumerate() {
-        if policy.is_command_allowed(&segment) {
-            continue;
-        }
-        let word = first_word(&segment);
-        if POSITION_FREE.contains(&word) {
-            continue;
-        }
-        if index > 0 && READ_ONLY_FILTERS.contains(&word) {
-            if filter_unsafe(&segment) {
-                return Some(segment);
-            }
-            continue;
-        }
-        return Some(segment);
-    }
-    None
+    analyze(command).map(|analysis| first_unauthorised(policy, analysis, false))
 }
 
 #[cfg(test)]
@@ -790,7 +804,7 @@ mod tests {
             split_top_level("uptime & id\npwd&&ls"),
             vec!["uptime", "id", "pwd", "ls"]
         );
-        assert_eq!(split_top_level("printf x 2>&1"), vec!["printf x 2>&1"]);
+        assert_eq!(split_top_level("printf x 2>&1"), vec!["printf x 2>& 1"]);
     }
 
     #[test]
@@ -799,6 +813,7 @@ mod tests {
         assert_eq!(has_substitution("echo \"$(id)\""), Some("$("));
         assert_eq!(has_substitution("echo `id`"), Some("`"));
         assert_eq!(has_substitution("cat <(id)"), Some("<("));
+        assert_eq!(has_substitution("echo ${x:-$(id)}"), Some("$("));
     }
 
     #[test]
@@ -807,21 +822,76 @@ mod tests {
         assert!(file_redirection("cat < /etc/passwd").is_some());
         assert!(file_redirection("printf x 2>&1").is_none());
         assert!(file_redirection("printf x >/dev/null").is_none());
-        assert!(file_redirection("cat <<EOF").is_none());
+        assert!(file_redirection("cat <<EOF\nx\nEOF").is_none());
+    }
+
+    #[test]
+    fn nested_substitution_does_not_make_first_top_level_filter_free() {
+        let policy = policy(&["printf"]);
+        assert_eq!(
+            unauthorised_chain(&policy, "cat \"$(printf x)\""),
+            Ok(Some("cat \"$(printf x)\"".into()))
+        );
+    }
+
+    #[test]
+    fn parent_command_is_reported_before_nested_substitution() {
+        let empty = policy(&[]);
+        assert_eq!(
+            unauthorised_chain(&empty, "curl \"$(id)\""),
+            Ok(Some("curl \"$(id)\"".into()))
+        );
+        let outer_allowed = policy(&["curl"]);
+        assert_eq!(
+            unauthorised_chain(&outer_allowed, "curl \"$(id)\""),
+            Ok(Some("id".into()))
+        );
+    }
+
+    #[test]
+    fn process_substitution_respects_nesting_limit() {
+        let policy = policy(&["cat"]);
+        let mut command = "cat".to_owned();
+        for _ in 0..=MAX_NESTING {
+            command = format!("cat <({command})");
+        }
+        assert!(unauthorised_chain(&policy, &command).is_err());
     }
 
     #[test]
     fn filters_cannot_open_paths_or_use_write_options() {
         let policy = policy(&["make"]);
-        assert_eq!(unauthorised_segment(&policy, "make | cat"), None);
+        assert_eq!(unauthorised_segment(&policy, "make | cat"), Ok(None));
         assert_eq!(
             unauthorised_segment(&policy, "make | cat /etc/shadow"),
-            Some("cat /etc/shadow".into())
+            Ok(Some("cat /etc/shadow".into()))
         );
         assert_eq!(
             unauthorised_segment(&policy, "make | sort -o /tmp/x"),
-            Some("sort -o /tmp/x".into())
+            Ok(Some("sort -o /tmp/x".into()))
         );
+    }
+
+    #[test]
+    fn redirect_only_and_malformed_commands_fail_closed() {
+        let empty = policy(&[]);
+        assert_eq!(
+            unauthorised_chain(&empty, "> /tmp/owned"),
+            Ok(Some("> /tmp/owned".into()))
+        );
+        assert_eq!(unauthorised_chain(&empty, "FOO=bar"), Ok(None));
+        assert!(unauthorised_chain(&empty, "echo '").is_err());
+        assert!(unauthorised_segment(&empty, "echo '").is_err());
+    }
+
+    #[test]
+    fn extended_test_is_safe_builtin_only_for_allowlist_chains() {
+        let empty = policy(&[]);
+        assert_eq!(unauthorised_chain(&empty, "[[ x == x ]]"), Ok(None));
+        assert!(matches!(
+            unauthorised_segment(&empty, "[[ x == x ]]"),
+            Ok(Some(_))
+        ));
     }
 
     #[test]
@@ -843,7 +913,24 @@ mod tests {
             unauthorised_chain(&policy, "for x in 1 2; do printf '%s' \"$x\"; done"),
             Ok(None)
         );
-        assert!(unauthorised_chain(&policy, "case x in x) ls;; esac").is_err());
+        assert!(unauthorised_chain(&policy, "case x in x) ls;; *) curl bad;; esac").is_err());
+    }
+
+    #[test]
+    fn historically_unsupported_bash_constructs_still_fail_closed() {
+        let policy = policy(&["echo", "true"]);
+        for command in [
+            "f() { echo ok; }",
+            "((1 + 2))",
+            "for ((i=0; i<2; i++)); do echo ok; done",
+            "case x in x) echo ok;; esac",
+            "coproc echo ok",
+        ] {
+            assert!(
+                unauthorised_chain(&policy, command).is_err(),
+                "unexpectedly accepted {command:?}"
+            );
+        }
     }
 
     #[test]

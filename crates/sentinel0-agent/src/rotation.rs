@@ -2,6 +2,7 @@ use crate::{
     AuthToken,
     identity::{Identity, load_identity},
 };
+use atomic_write_file::{OpenOptions as AtomicOpenOptions, unix::OpenOptionsExt as _};
 use base64::{
     Engine as _,
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
@@ -11,9 +12,8 @@ use num_traits::ToPrimitive;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    fs::{self, OpenOptions},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -160,7 +160,7 @@ fn persist_rotated_to(
     token: &str,
     hub: &str,
 ) -> Result<(), RotationError> {
-    let parent = path.parent().ok_or_else(|| {
+    path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "rotated identity has no parent",
@@ -171,44 +171,17 @@ fn persist_rotated_to(
         token,
         hub,
     })?;
-    let temp = parent.join(format!(
-        ".idrot-{}-{:016x}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
 
-    let write_result = (|| -> Result<(), std::io::Error> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        if let Err(error) = fs::File::open(parent).and_then(|directory| directory.sync_all()) {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "rotated credential was committed, but parent-directory fsync failed; crash durability is not guaranteed"
-            );
-        }
-        Ok(())
-    })();
+    let mut options = AtomicOpenOptions::new();
+    options
+        .preserve_mode(false)
+        .try_preserve_owner(false)
+        .mode(0o600);
+    let mut file = options.open(path)?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.commit()?;
 
-    if let Err(error) = write_result {
-        if let Err(cleanup) = fs::remove_file(&temp)
-            && cleanup.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                path = %temp.display(),
-                %cleanup,
-                "failed cleaning credential-rotation temp file"
-            );
-        }
-        return Err(error.into());
-    }
     Ok(())
 }
 
@@ -263,6 +236,7 @@ mod tests {
     use super::*;
     use crate::test_support::{TestResult, TestValue as _};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 

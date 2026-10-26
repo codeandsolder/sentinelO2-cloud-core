@@ -2,14 +2,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
+    fs,
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const PENDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const PENDING_TTL: Duration = Duration::from_hours(24);
 pub const MAX_PENDING_FILES: usize = 500;
 
 fn store_lock(dir: &Path) -> Arc<Mutex<()>> {
@@ -140,56 +140,17 @@ fn record_at_result_with_limit(
     let wrapped = json!({"at": at, "event": event});
     let bytes = serde_json::to_vec(&wrapped).map_err(std::io::Error::other)?;
 
-    let temp = loop {
-        let candidate = dir.join(format!(".pending-{:016x}.tmp", rand::random::<u64>()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(&bytes) {
-                    if let Err(cleanup) = fs::remove_file(&candidate)
-                        && cleanup.kind() != std::io::ErrorKind::NotFound
-                    {
-                        tracing::warn!(path = %candidate.display(), %cleanup, "failed cleaning partial pending-result file");
-                    }
-                    return Err(error);
-                }
-                if durable && let Err(error) = file.sync_all() {
-                    drop(file);
-                    if let Err(cleanup) = fs::remove_file(&candidate)
-                        && cleanup.kind() != std::io::ErrorKind::NotFound
-                    {
-                        tracing::warn!(
-                            path = %candidate.display(),
-                            %cleanup,
-                            "failed cleaning pending-result temp after fsync failure"
-                        );
-                    }
-                    return Err(error);
-                }
-                break candidate;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    };
-
-    if let Err(error) = fs::rename(&temp, &path) {
-        if let Err(cleanup) = fs::remove_file(&temp)
-            && cleanup.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %temp.display(), %cleanup, "failed cleaning pending-result temp after rename failure");
-        }
-        return Err(error);
-    }
-    if durable && let Err(error) = fs::File::open(&dir).and_then(|directory| directory.sync_all()) {
-        tracing::warn!(
-            path = %dir.display(),
-            %error,
-            "pending result was renamed, but directory fsync failed; crash durability is not guaranteed"
-        );
+    if durable {
+        let mut file = atomic_write_file::AtomicWriteFile::open(&path)?;
+        file.write_all(&bytes)?;
+        file.commit()?;
+    } else {
+        let mut file = tempfile::Builder::new()
+            .prefix(".pending-")
+            .suffix(".tmp")
+            .tempfile_in(&dir)?;
+        file.write_all(&bytes)?;
+        file.persist(&path).map_err(|error| error.error)?;
     }
 
     match json_files(&dir) {

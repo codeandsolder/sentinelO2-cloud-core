@@ -346,25 +346,20 @@ fn finalize_staged_upload(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("upload");
-    let adjacent = parent.join(format!(
-        ".{name}.sentinel-upload-{:016x}.tmp",
-        rand::random::<u64>()
-    ));
-    let copied = (|| -> std::io::Result<()> {
-        fs::copy(source, &adjacent)?;
-        fs::File::open(&adjacent)?.sync_all()?;
-        if overwrite {
-            fs::rename(&adjacent, destination)?;
-        } else {
-            rename_no_replace(&adjacent, destination)?;
-        }
-        fs::remove_file(source)?;
-        Ok(())
-    })();
-    if copied.is_err() {
-        let _ = fs::remove_file(&adjacent);
+    let prefix = format!(".{name}.sentinel-upload-");
+    let adjacent = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    fs::copy(source, adjacent.path())?;
+    adjacent.as_file().sync_all()?;
+    let adjacent = adjacent.into_temp_path();
+    if overwrite {
+        fs::rename(&adjacent, destination)?;
+    } else {
+        rename_no_replace(&adjacent, destination)?;
     }
-    copied
+    fs::remove_file(source)
 }
 
 async fn finalize_single_upload(

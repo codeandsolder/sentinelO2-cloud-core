@@ -412,9 +412,9 @@ fn timed_out_validator_error(child: &mut std::process::Child, pid: u32) -> Handl
         tracing::warn!(%message);
         cleanup_error.get_or_insert(message);
     }
-    let details = cleanup_error
-        .map(|error| Map::from_iter([("cleanup_error".into(), Value::String(error))]))
-        .unwrap_or_default();
+    let details = cleanup_error.map_or_else(Map::new, |error| {
+        Map::from_iter([("cleanup_error".into(), Value::String(error))])
+    });
     HandlerError::with_details(
         "validation_timeout",
         format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
@@ -565,22 +565,6 @@ fn unified_diff(old: &str, new: &str, path: &Path) -> String {
     out
 }
 
-struct RemoveFileOnDrop(PathBuf);
-
-impl Drop for RemoveFileOnDrop {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.0)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                path = %self.0.display(),
-                %error,
-                "failed cleaning temporary edit file"
-            );
-        }
-    }
-}
-
 fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
     let base = backup_dir.map_or_else(
         || target.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
@@ -643,44 +627,41 @@ fn atomic_replace(
         .ok_or_else(|| HandlerError::new("write_failed", "target has no parent directory"))?;
     fs::create_dir_all(parent)
         .map_err(|e| HandlerError::new("write_failed", format!("failed creating parent: {e}")))?;
+    let prefix = format!(
+        ".{}.sentinel0-",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+    );
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    if original_meta.is_none() {
+        // Match OpenOptions::create_new's ordinary creation mode for new files;
+        // tempfile defaults to 0600 unless told otherwise. The process umask is
+        // still applied by tempfile when the file is created.
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut temp = builder.tempfile_in(parent).map_err(|error| {
+        HandlerError::new(
+            "write_failed",
+            format!("failed creating temp file: {error}"),
+        )
+    })?;
 
-    let (temp, mut file) = loop {
-        let candidate = parent.join(format!(
-            ".{}.sentinel0-{:016x}.tmp",
-            target
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file"),
-            rand::rng().random::<u64>()
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => break (candidate, file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(HandlerError::new(
-                    "write_failed",
-                    format!("failed creating temp file: {error}"),
-                ));
-            }
-        }
-    };
-    let _temp_cleanup = RemoveFileOnDrop(temp.clone());
-
-    file.write_all(content.as_bytes())
+    temp.write_all(content.as_bytes())
         .map_err(|e| HandlerError::new("write_failed", format!("failed writing temp file: {e}")))?;
     if let Some(meta) = original_meta {
-        fs::set_permissions(&temp, fs::Permissions::from_mode(meta.mode())).map_err(|e| {
-            HandlerError::new(
-                "write_failed",
-                format!("failed preserving permissions: {e}"),
-            )
-        })?;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(meta.mode()))
+            .map_err(|e| {
+                HandlerError::new(
+                    "write_failed",
+                    format!("failed preserving permissions: {e}"),
+                )
+            })?;
 
-        let candidate_meta = fs::metadata(&temp).map_err(|e| {
+        let candidate_meta = temp.as_file().metadata().map_err(|e| {
             HandlerError::new(
                 "write_failed",
                 format!("failed reading replacement metadata: {e}"),
@@ -688,7 +669,7 @@ fn atomic_replace(
         })?;
         if candidate_meta.uid() != meta.uid() || candidate_meta.gid() != meta.gid() {
             match nix::unistd::chown(
-                &temp,
+                temp.path(),
                 Some(nix::unistd::Uid::from_raw(meta.uid())),
                 Some(nix::unistd::Gid::from_raw(meta.gid())),
             ) {
@@ -711,11 +692,15 @@ fn atomic_replace(
             }
         }
     }
-    file.sync_all()
+    temp.as_file()
+        .sync_all()
         .map_err(|e| HandlerError::new("write_failed", format!("failed syncing temp file: {e}")))?;
-    drop(file);
-    fs::rename(&temp, target)
-        .map_err(|e| HandlerError::new("write_failed", format!("atomic replace failed: {e}")))?;
+    temp.persist(target).map_err(|error| {
+        HandlerError::new(
+            "write_failed",
+            format!("atomic replace failed: {}", error.error),
+        )
+    })?;
     Ok(false)
 }
 
@@ -840,18 +825,26 @@ fn load_edit_target(
     })
 }
 
-fn stage_edit(policy: &Policy, target: &Path, updated: &str) -> Result<PathBuf, HandlerError> {
+fn stage_edit(
+    policy: &Policy,
+    target: &Path,
+    updated: &str,
+) -> Result<tempfile::NamedTempFile, HandlerError> {
     let staging = crate::staging::staging_root(&policy.upload_base)
         .map_err(|e| HandlerError::new("write_failed", e.to_string()))?;
-    let staged = staging.join(format!(
-        "edit-{}-{:016x}",
+    let prefix = format!(
+        "edit-{}-",
         target
             .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file"),
-        rand::rng().random::<u64>()
-    ));
-    fs::write(&staged, updated)
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+    );
+    let mut staged = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempfile_in(staging)
+        .map_err(|e| HandlerError::new("write_failed", format!("failed staging edit: {e}")))?;
+    staged
+        .write_all(updated.as_bytes())
         .map_err(|e| HandlerError::new("write_failed", format!("failed staging edit: {e}")))?;
     Ok(staged)
 }
@@ -978,8 +971,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     }
 
     let staged = stage_edit(policy, &target.path, &updated)?;
-    let _staged_cleanup = RemoveFileOnDrop(staged.clone());
-    let validator = run_validator(policy, &staged, &target.path, payload)?;
+    let validator = run_validator(policy, staged.path(), &target.path, payload)?;
     let diff = payload
         .get("diff")
         .and_then(Value::as_bool)
@@ -989,7 +981,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (backup, in_place) = apply_edit(policy, &target, &staged, &updated, payload)?;
+    let (backup, in_place) = apply_edit(policy, &target, staged.path(), &updated, payload)?;
     let sudo = payload
         .get("sudo")
         .and_then(Value::as_bool)

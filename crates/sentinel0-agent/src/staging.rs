@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     path::{Path, PathBuf},
 };
 use tracing::warn;
@@ -8,17 +8,9 @@ pub const STAGING_DIRNAME: &str = ".sentinelx_uploads";
 
 fn writable_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)?;
-    let probe = path.join(format!(
-        ".write-probe-{}-{:016x}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)?;
-    drop(file);
-    fs::remove_file(probe)?;
+    tempfile::Builder::new()
+        .prefix(".write-probe-")
+        .tempfile_in(path)?;
     Ok(())
 }
 

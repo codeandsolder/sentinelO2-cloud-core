@@ -1,7 +1,10 @@
 use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
-    process_output::{CapturedOutput, capture_bounded},
+    process_output::CapturedOutput,
+    process_runner::{
+        ProcessFailure, ProcessGroupKill, ProcessOutcome, RunOptions, run_argv_with_limits,
+    },
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -11,9 +14,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
-    process::Command,
     time::timeout,
 };
 
@@ -443,15 +445,14 @@ fn param_names(action: &Action) -> Vec<String> {
         let required = schema
             .get("required")
             .and_then(Value::as_array)
-            .map(|items| {
+            .map_or_else(Vec::new, |items| {
                 items
                     .iter()
                     .filter_map(Value::as_str)
                     .filter(|name| properties.contains_key(*name))
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            });
         let mut rest = properties
             .keys()
             .filter(|name| !required.contains(name))
@@ -611,202 +612,59 @@ where
     }
 }
 
-struct HttpHead {
-    status: u16,
-    content_length: Option<usize>,
-    chunked: bool,
-}
-
-async fn read_http_head(reader: &mut BufReader<UnixStream>) -> Result<HttpHead, HandlerError> {
-    const MAX_HEADER_BYTES: usize = 128 * 1024;
-    const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
-
-    let mut header = Vec::new();
-    loop {
-        let remaining = MAX_HEADER_BYTES.saturating_sub(header.len());
-        if remaining == 0 {
-            return Err(HandlerError::new("too_large", "HTTP headers exceeded cap"));
-        }
-        let line = read_until_bounded(
-            reader,
-            b'\n',
-            remaining.min(MAX_HEADER_LINE_BYTES),
-            "HTTP header line",
+fn http_error(endpoint: &Endpoint, error: &reqwest::Error) -> HandlerError {
+    if error.is_timeout() {
+        HandlerError::new(
+            "timeout",
+            format!("{} did not answer in time", endpoint.name),
         )
-        .await?;
-        if line.is_empty() {
-            return Err(HandlerError::new(
-                "bad_response",
-                "endpoint closed before HTTP headers completed",
-            ));
-        }
-        let blank = line == b"\r\n" || line == b"\n";
-        header.extend_from_slice(&line);
-        if blank {
-            break;
-        }
-    }
-
-    let head = String::from_utf8_lossy(&header);
-    let mut lines = head.lines();
-    let status_line = lines.next().unwrap_or("");
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| {
-            HandlerError::new(
-                "bad_response",
-                format!("unparseable HTTP status: {status_line:?}"),
-            )
-        })?;
-    let mut content_length = None;
-    let mut chunked = false;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("content-length") {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| HandlerError::new("bad_response", "invalid Content-Length header"))?;
-            if content_length.is_some_and(|existing| existing != parsed) {
-                return Err(HandlerError::new(
-                    "bad_response",
-                    "conflicting Content-Length headers",
-                ));
-            }
-            content_length = Some(parsed);
-        }
-        if name.eq_ignore_ascii_case("transfer-encoding")
-            && value
-                .split(',')
-                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
-        {
-            chunked = true;
-        }
-    }
-    Ok(HttpHead {
-        status,
-        content_length,
-        chunked,
-    })
-}
-
-async fn read_http_trailers(reader: &mut BufReader<UnixStream>) -> Result<(), HandlerError> {
-    const MAX_HEADER_BYTES: usize = 128 * 1024;
-    let mut trailer_bytes = 0_usize;
-    loop {
-        let trailer = read_until_bounded(reader, b'\n', 16 * 1024, "HTTP trailer line").await?;
-        if trailer.is_empty() {
-            return Err(HandlerError::new(
-                "bad_response",
-                "endpoint closed inside HTTP trailers",
-            ));
-        }
-        trailer_bytes = trailer_bytes.saturating_add(trailer.len());
-        if trailer_bytes > MAX_HEADER_BYTES {
-            return Err(HandlerError::new("too_large", "HTTP trailers exceeded cap"));
-        }
-        if trailer == b"\r\n" || trailer == b"\n" {
-            return Ok(());
-        }
+    } else if error.is_connect() {
+        HandlerError::new(
+            "endpoint_unreachable",
+            format!("cannot open {}: {error}", endpoint.path),
+        )
+    } else {
+        HandlerError::new("bad_response", error.to_string())
     }
 }
 
-async fn read_chunked_http_body(
-    reader: &mut BufReader<UnixStream>,
-) -> Result<Vec<u8>, HandlerError> {
-    let mut body = Vec::new();
-    loop {
-        let size_line = read_until_bounded(reader, b'\n', 8192, "HTTP chunk-size line").await?;
-        if size_line.is_empty() {
-            return Err(HandlerError::new(
-                "bad_response",
-                "endpoint closed before chunk size",
-            ));
-        }
-        let size_line = String::from_utf8_lossy(&size_line);
-        let size_text = size_line.trim().split(';').next().unwrap_or("0");
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|_| HandlerError::new("bad_response", "invalid chunk size"))?;
-        if size == 0 {
-            read_http_trailers(reader).await?;
-            return Ok(body);
-        }
-        if body.len().saturating_add(size) > MAX_RESPONSE_BYTES {
-            return Err(HandlerError::new(
-                "too_large",
-                "endpoint response exceeded the cap",
-            ));
-        }
-        let start = body.len();
-        body.resize(start + size, 0);
-        reader
-            .read_exact(&mut body[start..])
-            .await
-            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-        let mut crlf = [0_u8; 2];
-        reader
-            .read_exact(&mut crlf)
-            .await
-            .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-        if crlf != *b"\r\n" {
-            return Err(HandlerError::new(
-                "bad_response",
-                "chunk payload was not followed by CRLF",
-            ));
-        }
-    }
-}
-
-async fn read_http_payload(
-    reader: &mut BufReader<UnixStream>,
-    head: &HttpHead,
-) -> Result<Vec<u8>, HandlerError> {
-    if head.chunked {
-        return read_chunked_http_body(reader).await;
-    }
-    if let Some(length) = head.content_length {
-        if length > MAX_RESPONSE_BYTES {
-            return Err(HandlerError::new(
-                "too_large",
-                "endpoint response exceeded the cap",
-            ));
-        }
-        let mut body = vec![0_u8; length];
-        if length != 0 {
-            reader
-                .read_exact(&mut body)
-                .await
-                .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-        }
-        return Ok(body);
-    }
-
-    let mut body = Vec::new();
-    let mut limited = reader.take(u64::try_from(MAX_RESPONSE_BYTES + 1).unwrap_or(u64::MAX));
-    limited
-        .read_to_end(&mut body)
-        .await
-        .map_err(|error| HandlerError::new("bad_response", error.to_string()))?;
-    if body.len() > MAX_RESPONSE_BYTES {
+async fn decode_http_response(
+    endpoint: &Endpoint,
+    mut response: reqwest::Response,
+) -> Result<Value, HandlerError> {
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
         return Err(HandlerError::new(
             "too_large",
             "endpoint response exceeded the cap",
         ));
     }
-    Ok(body)
-}
 
-fn decode_http_payload(status: u16, body: &[u8]) -> Result<Value, HandlerError> {
-    if status >= 400 {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| http_error(endpoint, &error))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(HandlerError::new(
+                "too_large",
+                "endpoint response exceeded the cap",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    if status.is_client_error() || status.is_server_error() {
         return Err(HandlerError::new(
             "endpoint_error",
             format!(
-                "endpoint answered HTTP {status}: {}",
-                String::from_utf8_lossy(body)
+                "endpoint answered HTTP {}: {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&body)
                     .chars()
                     .take(200)
                     .collect::<String>()
@@ -816,16 +674,9 @@ fn decode_http_payload(status: u16, body: &[u8]) -> Result<Value, HandlerError> 
     if body.is_empty() {
         Ok(Value::Null)
     } else {
-        serde_json::from_slice(body)
+        serde_json::from_slice(&body)
             .map_err(|_| HandlerError::new("bad_response", "endpoint did not return JSON"))
     }
-}
-
-async fn read_http_body(stream: UnixStream) -> Result<Value, HandlerError> {
-    let mut reader = BufReader::new(stream);
-    let head = read_http_head(&mut reader).await?;
-    let body = read_http_payload(&mut reader, &head).await?;
-    decode_http_payload(head.status, &body)
 }
 
 async fn call_http(
@@ -833,6 +684,16 @@ async fn call_http(
     action: &Action,
     params: &Map<String, Value>,
 ) -> Result<Value, HandlerError> {
+    if endpoint.transport != "unix" {
+        return Err(HandlerError::new(
+            "endpoint_unreachable",
+            format!(
+                "transport {:?} is not available in the Rust compatibility agent",
+                endpoint.transport
+            ),
+        ));
+    }
+
     let request = action.request.as_deref().unwrap_or("").trim();
     let (method, target) = request.split_once(' ').ok_or_else(|| {
         HandlerError::new(
@@ -840,72 +701,27 @@ async fn call_http(
             format!("request must look like 'GET /path', got {request:?}"),
         )
     })?;
+    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|error| {
+        HandlerError::new(
+            "bad_action",
+            format!("invalid HTTP method {method:?}: {error}"),
+        )
+    })?;
     let target = render(target.trim(), params)?;
-    let mut stream = connect(endpoint).await?;
-    let wire = format!(
-        "{} {target} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        method.to_ascii_uppercase()
-    );
-    timeout(endpoint.timeout, stream.write_all(wire.as_bytes()))
+    let url = format!("http://localhost{target}");
+    let client = reqwest::Client::builder()
+        .unix_socket(Path::new(&endpoint.path))
+        .timeout(endpoint.timeout)
+        .no_proxy()
+        .build()
+        .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
+    let response = client
+        .request(method, url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
         .await
-        .map_err(|_| HandlerError::new("timeout", "timed out writing request"))?
-        .map_err(|e| HandlerError::new("endpoint_unreachable", e.to_string()))?;
-    timeout(endpoint.timeout, read_http_body(stream))
-        .await
-        .map_err(|_| HandlerError::new("timeout", "endpoint did not answer in time"))?
-}
-
-async fn kill_and_reap_relay(
-    child: &mut tokio::process::Child,
-    pid: Option<u32>,
-    reason: &'static str,
-) -> Option<String> {
-    let mut cleanup_error = None;
-    let should_kill = match child.try_wait() {
-        Ok(Some(_)) => false,
-        Ok(None) => true,
-        Err(error) => {
-            let message = format!(
-                "failed checking local-api relay state after {reason}: {error}; refusing PID-based group signal"
-            );
-            tracing::warn!(%message);
-            cleanup_error = Some(message);
-            false
-        }
-    };
-
-    #[cfg(unix)]
-    if should_kill {
-        if let Some(pid) = pid {
-            let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
-            if let Err(error) =
-                nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
-                && error != nix::errno::Errno::ESRCH
-            {
-                let message = format!("failed killing local-api relay process group: {error}");
-                tracing::warn!(%message);
-                cleanup_error.get_or_insert(message);
-            }
-        } else {
-            cleanup_error.get_or_insert_with(|| {
-                "local-api relay PID was unavailable; process group could not be killed".into()
-            });
-        }
-    }
-
-    #[cfg(not(unix))]
-    if should_kill && let Err(error) = child.kill().await {
-        let message = format!("failed killing local-api relay: {error}");
-        tracing::warn!(%message);
-        cleanup_error.get_or_insert(message);
-    }
-
-    if let Err(error) = child.wait().await {
-        let message = format!("failed reaping local-api relay: {error}");
-        tracing::warn!(%message);
-        cleanup_error.get_or_insert(message);
-    }
-    cleanup_error
+        .map_err(|error| http_error(endpoint, &error))?;
+    decode_http_response(endpoint, response).await
 }
 
 fn interpret_relay_output(
@@ -971,67 +787,69 @@ async fn call_via_run_as(
     let executable = std::env::current_exe()
         .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
     let argv = relay_command(policy, endpoint, &executable)?;
-    let mut command = Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    policy.tooling.configure_tokio(&mut command)?;
+    let outcome = run_argv_with_limits(
+        policy,
+        &argv,
+        endpoint.timeout + Duration::from_secs(5),
+        RunOptions {
+            cwd: None,
+            env: None,
+            stdin: Some(payload),
+            stdout_limit: MAX_RESPONSE_BYTES,
+            stderr_limit: RELAY_STDERR_BYTES,
+            killer: ProcessGroupKill::Direct,
+        },
+    )
+    .await;
 
-    let mut child = command.spawn().map_err(|error| {
-        HandlerError::new(
-            "run_as_not_permitted",
-            format!("could not start run_as relay: {error}"),
-        )
-    })?;
-    let pid = child.id();
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| HandlerError::new("internal_error", "run_as relay stdin was not piped"))?;
-    let write = async move {
-        stdin
-            .write_all(payload)
-            .await
-            .map_err(|error| std::io::Error::other(format!("relay stdin write failed: {error}")))?;
-        drop(stdin);
-        Ok::<(), std::io::Error>(())
-    };
-    let work = async {
-        let capture = capture_bounded(&mut child, MAX_RESPONSE_BYTES, RELAY_STDERR_BYTES);
-        let ((), captured) = tokio::try_join!(write, capture)?;
-        Ok::<_, std::io::Error>(captured)
-    };
-    let captured = match timeout(endpoint.timeout + Duration::from_secs(5), work).await {
-        Ok(Ok(captured)) => captured,
-        Ok(Err(error)) => {
-            let cleanup_error = kill_and_reap_relay(&mut child, pid, "I/O failure").await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(ProcessFailure::Setup(error)) => return Err(error),
+        Err(ProcessFailure::Spawn(error)) => {
+            return Err(HandlerError::new(
+                "run_as_not_permitted",
+                format!("could not start run_as relay: {error}"),
+            ));
+        }
+        Err(ProcessFailure::Capture {
+            error,
+            cleanup_error,
+        }) => {
+            let mut details = Map::new();
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
+            }
             return Err(HandlerError::with_details(
                 "bad_response",
                 format!("local-api relay I/O failed: {error}"),
-                cleanup_error
-                    .map(|error| Map::from_iter([("cleanup_error".into(), Value::String(error))]))
-                    .unwrap_or_default(),
-            ));
-        }
-        Err(_) => {
-            let cleanup_error = kill_and_reap_relay(&mut child, pid, "timeout").await;
-            return Err(HandlerError::with_details(
-                "timeout",
-                format!("{} did not answer in time", endpoint.name),
-                cleanup_error
-                    .map(|error| Map::from_iter([("cleanup_error".into(), Value::String(error))]))
-                    .unwrap_or_default(),
+                details,
             ));
         }
     };
 
-    interpret_relay_output(endpoint, &executable, &captured)
+    match outcome {
+        ProcessOutcome::Completed { captured, .. } => {
+            interpret_relay_output(endpoint, &executable, &captured)
+        }
+        ProcessOutcome::TimedOut {
+            captured,
+            cleanup_error,
+            ..
+        } => {
+            let mut details = Map::new();
+            if captured.left_running {
+                details.insert("left_running".into(), Value::Bool(true));
+            }
+            if let Some(error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(error));
+            }
+            Err(HandlerError::with_details(
+                "timeout",
+                format!("{} did not answer in time", endpoint.name),
+                details,
+            ))
+        }
+    }
 }
 
 async fn call_jsonrpc(
@@ -1469,6 +1287,104 @@ actions:
         let projected = project(value, &["Config.Image".into(), "Name".into()]);
         assert_eq!(projected[0]["Config.Image"], "a");
         assert_eq!(projected[1]["Name"], "two");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_over_unix_socket_decodes_chunked_json() -> TestResult {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().test_value()?;
+        let socket = dir.path().join("http.sock");
+        let listener = UnixListener::bind(&socket).test_value()?;
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).await?;
+            assert!(request[..count].starts_with(b"GET /"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n8\r\n{\"ok\":1}\r\n0\r\nX-Test: yes\r\n\r\n",
+                )
+                .await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let endpoint = Endpoint {
+            name: "fixture".into(),
+            transport: "unix".into(),
+            protocol: "http".into(),
+            path: socket.display().to_string(),
+            timeout: Duration::from_secs(2),
+            run_as: None,
+            actions: BTreeMap::new(),
+            compatibility: None,
+        };
+        let action = Action {
+            request: Some("GET /status".into()),
+            method: None,
+            select: Vec::new(),
+            description: None,
+            params_schema: None,
+        };
+
+        let response = call_http(&endpoint, &action, &Map::new())
+            .await
+            .test_value()?;
+        assert_eq!(response, json!({"ok": 1}));
+        server.await.test_value()?.test_value()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_over_unix_socket_rejects_oversized_body_before_reading_it() -> TestResult {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().test_value()?;
+        let socket = dir.path().join("http.sock");
+        let listener = UnixListener::bind(&socket).test_value()?;
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).await?;
+            assert!(request[..count].starts_with(b"GET /"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        MAX_RESPONSE_BYTES + 1
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let endpoint = Endpoint {
+            name: "fixture".into(),
+            transport: "unix".into(),
+            protocol: "http".into(),
+            path: socket.display().to_string(),
+            timeout: Duration::from_secs(2),
+            run_as: None,
+            actions: BTreeMap::new(),
+            compatibility: None,
+        };
+        let action = Action {
+            request: Some("GET /large".into()),
+            method: None,
+            select: Vec::new(),
+            description: None,
+            params_schema: None,
+        };
+
+        let error = call_http(&endpoint, &action, &Map::new())
+            .await
+            .test_error()?;
+        assert_eq!(error.code, "too_large");
+        server.await.test_value()?.test_value()?;
+        Ok(())
     }
 
     #[test]

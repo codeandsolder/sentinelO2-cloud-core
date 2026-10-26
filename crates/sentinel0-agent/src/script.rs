@@ -3,25 +3,27 @@ use crate::{
     jobs::BACKGROUND_TIMEOUT_MAX_SECS,
     policy::Policy,
     process_output::{
-        CapturedOutput, CapturedStream, LEFT_RUNNING_NOTE, POST_TIMEOUT_GRACE, TimedOutCapture,
-        TimedOutOutput, WaitOutcome, wait_bounded,
+        CapturedOutput, TimedOutOutput, add_capture_metadata, add_timeout_metadata,
+        combine_cleanup_errors, merged_output, process_result, timeout_output,
     },
+    process_runner::{self, ProcessFailure, ProcessGroupKill, ProcessOutcome},
     staging,
 };
-use rand::RngExt;
 use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Stdio,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::{fs as async_fs, process::Command};
+use tempfile::TempDir;
+use tokio::fs as async_fs;
 
 const TIMEOUT_MIN: u64 = 1;
 const TIMEOUT_MAX: u64 = 600;
+const PYTHON_RUNTIME_NAME: &str = "sentinelx_runtime.py";
+const PYTHON_RUNTIME_SOURCE: &str = include_str!("python_runtime.py");
 
 fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
     match error.raw_os_error() {
@@ -56,26 +58,17 @@ fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
     }
 }
 
-async fn cleanup_workdir_error(workdir: &Path) -> Option<String> {
-    match async_fs::remove_dir_all(workdir).await {
-        Ok(()) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            let message = format!(
-                "failed cleaning script workdir {}: {error}",
-                workdir.display()
-            );
-            tracing::warn!(%message);
-            Some(message)
-        }
-    }
-}
-
 fn with_cleanup_detail(mut error: HandlerError, cleanup: Option<String>) -> HandlerError {
     if let Some(cleanup) = cleanup {
-        error
+        let existing = error
             .details
-            .insert("cleanup_error".into(), Value::String(cleanup));
+            .remove("cleanup_error")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        if let Some(combined) = combine_cleanup_errors(existing, Some(cleanup)) {
+            error
+                .details
+                .insert("cleanup_error".into(), Value::String(combined));
+        }
     }
     error
 }
@@ -84,51 +77,8 @@ fn safe_filename(filename: Option<&str>, extension: &str) -> String {
     filename
         .and_then(|name| Path::new(name).file_name())
         .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty() && !name.starts_with('.'))
+        .filter(|name| !name.is_empty() && !name.starts_with('.') && *name != PYTHON_RUNTIME_NAME)
         .map_or_else(|| format!("script.{extension}"), str::to_owned)
-}
-
-fn merge_streams(stdout: &CapturedStream, stderr: &CapturedStream) -> String {
-    let stdout = stdout.rendered_trimmed_lossy();
-    let stderr = stderr.rendered_trimmed_lossy();
-    if stderr.is_empty() {
-        stdout
-    } else if stdout.is_empty() {
-        stderr
-    } else {
-        format!("{stdout}\n{stderr}")
-    }
-}
-
-fn merged_output(captured: &CapturedOutput) -> String {
-    let output = merge_streams(&captured.stdout, &captured.stderr);
-    if output.is_empty() {
-        "⚠️ Sin salida".into()
-    } else {
-        output
-    }
-}
-
-fn timeout_output(captured: &TimedOutOutput) -> String {
-    let partial = merge_streams(&captured.stdout, &captured.stderr);
-    let mut output = if partial.is_empty() {
-        "⏱️ Timeout".to_owned()
-    } else {
-        format!("⏱️ Timeout. Output written before the timeout:\n{partial}")
-    };
-    if captured.left_running {
-        output.push('\n');
-        output.push_str(LEFT_RUNNING_NOTE);
-    }
-    output
-}
-
-fn combine_cleanup_errors(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
-        (Some(error), None) | (None, Some(error)) => Some(error),
-        (None, None) => None,
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -139,28 +89,15 @@ struct ResultMeta<'a> {
     cleanup: bool,
 }
 
-fn add_capture_metadata(
-    out: &mut BTreeMap<String, Value>,
-    stdout: &CapturedStream,
-    stderr: &CapturedStream,
-) {
-    if stdout.truncated() || stderr.truncated() {
-        out.insert("output_truncated".into(), Value::Bool(true));
-        out.insert("stdout_bytes".into(), Value::from(stdout.total_bytes()));
-        out.insert("stderr_bytes".into(), Value::from(stderr.total_bytes()));
-    }
-}
-
 fn result(
     meta: ResultMeta<'_>,
     command: Vec<String>,
     output: String,
     duration: f64,
     returncode: i32,
-    captured: Option<&CapturedOutput>,
 ) -> BTreeMap<String, Value> {
-    let mut out = BTreeMap::from([
-        ("ok".into(), Value::Bool(returncode == 0)),
+    let mut out = process_result(output, duration, returncode);
+    out.extend([
         ("interpreter".into(), Value::String(meta.interpreter.into())),
         ("sudo".into(), Value::Bool(meta.sudo)),
         (
@@ -173,13 +110,7 @@ fn result(
             "command".into(),
             Value::Array(command.into_iter().map(Value::String).collect()),
         ),
-        ("output".into(), Value::String(output)),
-        ("duration".into(), Value::from(duration)),
-        ("returncode".into(), Value::from(returncode)),
     ]);
-    if let Some(captured) = captured {
-        add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
-    }
     out
 }
 
@@ -188,6 +119,7 @@ fn build_command(
     interpreter: &str,
     script: &Path,
     args: &[String],
+    env: &Map<String, Value>,
     sudo: bool,
     cwd: Option<&str>,
 ) -> (Vec<String>, Option<PathBuf>) {
@@ -227,23 +159,26 @@ fn build_command(
 
     if sudo {
         let sudo = policy.tooling.command("sudo").display().to_string();
+        let mut sudo_prefix = vec![sudo, "-n".into()];
+        let mut env_names = env.keys().collect::<Vec<_>>();
+        env_names.sort_unstable();
+        sudo_prefix.extend(
+            env_names
+                .into_iter()
+                .map(|name| format!("--preserve-env={name}")),
+        );
+        let mut command_argv = sudo_prefix;
         if let Some(cwd) = cwd {
-            let mut command_argv = vec![
-                sudo,
-                "-n".into(),
+            command_argv.extend([
                 policy.tooling.command("bash").display().to_string(),
                 "-c".into(),
-                "cd \"$1\" || { echo \"sentinelx: cannot enter $1\" >&2; exit 126; }; shift; exec \"$@\"" .into(),
+                "cd \"$1\" || { echo \"sentinelx: cannot enter $1\" >&2; exit 126; }; shift; exec \"$@\"".into(),
                 "bash".into(),
                 cwd.into(),
-            ];
-            command_argv.extend(inner);
-            (command_argv, None)
-        } else {
-            let mut command_argv = vec![sudo, "-n".into()];
-            command_argv.extend(inner);
-            (command_argv, None)
+            ]);
         }
+        command_argv.extend(inner);
+        (command_argv, None)
     } else {
         (inner, cwd.map(PathBuf::from))
     }
@@ -341,48 +276,143 @@ fn parse_script_request(payload: &Map<String, Value>) -> Result<ScriptRequest<'_
     })
 }
 
+struct StagedScript {
+    workdir: TempDir,
+    script_path: PathBuf,
+}
+
+impl StagedScript {
+    fn script_path(&self) -> &Path {
+        &self.script_path
+    }
+
+    fn finish_error(self, error: HandlerError, cleanup: bool) -> HandlerError {
+        if cleanup {
+            let cleanup_error = self
+                .workdir
+                .close()
+                .err()
+                .map(|error| format!("failed cleaning script workdir after error: {error}"));
+            with_cleanup_detail(error, cleanup_error)
+        } else {
+            let script_path = self.script_path.display().to_string();
+            let workdir = self.workdir.keep().display().to_string();
+            let mut error = error;
+            error
+                .details
+                .insert("script_path".into(), Value::String(script_path));
+            error
+                .details
+                .insert("workdir".into(), Value::String(workdir));
+            error
+        }
+    }
+
+    fn finalize(
+        self,
+        mut outcome: BTreeMap<String, Value>,
+        cleanup: bool,
+    ) -> BTreeMap<String, Value> {
+        if cleanup {
+            if let Err(error) = self.workdir.close() {
+                tracing::warn!(%error, "failed cleaning script workdir");
+                let existing = outcome
+                    .remove("cleanup_error")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                if let Some(combined) = combine_cleanup_errors(
+                    existing,
+                    Some(format!("failed cleaning script workdir: {error}")),
+                ) {
+                    outcome.insert("cleanup_error".into(), Value::String(combined));
+                }
+            }
+        } else {
+            let script_path = self.script_path.display().to_string();
+            let workdir = self.workdir.keep().display().to_string();
+            outcome.insert("script_path".into(), Value::String(script_path));
+            outcome.insert("workdir".into(), Value::String(workdir));
+        }
+        outcome
+    }
+}
+
+async fn stage_python_runtime(workdir: &Path) -> Result<(), HandlerError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        HandlerError::new(
+            "internal_error",
+            format!("cannot resolve SentinelO2 executable for Python runtime: {error}"),
+        )
+    })?;
+    let executable_literal =
+        serde_json::to_string(&executable.display().to_string()).map_err(|error| {
+            HandlerError::new(
+                "internal_error",
+                format!("cannot encode SentinelO2 executable path for Python runtime: {error}"),
+            )
+        })?;
+    let source =
+        PYTHON_RUNTIME_SOURCE.replace("__SENTINELX_AGENT_EXECUTABLE__", &executable_literal);
+    let path = workdir.join(PYTHON_RUNTIME_NAME);
+    async_fs::write(&path, source)
+        .await
+        .map_err(|error| staging_oserror(&error, &path))?;
+    async_fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|error| staging_oserror(&error, &path))?;
+    Ok(())
+}
+
 async fn prepare_script(
     policy: &Policy,
     request: &ScriptRequest<'_>,
-) -> Result<(PathBuf, PathBuf), HandlerError> {
+) -> Result<StagedScript, HandlerError> {
     let upload_base = policy.upload_base.clone();
     let upload_base_for_error = upload_base.clone();
     let root = tokio::task::spawn_blocking(move || staging::staging_root(&upload_base))
         .await
-        .map_err(|e| {
-            HandlerError::new("internal_error", format!("staging setup task failed: {e}"))
+        .map_err(|error| {
+            HandlerError::new(
+                "internal_error",
+                format!("staging setup task failed: {error}"),
+            )
         })?
-        .map_err(|e| staging_oserror(&e, &upload_base_for_error))?;
-    let workdir = root.join(format!("script_job_{:016x}", rand::rng().random::<u64>()));
-    async_fs::create_dir_all(&workdir)
-        .await
-        .map_err(|e| staging_oserror(&e, &workdir))?;
-    let script_path = workdir.join(&request.filename);
-    if let Err(error) = async_fs::write(&script_path, request.content).await {
-        let cleanup_error = if request.cleanup {
-            cleanup_workdir_error(&workdir).await
-        } else {
-            None
-        };
-        return Err(with_cleanup_detail(
-            staging_oserror(&error, &script_path),
-            cleanup_error,
-        ));
+        .map_err(|error| staging_oserror(&error, &upload_base_for_error))?;
+    let root_for_error = root.clone();
+    let workdir = tokio::task::spawn_blocking(move || {
+        tempfile::Builder::new()
+            .prefix("script_job_")
+            .tempdir_in(root)
+    })
+    .await
+    .map_err(|error| {
+        HandlerError::new(
+            "internal_error",
+            format!("temporary script directory task failed: {error}"),
+        )
+    })?
+    .map_err(|error| staging_oserror(&error, &root_for_error))?;
+    let script_path = workdir.path().join(&request.filename);
+    let staged = StagedScript {
+        workdir,
+        script_path,
+    };
+
+    if let Err(error) = async_fs::write(staged.script_path(), request.content).await {
+        let error = staging_oserror(&error, staged.script_path());
+        return Err(staged.finish_error(error, request.cleanup));
     }
     if let Err(error) =
-        async_fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).await
+        async_fs::set_permissions(staged.script_path(), fs::Permissions::from_mode(0o700)).await
     {
-        let cleanup_error = if request.cleanup {
-            cleanup_workdir_error(&workdir).await
-        } else {
-            None
-        };
-        return Err(with_cleanup_detail(
-            staging_oserror(&error, &script_path),
-            cleanup_error,
-        ));
+        let error = staging_oserror(&error, staged.script_path());
+        return Err(staged.finish_error(error, request.cleanup));
     }
-    Ok((workdir, script_path))
+    if matches!(request.interpreter, "python" | "python3")
+        && let Err(error) = stage_python_runtime(staged.workdir.path()).await
+    {
+        return Err(staged.finish_error(error, request.cleanup));
+    }
+    Ok(staged)
 }
 
 fn script_spawn_error(error: &std::io::Error, cwd: Option<&Path>) -> HandlerError {
@@ -420,209 +450,13 @@ fn script_spawn_error(error: &std::io::Error, cwd: Option<&Path>) -> HandlerErro
     HandlerError::new(code, format!("failed starting script: {error}"))
 }
 
-async fn spawn_script(
-    policy: &Policy,
-    request: &ScriptRequest<'_>,
-    workdir: &Path,
-    script_path: &Path,
-) -> Result<(tokio::process::Child, Vec<String>, Instant), HandlerError> {
-    let (command_argv, spawn_cwd) = build_command(
-        policy,
-        request.interpreter,
-        script_path,
-        &request.args,
-        request.sudo,
-        request.cwd,
-    );
-    let mut command = Command::new(&command_argv[0]);
-    command
-        .args(&command_argv[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    if let Err(error) = policy.tooling.configure_tokio(&mut command) {
-        let cleanup_error = if request.cleanup {
-            cleanup_workdir_error(workdir).await
-        } else {
-            None
-        };
-        return Err(with_cleanup_detail(error, cleanup_error));
-    }
-    if let Some(cwd) = spawn_cwd.as_ref() {
-        command.current_dir(cwd);
-    }
-    for (key, value) in &request.env {
-        if let Some(value) = value.as_str() {
-            command.env(key, value);
-        }
-    }
-    let started = Instant::now();
-    match command.spawn() {
-        Ok(child) => Ok((child, command_argv, started)),
-        Err(error) => {
-            let handler_error = script_spawn_error(&error, spawn_cwd.as_deref());
-            let cleanup_error = if request.cleanup {
-                cleanup_workdir_error(workdir).await
-            } else {
-                None
-            };
-            Err(with_cleanup_detail(handler_error, cleanup_error))
-        }
-    }
-}
-
-async fn capture_failure(
-    child: &mut tokio::process::Child,
-    pid: Option<u32>,
-    workdir: &Path,
-    cleanup: bool,
-    error: std::io::Error,
-) -> HandlerError {
-    let mut cleanup_error = None;
-    #[cfg(unix)]
-    match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            if let Some(pid) = pid {
-                let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
-                if let Err(kill_error) =
-                    nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
-                    && kill_error != nix::errno::Errno::ESRCH
-                {
-                    let message =
-                        format!("failed killing script after output-capture error: {kill_error}");
-                    tracing::warn!(%message);
-                    cleanup_error = Some(message);
-                }
-            }
-        }
-        Err(state_error) => {
-            let message = format!(
-                "failed checking script state after output-capture error: {state_error}; refusing PID-based group signal"
-            );
-            tracing::warn!(%message);
-            cleanup_error = Some(message);
-        }
-    }
-    if let Err(wait_error) = child.wait().await {
-        let message = format!("failed reaping script after output-capture error: {wait_error}");
-        tracing::warn!(%message);
-        cleanup_error.get_or_insert(message);
-    }
-    if cleanup && let Some(workdir_error) = cleanup_workdir_error(workdir).await {
-        cleanup_error = Some(cleanup_error.map_or_else(
-            || workdir_error.clone(),
-            |existing| format!("{existing}; {workdir_error}"),
-        ));
-    }
-    with_cleanup_detail(
-        HandlerError::new("io_error", format!("script output capture failed: {error}")),
-        cleanup_error,
-    )
-}
-
-async fn timed_out_result(
-    policy: &Policy,
-    request: &ScriptRequest<'_>,
-    child: &mut tokio::process::Child,
-    pid: Option<u32>,
-    pending: TimedOutCapture,
-    command_argv: Vec<String>,
-    started: Instant,
-) -> Result<BTreeMap<String, Value>, HandlerError> {
-    let cleanup_started = Instant::now();
-    let mut cleanup_error = None;
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        let child_is_live = match child.try_wait() {
-            Ok(Some(_)) => false,
-            Ok(None) => true,
-            Err(state_error) => {
-                let message = format!(
-                    "failed checking timed-out script state: {state_error}; refusing PID-based group signal"
-                );
-                tracing::warn!(%message);
-                cleanup_error = Some(message);
-                false
-            }
-        };
-        if child_is_live {
-            let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
-            if request.sudo {
-                let kill = Command::new(policy.tooling.command("sudo"))
-                    .args([
-                        "-n",
-                        "kill",
-                        "-9",
-                        "--",
-                        &format!("-{}", process_group.as_raw()),
-                    ])
-                    .env("PATH", policy.tooling.path_env()?)
-                    .status();
-                match tokio::time::timeout(POST_TIMEOUT_GRACE, kill).await {
-                    Ok(Ok(status)) if status.success() => {}
-                    Ok(Ok(status)) => {
-                        cleanup_error = Some(format!(
-                            "sudo kill of timed-out process group {} exited with {status}",
-                            process_group.as_raw()
-                        ));
-                    }
-                    Ok(Err(error)) => {
-                        cleanup_error = Some(format!(
-                            "failed killing timed-out sudo process group: {error}"
-                        ));
-                    }
-                    Err(_) => {
-                        cleanup_error = Some(format!(
-                            "timed out killing sudo process group {}",
-                            process_group.as_raw()
-                        ));
-                    }
-                }
-            } else if let Err(error) =
-                nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
-                && error != nix::errno::Errno::ESRCH
-            {
-                cleanup_error = Some(format!("failed killing timed-out process group: {error}"));
-            }
-        }
-    }
-    let remaining = POST_TIMEOUT_GRACE.saturating_sub(cleanup_started.elapsed());
-    let captured = pending.finish_after_kill(child, remaining).await;
-    cleanup_error = combine_cleanup_errors(cleanup_error, captured.capture_error.clone());
-    let mut out = result(
-        ResultMeta {
-            interpreter: request.interpreter,
-            sudo: request.sudo,
-            cwd: request.cwd,
-            cleanup: request.cleanup,
-        },
-        command_argv,
-        timeout_output(&captured),
-        (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
-        -1,
-        None,
-    );
-    out.insert("timed_out".into(), Value::Bool(true));
-    add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
-    if captured.left_running {
-        out.insert("left_running".into(), Value::Bool(true));
-    }
-    if let Some(error) = cleanup_error {
-        out.insert("cleanup_error".into(), Value::String(error));
-    }
-    Ok(out)
-}
-
 fn completed_result(
     request: &ScriptRequest<'_>,
     command_argv: Vec<String>,
-    started: Instant,
+    duration: f64,
     captured: &CapturedOutput,
 ) -> BTreeMap<String, Value> {
-    result(
+    let mut outcome = result(
         ResultMeta {
             interpreter: request.interpreter,
             sudo: request.sudo,
@@ -631,34 +465,33 @@ fn completed_result(
         },
         command_argv,
         merged_output(captured),
-        (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
+        duration,
         captured.status.code().unwrap_or(-1),
-        Some(captured),
-    )
+    );
+    add_capture_metadata(&mut outcome, &captured.stdout, &captured.stderr);
+    outcome
 }
 
-async fn finalize_script_result(
-    mut outcome: BTreeMap<String, Value>,
+fn timed_out_result(
     request: &ScriptRequest<'_>,
-    workdir: &Path,
-    script_path: &Path,
+    command_argv: Vec<String>,
+    duration: f64,
+    captured: &TimedOutOutput,
+    cleanup_error: Option<String>,
 ) -> BTreeMap<String, Value> {
-    if !request.cleanup {
-        outcome.insert(
-            "script_path".into(),
-            Value::String(script_path.display().to_string()),
-        );
-        outcome.insert(
-            "workdir".into(),
-            Value::String(workdir.display().to_string()),
-        );
-    } else if let Err(error) = async_fs::remove_dir_all(workdir).await {
-        tracing::warn!(path = %workdir.display(), %error, "failed cleaning script workdir");
-        outcome.insert(
-            "cleanup_error".into(),
-            Value::String(format!("failed cleaning script workdir: {error}")),
-        );
-    }
+    let mut outcome = result(
+        ResultMeta {
+            interpreter: request.interpreter,
+            sudo: request.sudo,
+            cwd: request.cwd,
+            cleanup: request.cleanup,
+        },
+        command_argv,
+        timeout_output(captured),
+        duration,
+        -1,
+    );
+    add_timeout_metadata(&mut outcome, captured, cleanup_error);
     outcome
 }
 
@@ -666,42 +499,64 @@ async fn finalize_script_result(
 /// Returns an error when the script request is invalid, disallowed, cannot be staged, or execution fails.
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let request = parse_script_request(payload)?;
-    let (workdir, script_path) = prepare_script(policy, &request).await?;
-    let (mut child, command_argv, started) =
-        spawn_script(policy, &request, &workdir, &script_path).await?;
-    let pid = child.id();
+    let staged = prepare_script(policy, &request).await?;
+    let (command_argv, spawn_cwd) = build_command(
+        policy,
+        request.interpreter,
+        staged.script_path(),
+        &request.args,
+        &request.env,
+        request.sudo,
+        request.cwd,
+    );
+    let killer = if request.sudo {
+        match ProcessGroupKill::sudo(policy) {
+            Ok(killer) => killer,
+            Err(error) => return Err(staged.finish_error(error, request.cleanup)),
+        }
+    } else {
+        ProcessGroupKill::Direct
+    };
 
-    let wait_outcome = match wait_bounded(
-        &mut child,
+    let outcome = process_runner::run_argv(
+        policy,
+        &command_argv,
         Duration::from_secs(request.timeout_seconds),
-        policy.exec_capture_max_bytes,
+        spawn_cwd.as_deref(),
+        Some(&request.env),
+        killer,
     )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return Err(capture_failure(&mut child, pid, &workdir, request.cleanup, error).await);
+    .await;
+
+    let outcome = match outcome {
+        Ok(ProcessOutcome::Completed { captured, duration }) => {
+            completed_result(&request, command_argv, duration, &captured)
+        }
+        Ok(ProcessOutcome::TimedOut {
+            captured,
+            duration,
+            cleanup_error,
+        }) => timed_out_result(&request, command_argv, duration, &captured, cleanup_error),
+        Err(ProcessFailure::Setup(error)) => {
+            return Err(staged.finish_error(error, request.cleanup));
+        }
+        Err(ProcessFailure::Spawn(error)) => {
+            let error = script_spawn_error(&error, spawn_cwd.as_deref());
+            return Err(staged.finish_error(error, request.cleanup));
+        }
+        Err(ProcessFailure::Capture {
+            error,
+            cleanup_error,
+        }) => {
+            let error = with_cleanup_detail(
+                HandlerError::new("io_error", format!("script output capture failed: {error}")),
+                cleanup_error,
+            );
+            return Err(staged.finish_error(error, request.cleanup));
         }
     };
 
-    let outcome = match wait_outcome {
-        WaitOutcome::Completed(captured) => {
-            completed_result(&request, command_argv, started, &captured)
-        }
-        WaitOutcome::TimedOut(pending) => {
-            timed_out_result(
-                policy,
-                &request,
-                &mut child,
-                pid,
-                pending,
-                command_argv,
-                started,
-            )
-            .await?
-        }
-    };
-    Ok(finalize_script_result(outcome, &request, &workdir, &script_path).await)
+    Ok(staged.finalize(outcome, request.cleanup))
 }
 
 #[cfg(test)]
@@ -738,6 +593,36 @@ mod tests {
         assert!(message.contains(&path.display().to_string()));
     }
 
+    #[test]
+    fn filename_is_reduced_to_a_safe_basename() {
+        assert_eq!(safe_filename(Some("../../kept.sh"), "sh"), "kept.sh");
+        assert_eq!(safe_filename(Some(".hidden"), "sh"), "script.sh");
+        assert_eq!(safe_filename(Some("../../"), "sh"), "script.sh");
+        assert_eq!(safe_filename(None, "py"), "script.py");
+        assert_eq!(safe_filename(Some(PYTHON_RUNTIME_NAME), "py"), "script.py");
+    }
+
+    #[test]
+    fn sudo_command_preserves_env_names_without_putting_values_in_argv() {
+        let policy = Policy::default();
+        let script = Path::new("/tmp/script.sh");
+        let env = Map::from_iter([
+            ("ZED".into(), Value::String("secret $() value".into())),
+            ("ALPHA".into(), Value::String("another secret".into())),
+        ]);
+        let (argv, cwd) = build_command(&policy, "bash", script, &[], &env, true, Some("/tmp/cwd"));
+
+        assert!(cwd.is_none());
+        assert_eq!(
+            argv[0],
+            policy.tooling.command("sudo").display().to_string()
+        );
+        assert_eq!(argv[1], "-n");
+        assert_eq!(argv[2], "--preserve-env=ALPHA");
+        assert_eq!(argv[3], "--preserve-env=ZED");
+        assert!(!argv.iter().any(|arg| arg.contains("secret")));
+    }
+
     #[tokio::test]
     async fn bash_script_captures_output_and_exit_code() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -762,6 +647,41 @@ mod tests {
         assert!(result["output"].as_str().test_value()?.contains("hello"));
         assert!(result["output"].as_str().test_value()?.contains("err"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn python_script_can_import_staged_runtime() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let uv = dir.path().join("uv");
+        fs::write(
+            &uv,
+            b"#!/bin/sh\nset -eu\n[ \"$1\" = run ]; shift\n[ \"$1\" = --no-project ]; shift\n[ \"$1\" = --python ]; shift 2\n[ \"$1\" = python ]; shift\nexec python3 \"$@\"\n",
+        )
+        .test_value()?;
+        fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).test_value()?;
+        let mut policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        policy.tooling.executables.insert("uv".into(), uv);
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("python3".into())),
+                (
+                    "content".into(),
+                    Value::String(
+                        "from sentinelx_runtime import RunResult\nprint(RunResult('x', 0, 'out', '').ok)"
+                            .into(),
+                    ),
+                ),
+            ]),
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["returncode"], 0);
+        assert_eq!(result["output"], "True");
         Ok(())
     }
 
@@ -931,6 +851,184 @@ mod tests {
             "failed script launch leaked workdir: {leftovers:?}"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn args_and_env_are_data_not_shell_source() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let marker = dir.path().join("injected");
+        let shell_like = format!("$(touch {})", marker.display());
+        let env_value = format!("space; $(touch {}) ' \" żółć 🦀", marker.display());
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("bash".into())),
+                (
+                    "content".into(),
+                    Value::String(
+                        "printf 'ARG=<%s>\\n' \"$@\"; printf 'ENV=<%s>\\n' \"$PAYLOAD\"".into(),
+                    ),
+                ),
+                (
+                    "args".into(),
+                    Value::Array(
+                        [
+                            "space arg".to_owned(),
+                            shell_like.clone(),
+                            "żółć 🦀".to_owned(),
+                        ]
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                    ),
+                ),
+                (
+                    "env".into(),
+                    serde_json::json!({"PAYLOAD": env_value.clone()}),
+                ),
+            ]),
+        )
+        .await
+        .test_value()?;
+
+        let output = result["output"].as_str().test_value()?;
+        assert!(output.contains("ARG=<space arg>"));
+        assert!(output.contains(&format!("ARG=<{shell_like}>")));
+        assert!(output.contains("ARG=<żółć 🦀>"));
+        assert!(output.contains(&format!("ENV=<{env_value}>")));
+        assert!(
+            !marker.exists(),
+            "shell-looking data was unexpectedly executed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_false_success_reports_retained_paths() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("bash".into())),
+                ("content".into(), Value::String("printf retained".into())),
+                ("cleanup".into(), Value::Bool(false)),
+                ("filename".into(), Value::String("../../kept.sh".into())),
+            ]),
+        )
+        .await
+        .test_value()?;
+
+        assert_eq!(result["cleanup"], false);
+        assert_eq!(result["output"], "retained");
+        let workdir = PathBuf::from(result["workdir"].as_str().test_value()?);
+        let script_path = PathBuf::from(result["script_path"].as_str().test_value()?);
+        assert_eq!(script_path.parent(), Some(workdir.as_path()));
+        assert_eq!(
+            script_path.file_name().and_then(|name| name.to_str()),
+            Some("kept.sh")
+        );
+        assert_eq!(
+            fs::read_to_string(&script_path).test_value()?,
+            "printf retained"
+        );
+        fs::remove_dir_all(workdir).test_value()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_false_launch_error_reports_retained_paths() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let error = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("powershell".into())),
+                (
+                    "content".into(),
+                    Value::String("Write-Output retained".into()),
+                ),
+                ("cleanup".into(), Value::Bool(false)),
+                (
+                    "env".into(),
+                    serde_json::json!({"PATH": "/definitely/not/a/real/bin"}),
+                ),
+                ("filename".into(), Value::String("debug.ps1".into())),
+            ]),
+        )
+        .await
+        .test_error()?;
+        assert_eq!(error.code, "interpreter_missing");
+
+        let workdir = PathBuf::from(error.details["workdir"].as_str().test_value()?);
+        let script_path = PathBuf::from(error.details["script_path"].as_str().test_value()?);
+        assert!(workdir.is_dir());
+        assert_eq!(script_path.parent(), Some(workdir.as_path()));
+        assert_eq!(
+            fs::read_to_string(&script_path).test_value()?,
+            "Write-Output retained"
+        );
+        fs::remove_dir_all(workdir).test_value()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_descendants_and_cleans_staging() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let started = dir.path().join("started");
+        let survived = dir.path().join("survived");
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let payload = Map::from_iter([
+            ("interpreter".into(), Value::String("bash".into())),
+            (
+                "content".into(),
+                Value::String(format!(
+                    "touch {}; (sleep 1; touch {}) >/dev/null 2>&1 & wait",
+                    started.display(),
+                    survived.display()
+                )),
+            ),
+        ]);
+        let task = tokio::spawn(async move { handle(&policy, &payload).await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !started.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(started.exists(), "script never reached its body");
+        task.abort();
+        let join_error = task.await.err().test_value()?;
+        assert!(join_error.is_cancelled());
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !survived.exists(),
+            "script descendant survived cancellation"
+        );
+        let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
+        let leftovers = fs::read_dir(staging)
+            .test_value()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "cancelled script leaked workdir: {leftovers:?}"
+        );
         Ok(())
     }
 }
