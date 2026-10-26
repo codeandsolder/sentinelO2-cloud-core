@@ -220,16 +220,16 @@ async fn established_session_loss_discards_old_handshake_backoff() -> TestResult
             reconnect: ReconnectPolicy {
                 steps: vec![
                     Duration::ZERO,
-                    Duration::from_millis(5),
-                    Duration::from_millis(10),
-                    Duration::from_millis(20),
-                    Duration::from_millis(300),
+                    Duration::from_millis(50),
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                    Duration::from_secs(5),
                 ]
                 .into(),
                 jitter: false,
             },
-            connect_timeout: Duration::from_millis(100),
-            welcome_timeout: Duration::from_millis(100),
+            connect_timeout: Duration::from_millis(500),
+            welcome_timeout: Duration::from_millis(500),
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(90),
         },
@@ -237,7 +237,7 @@ async fn established_session_loss_discards_old_handshake_backoff() -> TestResult
     )
     .test_value()?;
 
-    tokio::time::timeout(Duration::from_millis(150), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_secs(2), agent.run(cancel.clone()))
         .await
         .test_value()?
         .test_value()?;
@@ -258,10 +258,25 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() -> TestRe
             .await
             .test_value()?;
         let _hello = first.next().await.test_value()?.test_value()?;
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        drop(first);
+        // Send no welcome. The client must close this handshake on its own
+        // welcome deadline before attempting the next connection.
+        let closed = tokio::time::timeout(Duration::from_secs(2), first.next())
+            .await
+            .test_value()?;
+        match closed {
+            None | Some(Err(_) | Ok(WsMessage::Close(_))) => {}
+            Some(Ok(other)) => {
+                return Err(std::io::Error::other(format!(
+                    "expected handshake connection to close, got {other:?}"
+                ))
+                .into());
+            }
+        }
 
-        let (stream, _) = listener.accept().await.test_value()?;
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .test_value()?
+            .test_value()?;
         let mut second = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
             .test_value()?;
@@ -293,11 +308,11 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() -> TestRe
                 .join(format!("sentinel0-reconnect-{}", addr.port()))
                 .join("uploads"),
             reconnect: ReconnectPolicy {
-                steps: vec![Duration::ZERO, Duration::from_millis(5)].into(),
+                steps: vec![Duration::ZERO, Duration::from_millis(50)].into(),
                 jitter: false,
             },
-            connect_timeout: Duration::from_millis(30),
-            welcome_timeout: Duration::from_millis(30),
+            connect_timeout: Duration::from_millis(300),
+            welcome_timeout: Duration::from_millis(200),
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(90),
         },
@@ -305,7 +320,7 @@ async fn missing_welcome_times_out_and_next_real_connection_recovers() -> TestRe
     )
     .test_value()?;
 
-    tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_secs(3), agent.run(cancel.clone()))
         .await
         .test_value()?
         .test_value()?;
@@ -337,11 +352,25 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() -> Te
             .await
             .test_value()?;
 
-        // Stay connected but deliberately ignore application-level pings.
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        drop(first);
+        // Wait until the application heartbeat is actually outstanding,
+        // then deliberately withhold Pong while keeping the socket open.
+        let ping = tokio::time::timeout(Duration::from_secs(2), first.next())
+            .await
+            .test_value()?
+            .test_value()?
+            .test_value()?;
+        let WsMessage::Text(ping) = ping else {
+            return Err(std::io::Error::other("expected application Ping text frame").into());
+        };
+        assert!(matches!(
+            serde_json::from_str::<Message>(&ping).test_value()?,
+            Message::Ping { .. }
+        ));
 
-        let (stream, _) = listener.accept().await.test_value()?;
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .test_value()?
+            .test_value()?;
         let mut second = accept_hdr_async(stream, AssertHeaders(|_: &Request| {}))
             .await
             .test_value()?;
@@ -373,19 +402,19 @@ async fn silent_established_peer_trips_heartbeat_deadline_and_reconnects() -> Te
                 .join(format!("sentinel0-reconnect-{}", addr.port()))
                 .join("uploads"),
             reconnect: ReconnectPolicy {
-                steps: vec![Duration::ZERO, Duration::from_millis(5)].into(),
+                steps: vec![Duration::ZERO, Duration::from_millis(50)].into(),
                 jitter: false,
             },
-            connect_timeout: Duration::from_millis(100),
-            welcome_timeout: Duration::from_millis(100),
-            heartbeat_interval: Duration::from_millis(10),
-            heartbeat_timeout: Duration::from_millis(25),
+            connect_timeout: Duration::from_millis(500),
+            welcome_timeout: Duration::from_millis(500),
+            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_timeout: Duration::from_millis(300),
         },
         UnsupportedDispatcher,
     )
     .test_value()?;
 
-    tokio::time::timeout(Duration::from_millis(200), agent.run(cancel.clone()))
+    tokio::time::timeout(Duration::from_secs(3), agent.run(cancel.clone()))
         .await
         .test_value()?
         .test_value()?;

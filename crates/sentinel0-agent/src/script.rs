@@ -653,10 +653,18 @@ mod tests {
     #[tokio::test]
     async fn python_script_can_import_staged_runtime() -> TestResult {
         let dir = tempdir().test_value()?;
-        let policy = Policy {
+        let uv = dir.path().join("uv");
+        fs::write(
+            &uv,
+            b"#!/bin/sh\nset -eu\n[ \"$1\" = run ]; shift\n[ \"$1\" = --no-project ]; shift\n[ \"$1\" = --python ]; shift 2\n[ \"$1\" = python ]; shift\nexec python3 \"$@\"\n",
+        )
+        .test_value()?;
+        fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).test_value()?;
+        let mut policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
         };
+        policy.tooling.executables.insert("uv".into(), uv);
         let result = handle(
             &policy,
             &Map::from_iter([

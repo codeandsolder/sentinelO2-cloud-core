@@ -445,15 +445,14 @@ fn param_names(action: &Action) -> Vec<String> {
         let required = schema
             .get("required")
             .and_then(Value::as_array)
-            .map(|items| {
+            .map_or_else(Vec::new, |items| {
                 items
                     .iter()
                     .filter_map(Value::as_str)
                     .filter(|name| properties.contains_key(*name))
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            });
         let mut rest = properties
             .keys()
             .filter(|name| !required.contains(name))

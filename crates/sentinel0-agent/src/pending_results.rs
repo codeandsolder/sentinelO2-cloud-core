@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const PENDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const PENDING_TTL: Duration = Duration::from_hours(24);
 pub const MAX_PENDING_FILES: usize = 500;
 
 fn store_lock(dir: &Path) -> Arc<Mutex<()>> {

@@ -412,9 +412,9 @@ fn timed_out_validator_error(child: &mut std::process::Child, pid: u32) -> Handl
         tracing::warn!(%message);
         cleanup_error.get_or_insert(message);
     }
-    let details = cleanup_error
-        .map(|error| Map::from_iter([("cleanup_error".into(), Value::String(error))]))
-        .unwrap_or_default();
+    let details = cleanup_error.map_or_else(Map::new, |error| {
+        Map::from_iter([("cleanup_error".into(), Value::String(error))])
+    });
     HandlerError::with_details(
         "validation_timeout",
         format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
