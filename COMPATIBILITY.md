@@ -201,7 +201,9 @@ Reference surfaces:
   Python `script_run` also stages the version-matched `sentinelx_runtime`
   helper; its `exec_ssh()` context reuses one multiplexed OpenSSH session and
   provides argv-safe `run`, stdin-fed `bash`, and stdin-fed `python` remote
-  execution without requiring a separately installed runtime package.
+  execution without requiring a separately installed runtime package. Remote
+  calls accept `env=` without placing environment values in the SSH command
+  line, and `cwd` understands `~`/`~/...` relative to the SSH login user.
 - `exec_mode` is the authoritative command policy: `allowlist` is the default,
   `strict` adds shell-safety restrictions, and `unrestricted` disables the
   command allowlist. `allowed_commands` uses whole-word matching (plus explicit
