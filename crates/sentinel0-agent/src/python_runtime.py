@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +31,17 @@ class RunResult:
                 self.returncode, self.args, output=self.stdout, stderr=self.stderr
             )
         return self
+
+
+def _env_payload(env: Mapping[str, str] | None) -> dict[str, str]:
+    if env is None:
+        return {}
+    out: dict[str, str] = {}
+    for key, value in env.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise TypeError("env must map strings to strings")
+        out[key] = value
+    return out
 
 
 class SshExecutionTarget:
@@ -108,19 +119,53 @@ class SshExecutionTarget:
         )
         return result.check() if check else result
 
-    def run(self, command: str | Sequence[str], *, cwd: str | None = None, sudo: bool = False, timeout: int = 60, check: bool = False) -> RunResult:
+    def run(
+        self,
+        command: str | Sequence[str],
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        sudo: bool = False,
+        timeout: int = 60,
+        check: bool = False,
+    ) -> RunResult:
+        common = {"cwd": cwd, "env": _env_payload(env), "sudo": sudo, "timeout_seconds": timeout}
         if isinstance(command, str):
-            return self._request("shell", check=check, shown_args=command, command=command, cwd=cwd, sudo=sudo, timeout_seconds=timeout)
+            return self._request("shell", check=check, shown_args=command, command=command, **common)
         argv = [str(arg) for arg in command]
         if not argv:
             raise ValueError("command argv must not be empty")
-        return self._request("argv", check=check, shown_args=argv, argv=argv, cwd=cwd, sudo=sudo, timeout_seconds=timeout)
+        return self._request("argv", check=check, shown_args=argv, argv=argv, **common)
 
-    def bash(self, source: str, *args: str, cwd: str | None = None, sudo: bool = False, timeout: int = 60, check: bool = False) -> RunResult:
-        return self._request("bash", check=check, shown_args=["bash", "-s", "--", *args], source=source, args=list(args), cwd=cwd, sudo=sudo, timeout_seconds=timeout)
+    def bash(
+        self,
+        source: str,
+        *args: str,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        sudo: bool = False,
+        timeout: int = 60,
+        check: bool = False,
+    ) -> RunResult:
+        return self._request(
+            "bash", check=check, shown_args=["bash", "-s", "--", *args],
+            source=source, args=list(args), cwd=cwd, env=_env_payload(env), sudo=sudo, timeout_seconds=timeout,
+        )
 
-    def python(self, source: str, *args: str, cwd: str | None = None, sudo: bool = False, timeout: int = 60, check: bool = False) -> RunResult:
-        return self._request("python", check=check, shown_args=["python", "-", *args], source=source, args=list(args), cwd=cwd, sudo=sudo, timeout_seconds=timeout)
+    def python(
+        self,
+        source: str,
+        *args: str,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        sudo: bool = False,
+        timeout: int = 60,
+        check: bool = False,
+    ) -> RunResult:
+        return self._request(
+            "python", check=check, shown_args=["python", "-", *args],
+            source=source, args=list(args), cwd=cwd, env=_env_payload(env), sudo=sudo, timeout_seconds=timeout,
+        )
 
     def close(self) -> None:
         process = self._process

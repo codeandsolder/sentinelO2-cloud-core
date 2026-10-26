@@ -31,14 +31,14 @@ Python `script_run` stages a small `sentinelx_runtime.py` module beside the ephe
 from sentinelx_runtime import exec_ssh
 
 with exec_ssh("jan@acer") as target:
-    status = target.run(["git", "status", "--short"], cwd="/home/jan/projects/example")
-    target.bash("printf '%s\\n' \"$1\"", "literal $() data")
+    status = target.run(["git", "status", "--short"], cwd="~/projects/example")
+    target.bash("printf '%s\\n' \"$1:$TOKEN\"", "literal $() data", env={"TOKEN": "value"})
     target.python("print('hello from the remote host')")
 ```
 
-`exec_ssh()` owns one multiplexed OpenSSH session for the context. `run(list[str])` keeps dynamic values as argv data across the SSH boundary; `run(str)` intentionally requests a remote shell command. `bash()` and `python()` send source on stdin instead of interpolating it into an SSH command string. Results expose stdout, stderr, return code, byte counts, truncation state, and `check()`.
+`exec_ssh()` owns one multiplexed OpenSSH session for the context. `run(list[str])` keeps dynamic values as argv data across the SSH boundary; `run(str)` intentionally requests a remote shell command. `bash()` and `python()` send source on stdin instead of interpolating it into an SSH command string. All three accept `env=`; environment values are framed over stdin rather than exposed in the remote command line, while `sudo=True` preserves only the requested variable names. `cwd` accepts ordinary absolute/relative paths plus `~` and `~/...`, resolved against the SSH login user's home. Results expose stdout, stderr, return code, byte counts, truncation state, and `check()`.
 
-The helper is non-interactive (`BatchMode=yes`) and uses the normal SSH configuration/credentials of the agent account. Remote execution is currently Linux-first: commands are bounded with `timeout(1)`, `bash()` requires Bash, and `python()` additionally requires `uv` and Python on the remote host. This is an ergonomic runtime for the already-arbitrary-code `script_run` capability; it does not make `script_run` subject to `allowed_commands`.
+The helper is non-interactive (`BatchMode=yes`) and uses the normal SSH configuration/credentials of the agent account. Remote execution is currently Linux-first: commands are bounded with `timeout(1)`, calls using `env=` or `cwd` and `bash()` require Bash, and `python()` additionally requires `uv` and Python on the remote host. This is an ergonomic runtime for the already-arbitrary-code `script_run` capability; it does not make `script_run` subject to `allowed_commands`.
 
 ## Exec command encoding
 
