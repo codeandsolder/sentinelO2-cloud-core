@@ -21,13 +21,17 @@ grep -F '[[ -z "$smoke" ]] || rm -rf -- "$smoke"' "$HERE/sccache-release-update"
 grep -F -- '--continue-at -' "$HERE/sccache-release-update" >/dev/null
 grep -F '/api/v1/scheduler/status' "$HERE/sccache-release-update" >/dev/null
 grep -F 'systemctl is-active --quiet "$LOCAL_SERVICE"' "$HERE/sccache-release-update" >/dev/null
-grep -F 'tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT"' "$HERE/sccache-release-update" >/dev/null
+grep -F '"$SCHEDULER_URL/api/v1/scheduler/status"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'scheduler_ready && break' "$HERE/sccache-release-update" >/dev/null
 grep -F 'SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE' "$HERE/sccache-release-update" >/dev/null
+grep -F 'dist_update_required=0' "$HERE/sccache-release-update" >/dev/null
+grep -F 'if (( dist_was_active && dist_update_required )); then' "$HERE/sccache-release-update" >/dev/null
+grep -F 'if (( dist_update_required )); then' "$HERE/sccache-release-update" >/dev/null
 grep -F 'ROOT_LOCAL_SERVICE="${SCCACHE_AUTOUPDATE_ROOT_LOCAL_SERVICE:-sccache-local-root.service}"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'systemctl start "$ROOT_LOCAL_SERVICE"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'tcp_ready 127.0.0.1 "$ROOT_CLIENT_PORT"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'LIVE="${SCCACHE_AUTOUPDATE_LIVE:-/usr/local/libexec/sccache-bin/sccache}"' "$HERE/sccache-release-update" >/dev/null
-grep -F 'SCCACHE_SERVER_PORT="$CLIENT_PORT" SCCACHE_START_SERVER=0 "$LIVE" "$@"' "$HERE/sccache-release-update" >/dev/null
+grep -F 'env -u SCCACHE_SERVER_PORT SCCACHE_SERVER_UDS="$CLIENT_UDS" SCCACHE_START_SERVER=0 "$LIVE" "$@"' "$HERE/sccache-release-update" >/dev/null
 grep -F 'export SCCACHE_START_SERVER="${SCCACHE_START_SERVER:-0}"' "$HERE/sccache-router" >/dev/null
 grep -F 'exec /usr/local/libexec/sccache-bin/sccache "$@"' "$HERE/sccache-router" >/dev/null
 grep -F 'exec /usr/local/libexec/sccache-bin/sccache "${args[@]}"' "$HERE/sccache-client" >/dev/null
@@ -47,8 +51,8 @@ fi
 awk '
     /^rollback\(\) \{/ { in_rollback = 1; next }
     in_rollback && /^}/ { exit }
-    in_rollback && /systemctl start "\$DIST_SERVICE"/ && !dist_start { dist_start = NR }
-    in_rollback && /tcp_ready "\$SCHEDULER_HOST" "\$SCHEDULER_PORT"/ && !scheduler_ready { scheduler_ready = NR }
+    in_rollback && /systemctl start .*ACTIVE_DIST_SERVICES/ && !dist_start { dist_start = NR }
+    in_rollback && /scheduler_ready && break/ && !scheduler_ready { scheduler_ready = NR }
     in_rollback && /systemctl start "\$LOCAL_SERVICE"/ && !local_start { local_start = NR }
     END {
         if (!(dist_start && scheduler_ready && local_start &&

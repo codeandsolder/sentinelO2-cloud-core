@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 REPO="${SCCACHE_AUTOUPDATE_REPO:-codeandsolder/sccache-deduplicated}"
 TAG_PREFIX="${SCCACHE_AUTOUPDATE_TAG_PREFIX:-sccache-ci-}"
@@ -9,18 +9,54 @@ LIVE="${SCCACHE_AUTOUPDATE_LIVE:-/usr/local/libexec/sccache-bin/sccache}"
 DIST_LIVE="${SCCACHE_AUTOUPDATE_DIST_LIVE:-/usr/local/bin/sccache-dist}"
 LOCAL_SERVICE="${SCCACHE_AUTOUPDATE_LOCAL_SERVICE:-sccache-local.service}"
 ROOT_LOCAL_SERVICE="${SCCACHE_AUTOUPDATE_ROOT_LOCAL_SERVICE:-sccache-local-root.service}"
-DIST_SERVICE="${SCCACHE_AUTOUPDATE_DIST_SERVICE:-sccache-dist-scheduler.service}"
+NATIVE_ROOT_SERVICE="${SCCACHE_AUTOUPDATE_NATIVE_ROOT_SERVICE:-sccache-native-root.service}"
+OPENWRT_ROOT_SERVICE="${SCCACHE_AUTOUPDATE_OPENWRT_ROOT_SERVICE:-sccache-openwrt-root.service}"
+STRICT_LOCAL_SERVICE="${SCCACHE_AUTOUPDATE_STRICT_LOCAL_SERVICE:-sccache-strict-local.service}"
+DIST_SERVICE="${SCCACHE_AUTOUPDATE_DIST_SERVICE:-sccache-dist-worker.service}"
+SCHEDULER_SERVICE="${SCCACHE_AUTOUPDATE_SCHEDULER_SERVICE:-sccache-dist-scheduler.service}"
+DIST_SERVICES=("$DIST_SERVICE")
+if [[ "$SCHEDULER_SERVICE" != "$DIST_SERVICE" ]]; then
+    DIST_SERVICES+=("$SCHEDULER_SERVICE")
+fi
 DRAIN="${SCCACHE_AUTOUPDATE_DRAIN:-/dev/shm/sccache-maintenance-drain}"
+CLIENT_UDS="${SCCACHE_AUTOUPDATE_CLIENT_UDS:-/run/sccache-jan/sccache.sock}"
 CLIENT_PORT="${SCCACHE_AUTOUPDATE_CLIENT_PORT:-4226}"
 ROOT_CLIENT_PORT="${SCCACHE_AUTOUPDATE_ROOT_CLIENT_PORT:-4227}"
-SCHEDULER_HOST="${SCCACHE_AUTOUPDATE_SCHEDULER_HOST:-100.65.0.2}"
-SCHEDULER_PORT="${SCCACHE_AUTOUPDATE_SCHEDULER_PORT:-10600}"
+NATIVE_ROOT_PORT="${SCCACHE_AUTOUPDATE_NATIVE_ROOT_PORT:-4237}"
+OPENWRT_ROOT_PORT="${SCCACHE_AUTOUPDATE_OPENWRT_ROOT_PORT:-4238}"
+STRICT_LOCAL_PORT="${SCCACHE_AUTOUPDATE_STRICT_LOCAL_PORT:-4228}"
+CLIENT_SERVICES=("$LOCAL_SERVICE" "$ROOT_LOCAL_SERVICE" "$NATIVE_ROOT_SERVICE" "$STRICT_LOCAL_SERVICE")
+CLIENT_PORTS=("$ROOT_CLIENT_PORT" "$NATIVE_ROOT_PORT" "$STRICT_LOCAL_PORT")
+SCHEDULER_URL="${SCCACHE_AUTOUPDATE_SCHEDULER_URL:-https://sccache.onhir.eu}"
 LOCK="${SCCACHE_AUTOUPDATE_LOCK:-/run/lock/sccache-autoupdate.lock}"
 MODE=apply
-# Artifact provenance pin: advance only when the immutable sccache bundle itself is rebuilt with a newer toolchain.
 EXPECTED_RUST_TOOLCHAIN="${SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN:-1.99.0}"
 SMOKE_RUSTC="${SCCACHE_AUTOUPDATE_SMOKE_RUSTC:-/opt/toolchains/rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc}"
 VERIFY_DIST_SMOKE="${SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE:-0}"
+
+managed_client_processes_match() {
+    local expected_hash="$1"
+    local service pid running_hash
+    for service in "${CLIENT_SERVICES[@]}"; do
+        systemctl is-active --quiet "$service" || continue
+        pid="$(systemctl show -p MainPID --value "$service" 2>/dev/null || echo 0)"
+        [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/exe" ]] || return 1
+        running_hash="$(sha256sum "/proc/$pid/exe" 2>/dev/null | awk '{print $1}')"
+        [[ "$running_hash" == "$expected_hash" ]] || return 1
+    done
+}
+
+managed_dist_processes_match() {
+    local expected_hash="$1"
+    local service pid running_hash
+    for service in "${DIST_SERVICES[@]}"; do
+        systemctl is-active --quiet "$service" || continue
+        pid="$(systemctl show -p MainPID --value "$service" 2>/dev/null || echo 0)"
+        [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/exe" ]] || return 1
+        running_hash="$(sha256sum "/proc/$pid/exe" 2>/dev/null | awk '{print $1}')"
+        [[ "$running_hash" == "$expected_hash" ]] || return 1
+    done
+}
 
 case "${1:-}" in
     "") ;;
@@ -87,19 +123,11 @@ if [[ "$MODE" == apply &&
     managed_dist_hash="$(cat "$STATE_DIR/dist_binary_sha256")"
     live_hash="$(sha256sum "$LIVE" | awk '{print $1}')"
     live_dist_hash="$(sha256sum "$DIST_LIVE" | awk '{print $1}')"
-    running_dist_hash="$managed_dist_hash"
-    if systemctl is-active --quiet "$DIST_SERVICE"; then
-        dist_pid="$(systemctl show -p MainPID --value "$DIST_SERVICE" 2>/dev/null || echo 0)"
-        if [[ "$dist_pid" =~ ^[1-9][0-9]*$ && -r "/proc/$dist_pid/exe" ]]; then
-            running_dist_hash="$(sha256sum "/proc/$dist_pid/exe" 2>/dev/null | awk '{print $1}')"
-        else
-            running_dist_hash=""
-        fi
-    fi
     if [[ "$managed_tag" == "$tag" &&
           "$managed_hash" == "$live_hash" &&
-          "$managed_dist_hash" == "$live_dist_hash" &&
-          "$managed_dist_hash" == "$running_dist_hash" ]]; then
+          "$managed_dist_hash" == "$live_dist_hash" ]] &&
+       managed_dist_processes_match "$managed_dist_hash" &&
+       managed_client_processes_match "$managed_hash"; then
         echo "sccache-release-update: $tag already installed"
         exit 0
     fi
@@ -216,14 +244,6 @@ if [[ "$MODE" == check ]]; then
     exit 0
 fi
 
-running_dist_sha() {
-    local pid
-    systemctl is-active --quiet "$DIST_SERVICE" || return 1
-    pid="$(systemctl show -p MainPID --value "$DIST_SERVICE" 2>/dev/null || echo 0)"
-    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/exe" ]] || return 1
-    sha256sum "/proc/$pid/exe" 2>/dev/null | awk '{print $1}'
-}
-
 tcp_ready() {
     local host="$1"
     local port="$2"
@@ -232,9 +252,13 @@ tcp_ready() {
 }
 
 local_sccache() {
-    SCCACHE_SERVER_PORT="$CLIENT_PORT" SCCACHE_START_SERVER=0 "$LIVE" "$@"
+    env -u SCCACHE_SERVER_PORT SCCACHE_SERVER_UDS="$CLIENT_UDS" SCCACHE_START_SERVER=0 "$LIVE" "$@"
 }
 
+
+scheduler_ready() {
+    curl -fsS --connect-timeout 3 --max-time 5         "$SCHEDULER_URL/api/v1/scheduler/status" >/dev/null 2>&1
+}
 local_dist_status_value() {
     local field="$1"
     local status
@@ -261,7 +285,7 @@ dist_status_value() {
     fi
 
     curl -fsS --connect-timeout 3 --max-time 5 \
-        "http://$SCHEDULER_HOST:$SCHEDULER_PORT/api/v1/scheduler/status" |
+        "$SCHEDULER_URL/api/v1/scheduler/status" |
         python3 -c 'import struct,sys
 field=sys.argv[1]
 data=sys.stdin.buffer.read()
@@ -288,12 +312,8 @@ print(sum(int(v) for v in d.get("dist_compiles",{}).values()))'
 }
 
 if [[ "$candidate_sha" == "$live_sha" && "$candidate_dist_sha" == "$live_dist_sha" ]]; then
-    dist_matches=1
-    if systemctl is-active --quiet "$DIST_SERVICE"; then
-        running_hash="$(running_dist_sha || true)"
-        [[ "$running_hash" == "$candidate_dist_sha" ]] || dist_matches=0
-    fi
-    if (( dist_matches )); then
+    if managed_dist_processes_match "$candidate_dist_sha" &&
+       managed_client_processes_match "$candidate_sha"; then
         printf '%s\n' "$tag" > "$STATE_DIR/release_tag"
         printf '%s\n' "$source_sha" > "$STATE_DIR/source_sha"
         printf '%s\n' "$published_at" > "$STATE_DIR/published_at"
@@ -307,7 +327,16 @@ if [[ "$candidate_sha" == "$live_sha" && "$candidate_dist_sha" == "$live_dist_sh
 fi
 
 active_clients() {
-    ss -Htn state established "( sport = :$CLIENT_PORT or dport = :$CLIENT_PORT or sport = :$ROOT_CLIENT_PORT or dport = :$ROOT_CLIENT_PORT )" 2>/dev/null | grep -q .
+    local port
+    if ss -Hxn state established 2>/dev/null | grep -Fq "$CLIENT_UDS"; then
+        return 0
+    fi
+    for port in "${CLIENT_PORTS[@]}"; do
+        if ss -Htn state established "( sport = :$port or dport = :$port )" 2>/dev/null | grep -q .; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Do not disrupt active local or distributed compiles merely because a release
@@ -316,18 +345,48 @@ root_local_was_active=0
 if systemctl is-active --quiet "$ROOT_LOCAL_SERVICE"; then
     root_local_was_active=1
 fi
+native_root_was_active=0
+if systemctl is-active --quiet "$NATIVE_ROOT_SERVICE"; then
+    native_root_was_active=1
+fi
+openwrt_root_was_active=0
+if systemctl is-active --quiet "$OPENWRT_ROOT_SERVICE"; then
+    openwrt_root_was_active=1
+fi
+strict_local_was_active=0
+if systemctl is-active --quiet "$STRICT_LOCAL_SERVICE"; then
+    strict_local_was_active=1
+fi
 
+ACTIVE_DIST_SERVICES=()
+for service in "${DIST_SERVICES[@]}"; do
+    if systemctl is-active --quiet "$service"; then
+        ACTIVE_DIST_SERVICES+=("$service")
+    fi
+done
 dist_was_active=0
-if systemctl is-active --quiet "$DIST_SERVICE"; then
+dist_update_required=1
+if [[ "$candidate_dist_sha" == "$live_dist_sha" ]] &&
+   managed_dist_processes_match "$candidate_dist_sha"; then
+    dist_update_required=0
+fi
+if (( ${#ACTIVE_DIST_SERVICES[@]} > 0 )); then
     dist_was_active=1
-    if ! dist_busy="$(dist_in_progress)"; then
-        echo "sccache-release-update: cannot verify scheduler activity; deferring update" >&2
-        exit 0
+    # A client-only release cannot interrupt jobs already running on the
+    # scheduler/worker processes, so do not make unrelated global dist activity
+    # block a client update when the dist binary is already exactly right.
+    if (( dist_update_required )); then
+        if ! dist_busy="$(dist_in_progress)"; then
+            echo "sccache-release-update: cannot verify scheduler activity; deferring dist update" >&2
+            exit 0
+        fi
+        if (( dist_busy > 0 )); then
+            echo "sccache-release-update: $dist_busy distributed compile(s) active; deferring dist update"
+            exit 0
+        fi
     fi
-    if (( dist_busy > 0 )); then
-        echo "sccache-release-update: $dist_busy distributed compile(s) active; deferring update"
-        exit 0
-    fi
+    # Keep this check even for client-only releases: the freshly installed
+    # client must still prove it can use the live distributed pool.
     if [[ "$VERIFY_DIST_SMOKE" == 1 ]]; then
         if ! dist_servers="$(dist_num_servers)"; then
             echo "sccache-release-update: cannot verify scheduler workers; deferring update" >&2
@@ -339,6 +398,24 @@ if systemctl is-active --quiet "$DIST_SERVICE"; then
         fi
     fi
 fi
+
+stop_dist_services() {
+    local service
+    for service in "${ACTIVE_DIST_SERVICES[@]}"; do
+        systemctl stop "$service"
+    done
+}
+
+start_dist_services() {
+    local i service
+    # Scheduler is appended after the worker, so reverse order starts the
+    # scheduler first. With a single configured service this is unchanged.
+    for ((i=${#ACTIVE_DIST_SERVICES[@]}-1; i>=0; i--)); do
+        service="${ACTIVE_DIST_SERVICES[i]}"
+        systemctl start "$service"
+        systemctl is-active --quiet "$service"
+    done
+}
 if active_clients; then
     echo "sccache-release-update: active compiler clients; deferring update"
     exit 0
@@ -354,23 +431,38 @@ mkdir -p "$backup_dir"
 
 rollback() {
     rc=$?
-    trap - ERR INT TERM
+    trap - EXIT ERR INT TERM
     echo "sccache-release-update: update failed (rc=$rc), rolling back" >&2
     if (( root_local_was_active )); then
         systemctl stop "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
     fi
+    if (( native_root_was_active )); then
+        systemctl stop "$NATIVE_ROOT_SERVICE" >/dev/null 2>&1 || true
+    fi
+    if (( openwrt_root_was_active )); then
+        systemctl stop "$OPENWRT_ROOT_SERVICE" >/dev/null 2>&1 || true
+    fi
+    if (( strict_local_was_active )); then
+        systemctl stop "$STRICT_LOCAL_SERVICE" >/dev/null 2>&1 || true
+    fi
     systemctl stop "$LOCAL_SERVICE" >/dev/null 2>&1 || true
-    if (( dist_was_active )); then
-        systemctl stop "$DIST_SERVICE" >/dev/null 2>&1 || true
+    if (( dist_was_active && dist_update_required )); then
+        for service in "${ACTIVE_DIST_SERVICES[@]}"; do
+            systemctl stop "$service" >/dev/null 2>&1 || true
+        done
     fi
     [[ -e "$backup_dir/sccache" ]] && install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE"
-    [[ -e "$backup_dir/sccache-dist" ]] && install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE"
+    if (( dist_update_required )) && [[ -e "$backup_dir/sccache-dist" ]]; then
+        install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE"
+    fi
     # Restore the scheduler before the local daemon so the reverted client
     # does not enter reconnect backoff against a scheduler that is still down.
-    if (( dist_was_active )); then
-        systemctl start "$DIST_SERVICE" >/dev/null 2>&1 || true
+    if (( dist_was_active && dist_update_required )); then
+        for ((i=${#ACTIVE_DIST_SERVICES[@]}-1; i>=0; i--)); do
+            systemctl start "${ACTIVE_DIST_SERVICES[i]}" >/dev/null 2>&1 || true
+        done
         for _ in $(seq 1 100); do
-            tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT" && break
+            scheduler_ready && break
             sleep 0.05
         done
     fi
@@ -378,11 +470,20 @@ rollback() {
     if (( root_local_was_active )); then
         systemctl start "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
     fi
+    if (( native_root_was_active )); then
+        systemctl start "$NATIVE_ROOT_SERVICE" >/dev/null 2>&1 || true
+    fi
+    if (( openwrt_root_was_active )); then
+        systemctl start "$OPENWRT_ROOT_SERVICE" >/dev/null 2>&1 || true
+    fi
+    if (( strict_local_was_active )); then
+        systemctl start "$STRICT_LOCAL_SERVICE" >/dev/null 2>&1 || true
+    fi
     [[ -z "$smoke" ]] || rm -rf -- "$smoke"
     rm -f "$DRAIN"
     exit "$rc"
 }
-trap rollback ERR INT TERM
+trap rollback EXIT ERR INT TERM
 
 touch "$DRAIN"
 # A client may have crossed the idle check just before the marker appeared.
@@ -393,40 +494,41 @@ done
 if active_clients; then
     echo "sccache-release-update: client did not drain within 30s; deferring" >&2
     rm -f "$DRAIN"
-    trap - ERR INT TERM
+    trap - EXIT ERR INT TERM
     exit 0
 fi
 
 # Recheck distributed activity immediately before stopping the scheduler. This
 # closes the normal timer race as far as possible without interrupting a known
 # in-flight remote compilation.
-if (( dist_was_active )); then
+if (( dist_was_active && dist_update_required )); then
     if ! dist_busy="$(dist_in_progress)"; then
         echo "sccache-release-update: cannot recheck scheduler activity; deferring update" >&2
         rm -f "$DRAIN"
-        trap - ERR INT TERM
+        trap - EXIT ERR INT TERM
         exit 0
     fi
     if (( dist_busy > 0 )); then
         echo "sccache-release-update: $dist_busy distributed compile(s) became active; deferring update"
         rm -f "$DRAIN"
-        trap - ERR INT TERM
+        trap - EXIT ERR INT TERM
         exit 0
     fi
-    systemctl stop "$DIST_SERVICE"
+    stop_dist_services
 fi
 
-install -o root -g root -m 0755 "$release_dir/sccache-dist-linux-x86_64-v2" "$DIST_LIVE.new"
-mv -f "$DIST_LIVE.new" "$DIST_LIVE"
+if (( dist_update_required )); then
+    install -o root -g root -m 0755 "$release_dir/sccache-dist-linux-x86_64-v2" "$DIST_LIVE.new"
+    mv -f "$DIST_LIVE.new" "$DIST_LIVE"
 
-if (( dist_was_active )); then
-    systemctl start "$DIST_SERVICE"
-    for _ in $(seq 1 100); do
-        tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT" >/dev/null 2>&1 && break
-        sleep 0.05
-    done
-    systemctl is-active --quiet "$DIST_SERVICE"
-    tcp_ready "$SCHEDULER_HOST" "$SCHEDULER_PORT"
+    if (( dist_was_active )); then
+        start_dist_services
+        for _ in $(seq 1 100); do
+            scheduler_ready >/dev/null 2>&1 && break
+            sleep 0.05
+        done
+        scheduler_ready
+    fi
 fi
 
 # The pre-managed local daemon predates deterministic background-task draining.
@@ -439,17 +541,27 @@ fi
 if (( root_local_was_active )); then
     systemctl stop "$ROOT_LOCAL_SERVICE"
 fi
+if (( native_root_was_active )); then
+    systemctl stop "$NATIVE_ROOT_SERVICE"
+fi
+if (( openwrt_root_was_active )); then
+    systemctl stop "$OPENWRT_ROOT_SERVICE"
+fi
+if (( strict_local_was_active )); then
+    systemctl stop "$STRICT_LOCAL_SERVICE"
+fi
 systemctl stop "$LOCAL_SERVICE"
 install -o root -g root -m 0755 "$release_dir/sccache-linux-x86_64-v2" "$LIVE.new"
 mv -f "$LIVE.new" "$LIVE"
 
 systemctl start "$LOCAL_SERVICE"
 for _ in $(seq 1 100); do
-    tcp_ready 127.0.0.1 "$CLIENT_PORT" >/dev/null 2>&1 && break
+    [[ -S "$CLIENT_UDS" ]] && break
     sleep 0.05
 done
 systemctl is-active --quiet "$LOCAL_SERVICE"
-tcp_ready 127.0.0.1 "$CLIENT_PORT"
+[[ -S "$CLIENT_UDS" ]]
+local_sccache --show-stats >/dev/null
 
 if (( root_local_was_active )); then
     systemctl start "$ROOT_LOCAL_SERVICE"
@@ -459,6 +571,33 @@ if (( root_local_was_active )); then
     done
     systemctl is-active --quiet "$ROOT_LOCAL_SERVICE"
     tcp_ready 127.0.0.1 "$ROOT_CLIENT_PORT"
+fi
+if (( native_root_was_active )); then
+    systemctl start "$NATIVE_ROOT_SERVICE"
+    for _ in $(seq 1 100); do
+        tcp_ready 127.0.0.1 "$NATIVE_ROOT_PORT" >/dev/null 2>&1 && break
+        sleep 0.05
+    done
+    systemctl is-active --quiet "$NATIVE_ROOT_SERVICE"
+    tcp_ready 127.0.0.1 "$NATIVE_ROOT_PORT"
+fi
+if (( openwrt_root_was_active )); then
+    systemctl start "$OPENWRT_ROOT_SERVICE"
+    for _ in $(seq 1 100); do
+        tcp_ready 127.0.0.1 "$OPENWRT_ROOT_PORT" >/dev/null 2>&1 && break
+        sleep 0.05
+    done
+    systemctl is-active --quiet "$OPENWRT_ROOT_SERVICE"
+    tcp_ready 127.0.0.1 "$OPENWRT_ROOT_PORT"
+fi
+if (( strict_local_was_active )); then
+    systemctl start "$STRICT_LOCAL_SERVICE"
+    for _ in $(seq 1 100); do
+        tcp_ready 127.0.0.1 "$STRICT_LOCAL_PORT" >/dev/null 2>&1 && break
+        sleep 0.05
+    done
+    systemctl is-active --quiet "$STRICT_LOCAL_SERVICE"
+    tcp_ready 127.0.0.1 "$STRICT_LOCAL_PORT"
 fi
 
 dist_smoke_before=""
@@ -523,5 +662,5 @@ printf '%s\n' "$candidate_dist_sha" > "$STATE_DIR/dist_binary_sha256"
 printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/updated_at"
 
 rm -f "$DRAIN"
-trap - ERR INT TERM
+trap - EXIT ERR INT TERM
 echo "sccache-release-update: installed $tag ($source_sha)"
