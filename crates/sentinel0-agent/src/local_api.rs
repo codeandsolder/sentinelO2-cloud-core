@@ -3,23 +3,31 @@ use crate::{
     policy::Policy,
     process_output::CapturedOutput,
     process_runner::{
-        ProcessFailure, ProcessGroupKill, ProcessOutcome, RunOptions, run_argv_with_limits,
+        ProcessFailure, ProcessGroupGuard, ProcessGroupKill, ProcessOutcome, RunOptions,
+        run_argv_with_limits,
     },
 };
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
     io::{Read as _, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
+    process::Stdio,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
+    process::{Child, ChildStdin, ChildStdout, Command},
     time::timeout,
 };
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const STDIO_EXIT_GRACE: Duration = Duration::from_secs(2);
+const STDIO_KILL_GRACE: Duration = Duration::from_secs(5);
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+const MAX_SKIPPED_MESSAGES: usize = 1000;
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 fn relay_command(
     policy: &Policy,
@@ -145,6 +153,10 @@ struct Endpoint {
     path: String,
     timeout: Duration,
     run_as: Option<String>,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: Map<String, Value>,
+    handshake: String,
     actions: BTreeMap<String, Action>,
     compatibility: Option<Value>,
 }
@@ -322,6 +334,10 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
             "path",
             "timeout_s",
             "run_as",
+            "args",
+            "cwd",
+            "env",
+            "handshake",
             "compatibility",
             "actions",
         ],
@@ -334,9 +350,9 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("local_apis.{name}.transport is required"))?
         .to_owned();
-    if transport != "unix" {
+    if !matches!(transport.as_str(), "unix" | "stdio") {
         return Err(format!(
-            "local_apis.{name}.transport={transport:?} is unsupported; the Rust agent currently supports only unix"
+            "local_apis.{name}.transport must be unix or stdio, got {transport:?}"
         ));
     }
     let protocol = map
@@ -358,6 +374,72 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("local_apis.{name}.path is required"))?
         .to_owned();
+
+    if transport == "stdio" && protocol != "jsonrpc" {
+        return Err(format!(
+            "local_apis.{name} transport stdio needs protocol jsonrpc, got {protocol:?}"
+        ));
+    }
+    if transport == "stdio" && !Path::new(&path).is_absolute() {
+        return Err(format!(
+            "local_apis.{name} transport stdio needs an absolute path to the binary, got {path:?}"
+        ));
+    }
+    let scalar_text = |value: &Value| -> Option<String> {
+        match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
+    };
+    let args = match map.get("args") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) if values.iter().all(|value| scalar_text(value).is_some()) => {
+            values.iter().filter_map(&scalar_text).collect()
+        }
+        Some(_) => {
+            return Err(format!(
+                "local_apis.{name}.args must be a list of strings or numeric scalars"
+            ));
+        }
+    };
+    let cwd = match map.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if Path::new(value).is_absolute() => Some(PathBuf::from(value)),
+        Some(_) => return Err(format!("local_apis.{name}.cwd must be an absolute path")),
+    };
+    let env = match map.get("env") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(values))
+            if values.iter().all(|(key, value)| {
+                !key.is_empty() && !key.contains('=') && scalar_text(value).is_some()
+            }) =>
+        {
+            values
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        Value::String(scalar_text(value).unwrap_or_default()),
+                    )
+                })
+                .collect()
+        }
+        Some(_) => {
+            return Err(format!(
+                "local_apis.{name}.env must map variable names to strings or numeric scalars"
+            ));
+        }
+    };
+    let handshake = match map.get("handshake") {
+        None | Some(Value::Null) => "none".to_owned(),
+        Some(Value::String(value))
+            if matches!(value.trim().to_ascii_lowercase().as_str(), "none" | "mcp") =>
+        {
+            value.trim().to_ascii_lowercase()
+        }
+        Some(_) => return Err(format!("local_apis.{name}.handshake must be none or mcp")),
+    };
 
     let raw_actions = map
         .get("actions")
@@ -386,21 +468,27 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
     };
     let compatibility = valid_compatibility(map.get("compatibility"), &protocol)
         .map_err(|error| format!("local_apis.{name}.{error}"))?;
+    let run_as = match map.get("run_as") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => (!value.trim().is_empty()).then(|| value.trim().to_owned()),
+        Some(_) => return Err(format!("local_apis.{name}.run_as must be a string")),
+    };
+    if transport == "stdio" && run_as.is_some() && !env.is_empty() {
+        return Err(format!(
+            "local_apis.{name} sets both env and run_as; sudo would drop the variables"
+        ));
+    }
     Ok(Endpoint {
         name: name.to_owned(),
         transport,
         protocol,
         path,
         timeout: Duration::from_secs_f64(timeout_seconds),
-        run_as: match map.get("run_as") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(value)) => {
-                (!value.trim().is_empty()).then(|| value.trim().to_owned())
-            }
-            Some(_) => {
-                return Err(format!("local_apis.{name}.run_as must be a string"));
-            }
-        },
+        run_as,
+        args,
+        cwd,
+        env,
+        handshake,
         actions,
         compatibility,
     })
@@ -900,6 +988,369 @@ async fn call_jsonrpc(
     Ok(response.get("result").cloned().unwrap_or(response))
 }
 
+fn stdio_argv(policy: &Policy, endpoint: &Endpoint) -> Vec<String> {
+    let mut declared = Vec::with_capacity(endpoint.args.len() + 1);
+    declared.push(endpoint.path.clone());
+    declared.extend(endpoint.args.iter().cloned());
+    if let Some(user) = endpoint.run_as.as_deref() {
+        let mut argv = vec![
+            policy.tooling.command("sudo").display().to_string(),
+            "-n".into(),
+            "-u".into(),
+            user.into(),
+            "--".into(),
+        ];
+        argv.extend(declared);
+        argv
+    } else {
+        declared
+    }
+}
+
+fn configure_stdio_environment(
+    policy: &Policy,
+    endpoint: &Endpoint,
+    command: &mut Command,
+) -> Result<(), HandlerError> {
+    const POSIX_KEYS: &[&str] = &[
+        "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "USER", "LOGNAME",
+    ];
+    const WINDOWS_KEYS: &[&str] = &[
+        "PATHEXT",
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "COMPUTERNAME",
+        "USERNAME",
+    ];
+    command.env_clear();
+    command.env("PATH", policy.tooling.path_env()?);
+    let keys = if cfg!(windows) {
+        WINDOWS_KEYS
+    } else {
+        POSIX_KEYS
+    };
+    for key in keys {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    #[cfg(not(windows))]
+    if std::env::var_os("LANG").is_none() {
+        command.env("LANG", "C.UTF-8");
+    }
+    for (key, value) in &endpoint.env {
+        if let Some(value) = value.as_str() {
+            command.env(key, value);
+        }
+    }
+    Ok(())
+}
+
+fn stdio_binary_problem(path: &Path, run_as: bool) -> Option<(&'static str, String)> {
+    if !path.is_absolute() {
+        return Some((
+            "endpoint_unreachable",
+            format!("{} is not an absolute path", path.display()),
+        ));
+    }
+    let real = match path.canonicalize() {
+        Ok(real) => real,
+        Err(error) => {
+            return Some((
+                "endpoint_unreachable",
+                format!("cannot inspect {}: {error}", path.display()),
+            ));
+        }
+    };
+    let metadata = match std::fs::metadata(&real) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Some((
+                "endpoint_unreachable",
+                format!("cannot inspect {}: {error}", path.display()),
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        return Some((
+            "endpoint_unreachable",
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let replaceable = |metadata: &std::fs::Metadata| {
+            let mode = metadata.mode();
+            let world = mode & 0o002 != 0;
+            let group = mode & 0o020 != 0;
+            let sticky_dir = metadata.is_dir() && mode & 0o1000 != 0;
+            !sticky_dir && (world || group)
+        };
+        if replaceable(&metadata) {
+            return Some((
+                "unsafe_binary",
+                format!(
+                    "{} is writable by users other than its owner",
+                    real.display()
+                ),
+            ));
+        }
+        for directory in [real.parent(), path.parent()].into_iter().flatten() {
+            if let Ok(metadata) = std::fs::metadata(directory)
+                && replaceable(&metadata)
+            {
+                return Some((
+                    "unsafe_binary",
+                    format!(
+                        "{} can be replaced because {} is writable by other users",
+                        real.display(),
+                        directory.display()
+                    ),
+                ));
+            }
+        }
+        if !run_as && metadata.mode() & 0o111 == 0 {
+            return Some((
+                "endpoint_unreachable",
+                format!("{} is not executable", path.display()),
+            ));
+        }
+    }
+    None
+}
+
+async fn stdio_send(stdin: &mut ChildStdin, message: &Value) -> Result<(), HandlerError> {
+    let mut encoded = serde_json::to_vec(message)
+        .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
+    encoded.push(b'\n');
+    stdin.write_all(&encoded).await.map_err(|error| {
+        HandlerError::new("bad_response", format!("endpoint stdin closed: {error}"))
+    })
+}
+
+async fn stdio_receive(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    endpoint: &Endpoint,
+    want_id: &str,
+    total_bytes: &mut usize,
+) -> Result<Value, HandlerError> {
+    for _ in 0..=MAX_SKIPPED_MESSAGES {
+        let remaining = MAX_RESPONSE_BYTES.saturating_sub(*total_bytes);
+        if remaining == 0 {
+            return Err(HandlerError::new(
+                "too_large",
+                "stdio endpoint stdout exceeded the cap",
+            ));
+        }
+        let line = read_until_bounded(stdout, b'\n', remaining, "stdio JSON-RPC response").await?;
+        if line.is_empty() {
+            return Err(HandlerError::new(
+                "bad_response",
+                "endpoint exited before answering",
+            ));
+        }
+        *total_bytes = total_bytes.saturating_add(line.len());
+        let text = line
+            .iter()
+            .copied()
+            .skip_while(|byte| byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        if text.is_empty() {
+            continue;
+        }
+        let message: Value = serde_json::from_slice(&text).map_err(|_| {
+            HandlerError::new(
+                "bad_response",
+                format!("{} wrote non-JSON data to stdout", endpoint.name),
+            )
+        })?;
+        if message.get("id").and_then(Value::as_str) == Some(want_id)
+            && (message.get("result").is_some() || message.get("error").is_some())
+        {
+            return Ok(message);
+        }
+        if message.get("method").and_then(Value::as_str).is_some()
+            && let Some(id) = message.get("id").filter(|value| !value.is_null())
+        {
+            stdio_send(
+                stdin,
+                &json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "not supported by the SentinelX agent"},
+                }),
+            )
+            .await?;
+        }
+    }
+    Err(HandlerError::new(
+        "bad_response",
+        format!("{} sent too many messages without answering", endpoint.name),
+    ))
+}
+
+fn unwrap_jsonrpc(message: Value) -> Result<Value, HandlerError> {
+    if let Some(error) = message.get("error").filter(|value| !value.is_null()) {
+        return Err(HandlerError::new("endpoint_error", error.to_string()));
+    }
+    Ok(message.get("result").cloned().unwrap_or(message))
+}
+
+async fn stop_stdio_child(child: &mut Child, guard: &mut ProcessGroupGuard) -> Option<String> {
+    let exited = match timeout(STDIO_EXIT_GRACE, child.wait()).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => return Some(format!("failed waiting for stdio endpoint: {error}")),
+        Err(_) => false,
+    };
+    let cleanup_error = guard.kill().await;
+    if !exited && child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill().await;
+        let _ = timeout(STDIO_KILL_GRACE, child.wait()).await;
+    }
+    cleanup_error
+}
+
+async fn call_stdio_jsonrpc(
+    policy: &Policy,
+    endpoint: &Endpoint,
+    action: &Action,
+    params: &Map<String, Value>,
+) -> Result<Value, HandlerError> {
+    if let Some((code, message)) =
+        stdio_binary_problem(Path::new(&endpoint.path), endpoint.run_as.is_some())
+    {
+        return Err(HandlerError::new(code, message));
+    }
+    let argv = stdio_argv(policy, endpoint);
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    configure_stdio_environment(policy, endpoint, &mut command)?;
+    if let Some(cwd) = endpoint.cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|error| {
+        HandlerError::new(
+            "endpoint_unreachable",
+            format!("cannot start {}: {error}", endpoint.path),
+        )
+    })?;
+    let mut guard = ProcessGroupGuard::new(child.id(), ProcessGroupKill::Direct);
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HandlerError::new("internal_error", "missing stdio stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HandlerError::new("internal_error", "missing stdio stdout"))?;
+    let mut stdout = BufReader::new(stdout);
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| HandlerError::new("internal_error", "missing stdio stderr"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut tail = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            let read = match stderr.read(&mut buf).await {
+                Ok(read) => read,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+            tail.extend_from_slice(&buf[..read]);
+            if tail.len() > STDERR_TAIL_BYTES {
+                tail.drain(..tail.len() - STDERR_TAIL_BYTES);
+            }
+        }
+        tail
+    });
+    let conversation = async {
+        let mut total_bytes = 0_usize;
+        if endpoint.handshake == "mcp" {
+            let id = format!("sentinel-local-api-init-{:08x}", rand::random::<u32>());
+            stdio_send(&mut stdin, &json!({
+                "jsonrpc": "2.0", "id": id, "method": "initialize",
+                "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                    "clientInfo": {"name": "sentinelx-agent", "version": env!("CARGO_PKG_VERSION")}},
+            })).await?;
+            let reply =
+                stdio_receive(&mut stdin, &mut stdout, endpoint, &id, &mut total_bytes).await?;
+            unwrap_jsonrpc(reply).map_err(|error| {
+                HandlerError::new(
+                    "endpoint_error",
+                    format!("initialize was refused: {}", error.message),
+                )
+            })?;
+            stdio_send(
+                &mut stdin,
+                &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .await?;
+        }
+        let id = format!("sentinel-local-api-{:08x}", rand::random::<u32>());
+        stdio_send(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "id": id, "method": action.method, "params": params}),
+        )
+        .await?;
+        let reply = stdio_receive(&mut stdin, &mut stdout, endpoint, &id, &mut total_bytes).await?;
+        unwrap_jsonrpc(reply)
+    };
+    let result = match timeout(endpoint.timeout, conversation).await {
+        Ok(result) => result,
+        Err(_) => Err(HandlerError::new(
+            "timeout",
+            format!("{} did not answer in time", endpoint.name),
+        )),
+    };
+    drop(stdin);
+    let cleanup_error = stop_stdio_child(&mut child, &mut guard).await;
+    let stderr_tail = timeout(Duration::from_millis(500), stderr_task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    match result {
+        Ok(value) => Ok(value),
+        Err(mut error) => {
+            if !stderr_tail.is_empty() {
+                error.details.insert(
+                    "stderr_tail".into(),
+                    Value::String(String::from_utf8_lossy(&stderr_tail).trim().to_owned()),
+                );
+            }
+            if let Some(cleanup_error) = cleanup_error {
+                error
+                    .details
+                    .insert("cleanup_error".into(), Value::String(cleanup_error));
+            }
+            Err(error)
+        }
+    }
+}
+
 fn extract<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
     let mut current = data;
     for part in path.split('.') {
@@ -949,7 +1400,9 @@ async fn ensure_compatible(policy: &Policy, endpoint: &Endpoint) -> Result<(), H
         description: None,
         params_schema: None,
     };
-    let response = match if endpoint.protocol == "http" {
+    let response = match if endpoint.transport == "stdio" {
+        call_stdio_jsonrpc(policy, endpoint, &probe_action, &Map::new()).await
+    } else if endpoint.protocol == "http" {
         call_http(endpoint, &probe_action, &Map::new()).await
     } else {
         call_jsonrpc(policy, endpoint, &probe_action, &Map::new()).await
@@ -1023,7 +1476,9 @@ async fn call_action(
         )
     })?;
     ensure_compatible(policy, endpoint).await?;
-    let raw = match if endpoint.protocol == "http" {
+    let raw = match if endpoint.transport == "stdio" {
+        call_stdio_jsonrpc(policy, endpoint, action, params).await
+    } else if endpoint.protocol == "http" {
         call_http(endpoint, action, params).await
     } else {
         call_jsonrpc(policy, endpoint, action, params).await
@@ -1037,7 +1492,6 @@ async fn call_action(
 fn list_endpoints(endpoints: &BTreeMap<String, Endpoint>) -> BTreeMap<String, Value> {
     let listed = endpoints
         .values()
-        .filter(|endpoint| endpoint.transport == "unix")
         .map(|endpoint| {
             json!({
                 "name": endpoint.name,
@@ -1175,6 +1629,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use tempfile::tempdir;
 
     #[test]
     fn unknown_local_api_keys_fail_at_config_boundary() -> TestResult {
@@ -1317,6 +1772,10 @@ actions:
             path: socket.display().to_string(),
             timeout: Duration::from_secs(2),
             run_as: None,
+            args: Vec::new(),
+            cwd: None,
+            env: Map::new(),
+            handshake: "none".into(),
             actions: BTreeMap::new(),
             compatibility: None,
         };
@@ -1368,6 +1827,10 @@ actions:
             path: socket.display().to_string(),
             timeout: Duration::from_secs(2),
             run_as: None,
+            args: Vec::new(),
+            cwd: None,
+            env: Map::new(),
+            handshake: "none".into(),
             actions: BTreeMap::new(),
             compatibility: None,
         };
@@ -1392,6 +1855,120 @@ actions:
         let error = render("/containers/{id}/json", &Map::new()).test_error()?;
         assert_eq!(error.code, "missing_param");
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn stdio_fixture(mode: &str) -> TestResult<(tempfile::TempDir, Endpoint)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().test_value()?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .test_value()?;
+        let script = dir.path().join("server.py");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys
+mode = sys.argv[1]
+def read(): return json.loads(sys.stdin.readline())
+def out(v):
+    print(json.dumps(v), flush=True)
+if mode == 'mcp':
+    init = read()
+    out({'jsonrpc':'2.0','id':init['id'],'result':{'protocolVersion':init['params']['protocolVersion']}})
+    note = read()
+req = read()
+if mode == 'chatty':
+    out({'jsonrpc':'2.0','method':'notifications/progress','params':{}})
+    out({'jsonrpc':'2.0','id':99,'method':'ping'})
+    reply = read()
+    result = {'ping': reply['error']['code'], 'params': req['params'], 'argv': sys.argv[1:]}
+else:
+    result = {'params': req['params'], 'argv': sys.argv[1:]}
+out({'jsonrpc':'2.0','id':req['id'],'result':result})
+"#,
+        ).test_value()?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).test_value()?;
+        let endpoint = Endpoint {
+            name: "fixture".into(),
+            transport: "stdio".into(),
+            protocol: "jsonrpc".into(),
+            path: script.display().to_string(),
+            timeout: Duration::from_secs(5),
+            run_as: None,
+            args: vec![mode.into()],
+            cwd: None,
+            env: Map::new(),
+            handshake: if mode == "mcp" {
+                "mcp".into()
+            } else {
+                "none".into()
+            },
+            actions: BTreeMap::from([(
+                "echo".into(),
+                Action {
+                    request: None,
+                    method: Some("echo".into()),
+                    select: Vec::new(),
+                    description: None,
+                    params_schema: None,
+                },
+            )]),
+            compatibility: None,
+        };
+        Ok((dir, endpoint))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_round_trip_keeps_call_parameters_out_of_argv() -> TestResult {
+        let (_dir, endpoint) = stdio_fixture("echo")?;
+        let result = call_action(
+            &Policy::default(),
+            &endpoint,
+            "echo",
+            &Map::from_iter([("target".into(), Value::String("--evil; rm -rf /".into()))]),
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["params"]["target"], "--evil; rm -rf /");
+        assert_eq!(result["argv"], json!(["echo"]));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_mcp_handshake_and_server_requests_are_supported() -> TestResult {
+        let (_dir, endpoint) = stdio_fixture("mcp")?;
+        let result = call_action(&Policy::default(), &endpoint, "echo", &Map::new())
+            .await
+            .test_value()?;
+        assert_eq!(result["argv"], json!(["mcp"]));
+
+        let (_dir, endpoint) = stdio_fixture("chatty")?;
+        let result = call_action(&Policy::default(), &endpoint, "echo", &Map::new())
+            .await
+            .test_value()?;
+        assert_eq!(result["ping"], -32601);
+        Ok(())
+    }
+
+    #[test]
+    fn stdio_config_is_strict_about_protocol_paths_and_options() -> TestResult {
+        let good: yaml_serde::Value = yaml_serde::from_str(
+            "transport: stdio\nprotocol: jsonrpc\npath: /usr/bin/example\nargs: [--stdio, 7]\ncwd: /tmp\nenv: {PORT: 8080}\nhandshake: mcp\nactions:\n  x: {method: x}\n",
+        ).test_value()?;
+        let endpoint = endpoint_from_raw("x", &good).test_value()?;
+        assert_eq!(endpoint.args, ["--stdio", "7"]);
+        assert_eq!(endpoint.handshake, "mcp");
+        for bad in [
+            "transport: stdio\nprotocol: http\npath: /x\nactions:\n  x: {request: 'GET /'}\n",
+            "transport: stdio\nprotocol: jsonrpc\npath: relative\nactions:\n  x: {method: x}\n",
+            "transport: stdio\nprotocol: jsonrpc\npath: /x\nhandshake: nope\nactions:\n  x: {method: x}\n",
+        ] {
+            let raw: yaml_serde::Value = yaml_serde::from_str(bad).test_value()?;
+            assert!(endpoint_from_raw("x", &raw).is_err());
+        }
         Ok(())
     }
 }

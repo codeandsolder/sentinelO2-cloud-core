@@ -1,12 +1,9 @@
-use crate::AuthToken;
+use crate::{AuthToken, happy_eyeballs};
 use futures_util::StreamExt;
 use http::header::AUTHORIZATION;
 use std::time::Duration;
 use tokio::time::timeout;
-use tokio_tungstenite::{
-    connect_async_with_config,
-    tungstenite::{self, Message as WsMessage, client::IntoClientRequest},
-};
+use tokio_tungstenite::tungstenite::{self, Message as WsMessage, client::IntoClientRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreflightResult {
@@ -60,11 +57,7 @@ async fn verify_enrollment_with_timeouts(
     };
     request.headers_mut().insert(AUTHORIZATION, header);
 
-    let connected = timeout(
-        connect_timeout,
-        connect_async_with_config(request, None, false),
-    )
-    .await;
+    let connected = timeout(connect_timeout, happy_eyeballs::connect(request, None)).await;
     let (mut websocket, _) = match connected {
         Err(_) => return PreflightResult::failed("unreachable", "connection timed out"),
         Ok(Err(tungstenite::Error::Io(error))) => {

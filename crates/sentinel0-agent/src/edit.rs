@@ -57,6 +57,25 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
             format!("mode must be one of: {}", MODES.join(", ")),
         ));
     }
+    if payload
+        .get("secret")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && (payload
+            .get("diff")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || payload
+                .get("create")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || payload.get("backup_dir").is_some())
+    {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            "secret edits take no diff, create or backup_dir",
+        ));
+    }
     if payload.get("validator").is_some_and(Value::is_string)
         && payload
             .get("validator_preset")
@@ -863,7 +882,15 @@ fn apply_edit(
     {
         return Ok((None, false));
     }
-    let backup = if target.existed {
+    let secret = payload
+        .get("secret")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let no_backup = payload
+        .get("no_backup")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let backup = if target.existed && !secret && !no_backup {
         let backup = backup_path(
             &target.path,
             payload.get("backup_dir").and_then(Value::as_str),
@@ -1252,6 +1279,57 @@ mod tests {
             fs::read_to_string(&path).test_value()?,
             "[Unit]\nDescription=old\n[Service]\nType=oneshot\nExecStart=/bin/true\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn secret_edit_writes_without_backup_or_diff_and_rejects_leaky_options() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let path = dir.path().join("secret.env");
+        fs::write(&path, "TOKEN=old\n").test_value()?;
+        let result = edit(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(path.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                ("new_text".into(), Value::String("TOKEN=new\n".into())),
+                ("secret".into(), Value::Bool(true)),
+            ]),
+        )
+        .test_value()?;
+        assert_eq!(fs::read_to_string(&path).test_value()?, "TOKEN=new\n");
+        assert!(result.get("backup").is_none());
+        assert!(result.get("diff").is_none());
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .test_value()?
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains(".bak."))
+                .count(),
+            0
+        );
+
+        for (key, value) in [
+            ("diff", Value::Bool(true)),
+            ("create", Value::Bool(true)),
+            (
+                "backup_dir",
+                Value::String(dir.path().display().to_string()),
+            ),
+        ] {
+            let error = edit(
+                &policy(dir.path()),
+                &Map::from_iter([
+                    ("path".into(), Value::String(path.display().to_string())),
+                    ("mode".into(), Value::String("write".into())),
+                    ("new_text".into(), Value::String("TOKEN=x\n".into())),
+                    ("secret".into(), Value::Bool(true)),
+                    (key.into(), value),
+                ]),
+            )
+            .test_error()?;
+            assert_eq!(error.code, "invalid_payload");
+        }
         Ok(())
     }
 }

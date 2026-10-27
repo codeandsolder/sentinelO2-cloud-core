@@ -6,8 +6,8 @@ the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
 - `pensados/sentinelx-cloud-protocol` protocol package 1.13.2.
-- `pensados/sentinelx-cloud-core` 0.23.28 behavior at reviewed upstream commit
-  `63bd5ba686b4de8084ccee78fb16223e422e44e0`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-core` 0.23.34 behavior at reviewed upstream commit
+  `b4207d6149d95f2d3cc9b219d4e617c365b76fda`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -126,7 +126,8 @@ Reference surfaces:
   matches result, while unreadable nested directories/files make list/search
   results explicitly `partial`, with bounded `unreadable_dirs` evidence and a
   warning that absence was not proven.
-- Applicable Linux/cross-platform behavior through upstream 0.23.28 is
+- Upstream 0.23.29–0.23.34 parity adds fresh edit mtimes, writable-handle cross-filesystem upload finalization, stdio JSON-RPC/MCP local APIs with fixed argv and bounded child cleanup, 250 ms Happy-Eyeballs address racing for both normal and enrollment connections, secret edits with backup/diff/audit suppression, and fail-closed exec concessions including empty-allowlist deny-all, relative file operands, file-reading options and redirections.
+- Applicable Linux/cross-platform behavior through upstream 0.23.34 is
   matched. This includes host-valid config-edit guidance; `exec_mode`
   (`allowlist` by default, `strict`, `unrestricted`); whole-word command
   matching and full chain authorization; strict shell grammar/substitution/

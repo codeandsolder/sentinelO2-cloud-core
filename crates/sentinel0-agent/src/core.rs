@@ -145,12 +145,16 @@ impl CoreDispatcher {
 
     #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
-        Op::ALL
+        let mut capabilities = Op::ALL
             .iter()
             .filter(|op| self.op_enabled(**op))
             .map(|op| op.as_str().to_owned())
             .chain(std::iter::once("opaque_ref".into()))
-            .collect()
+            .collect::<Vec<_>>();
+        if self.op_enabled(Op::Edit) {
+            capabilities.push("edit_secret".into());
+        }
+        capabilities
     }
 
     fn op_enabled(&self, op: Op) -> bool {
@@ -275,7 +279,7 @@ impl CoreDispatcher {
         let mut ops = self
             .capabilities()
             .into_iter()
-            .filter(|name| name != "opaque_ref")
+            .filter(|name| !matches!(name.as_str(), "opaque_ref" | "edit_secret"))
             .collect::<Vec<_>>();
         ops.sort();
         ops
@@ -907,6 +911,18 @@ impl CoreDispatcher {
     }
 
     fn validate_exec_policy(&self, command: &str) -> Result<(), HandlerError> {
+        if self.policy.exec_mode != ExecMode::Unrestricted
+            && self.policy.allowed_commands.is_empty()
+        {
+            return Err(HandlerError::with_details(
+                "command_not_allowed",
+                "allowed_commands is empty for this host, so exec is deny-all and runs no command",
+                Map::from_iter([
+                    ("command".into(), Value::String(command.into())),
+                    ("allowed_commands".into(), Value::Array(Vec::new())),
+                ]),
+            ));
+        }
         match self.policy.exec_mode {
             ExecMode::Unrestricted => {}
             ExecMode::Strict => {
@@ -1474,7 +1490,7 @@ mod tests {
         assert_eq!(
             capabilities
                 .iter()
-                .filter(|name| name.as_str() != "opaque_ref")
+                .filter(|name| !matches!(name.as_str(), "opaque_ref" | "edit_secret"))
                 .count(),
             Op::ALL.len()
         );
@@ -1961,5 +1977,51 @@ mod tests {
         assert!(result.contains_key("returncode"));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_exec_allowlist_is_deny_all_even_for_concession_commands() -> TestResult {
+        for mode in [ExecMode::Allowlist, ExecMode::Strict] {
+            let dispatcher = CoreDispatcher::new(
+                Policy {
+                    exec_mode: mode,
+                    allowed_commands: Vec::new(),
+                    ..Policy::default()
+                },
+                PathBuf::from("/tmp/config.yaml"),
+                "test",
+            );
+            let error = dispatcher
+                .validate_exec_policy("printf harmless")
+                .test_error()?;
+            assert_eq!(error.code, "command_not_allowed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn edit_secret_is_advertised_only_when_edit_is_enabled() {
+        let enabled =
+            CoreDispatcher::new(Policy::default(), PathBuf::from("/tmp/config.yaml"), "test");
+        assert!(
+            enabled
+                .capabilities()
+                .iter()
+                .any(|name| name == "edit_secret")
+        );
+        let disabled = CoreDispatcher::new(
+            Policy {
+                disabled_ops: std::collections::BTreeSet::from(["edit".into()]),
+                ..Policy::default()
+            },
+            PathBuf::from("/tmp/config.yaml"),
+            "test",
+        );
+        assert!(
+            !disabled
+                .capabilities()
+                .iter()
+                .any(|name| name == "edit_secret")
+        );
     }
 }

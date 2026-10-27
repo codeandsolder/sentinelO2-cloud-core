@@ -433,10 +433,6 @@ fn only_assignments(simple: &SimpleCommand) -> bool {
             .all(|item| matches!(item, CommandPrefixOrSuffixItem::AssignmentWord(_, _)))
 }
 
-fn looks_like_path(token: &str) -> bool {
-    token.starts_with('/') || token.starts_with('~') || token.contains('/')
-}
-
 fn option_takes_value(name: &str, option: &str) -> bool {
     match name {
         "head" | "tail" => matches!(option, "-n" | "-c"),
@@ -452,15 +448,35 @@ fn option_takes_value(name: &str, option: &str) -> bool {
     }
 }
 
+fn file_option(name: &str, option: &str) -> bool {
+    match name {
+        "grep" | "egrep" | "fgrep" => matches!(option, "-f" | "--file"),
+        "rg" => matches!(
+            option,
+            "-f" | "--file" | "--pre" | "--pre-glob" | "--hostname-bin"
+        ),
+        "wc" | "sort" => option == "--files0-from",
+        "date" => matches!(option, "-f" | "--file"),
+        _ => false,
+    }
+}
+
 fn filter_unsafe(name: &str, arguments: &[String], has_unsafe_redirection: bool) -> bool {
     if has_unsafe_redirection {
         return true;
     }
     if arguments.iter().any(|token| {
         let head = token.split('=').next().unwrap_or(token);
-        name == "sort" && matches!(head, "-o" | "--output" | "--compress-program" | "-S")
+        file_option(name, head)
+            || (name == "sort" && matches!(head, "-o" | "--output" | "--compress-program" | "-S"))
     }) {
         return true;
+    }
+    if matches!(
+        name,
+        "tr" | "echo" | "printf" | "true" | "false" | "seq" | "date"
+    ) {
+        return false;
     }
     let mut operands = Vec::new();
     let mut expecting_value = false;
@@ -484,7 +500,7 @@ fn filter_unsafe(name: &str, arguments: &[String], has_unsafe_redirection: bool)
     if matches!(name, "grep" | "egrep" | "fgrep" | "rg") && !operands.is_empty() {
         operands.remove(0);
     }
-    operands.into_iter().any(looks_like_path)
+    !operands.is_empty()
 }
 
 fn push_before_nested(analysis: &mut Analysis, nested_start: usize, command: CommandInfo) {
@@ -744,6 +760,9 @@ fn first_unauthorised(policy: &Policy, analysis: Analysis, chain: bool) -> Optio
         }
         let name = command.program.as_str();
         if POSITION_FREE.contains(&name) || (chain && SAFE_BUILTINS.contains(&name)) {
+            if command.has_unsafe_redirection {
+                return Some(command.rendered);
+            }
             continue;
         }
         if command.filter_position && READ_ONLY_FILTERS.contains(&name) {
@@ -957,5 +976,37 @@ mod tests {
             Ok(Some("id".into()))
         );
         assert!(unauthorised_chain(&policy, "cat <<EOF\nmissing terminator").is_err());
+    }
+
+    #[test]
+    fn concessions_cannot_read_relative_files_or_hide_file_inputs_in_options() {
+        let policy = policy(&["make"]);
+        assert_eq!(
+            unauthorised_chain(&policy, "make | cat secret.txt"),
+            Ok(Some("cat secret.txt".into()))
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "make | grep -f patterns needle"),
+            Ok(Some("grep -f patterns needle".into()))
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "make | rg --file=patterns needle"),
+            Ok(Some("rg --file=patterns needle".into()))
+        );
+        assert_eq!(unauthorised_chain(&policy, "make | cat"), Ok(None));
+        assert_eq!(unauthorised_chain(&policy, "make | printf done"), Ok(None));
+    }
+
+    #[test]
+    fn concession_segments_cannot_redirect_to_files() {
+        let policy = policy(&["make"]);
+        assert_eq!(
+            unauthorised_chain(&policy, "make && cd . > result.txt"),
+            Ok(Some("cd . > result.txt".into()))
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "make | printf done > result.txt"),
+            Ok(Some("printf done > result.txt".into()))
+        );
     }
 }
