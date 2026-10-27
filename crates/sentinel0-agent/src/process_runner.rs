@@ -115,14 +115,14 @@ impl ProcessGroupKill {
 }
 
 #[derive(Debug)]
-pub(crate) struct ProcessGroupGuard {
+pub struct ProcessGroupGuard {
     pid: Option<u32>,
     killer: ProcessGroupKill,
     armed: bool,
 }
 
 impl ProcessGroupGuard {
-    pub(crate) const fn new(pid: Option<u32>, killer: ProcessGroupKill) -> Self {
+    pub const fn new(pid: Option<u32>, killer: ProcessGroupKill) -> Self {
         Self {
             pid,
             killer,
@@ -130,11 +130,11 @@ impl ProcessGroupGuard {
         }
     }
 
-    pub(crate) const fn disarm(&mut self) {
+    pub const fn disarm(&mut self) {
         self.armed = false;
     }
 
-    pub(crate) async fn kill(&mut self) -> Option<String> {
+    pub async fn kill(&mut self) -> Option<String> {
         let error = self.killer.kill(self.pid).await;
         self.armed = false;
         error

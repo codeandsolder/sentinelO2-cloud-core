@@ -18,7 +18,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     time::timeout,
 };
 
@@ -143,6 +143,14 @@ struct Action {
     select: Vec<String>,
     description: Option<String>,
     params_schema: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct EndpointProcessOptions {
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: Map<String, Value>,
+    handshake: String,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +329,172 @@ fn parse_action(
     })
 }
 
+fn scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn required_endpoint_text(
+    name: &str,
+    map: &Map<String, Value>,
+    field: &str,
+) -> Result<String, String> {
+    map.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("local_apis.{name}.{field} is required"))
+}
+
+fn parse_endpoint_basics(
+    name: &str,
+    map: &Map<String, Value>,
+) -> Result<(String, String, String), String> {
+    let transport = required_endpoint_text(name, map, "transport")?;
+    if !matches!(transport.as_str(), "unix" | "stdio") {
+        return Err(format!(
+            "local_apis.{name}.transport must be unix or stdio, got {transport:?}"
+        ));
+    }
+    let protocol = required_endpoint_text(name, map, "protocol")?;
+    if !matches!(protocol.as_str(), "http" | "jsonrpc") {
+        return Err(format!(
+            "local_apis.{name}.protocol must be http or jsonrpc, got {protocol:?}"
+        ));
+    }
+    let path = required_endpoint_text(name, map, "path")?;
+    if transport == "stdio" && protocol != "jsonrpc" {
+        return Err(format!(
+            "local_apis.{name} transport stdio needs protocol jsonrpc, got {protocol:?}"
+        ));
+    }
+    if transport == "stdio" && !Path::new(&path).is_absolute() {
+        return Err(format!(
+            "local_apis.{name} transport stdio needs an absolute path to the binary, got {path:?}"
+        ));
+    }
+    Ok((transport, protocol, path))
+}
+
+fn parse_endpoint_args(name: &str, map: &Map<String, Value>) -> Result<Vec<String>, String> {
+    match map.get("args") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                scalar_text(value).ok_or_else(|| {
+                    format!("local_apis.{name}.args must be a list of strings or numeric scalars")
+                })
+            })
+            .collect(),
+        Some(_) => Err(format!(
+            "local_apis.{name}.args must be a list of strings or numeric scalars"
+        )),
+    }
+}
+
+fn parse_endpoint_env(name: &str, map: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+    match map.get("env") {
+        None | Some(Value::Null) => Ok(Map::new()),
+        Some(Value::Object(values)) => values
+            .iter()
+            .map(|(key, value)| {
+                if key.is_empty() || key.contains('=') {
+                    return Err(format!(
+                        "local_apis.{name}.env must map variable names to strings or numeric scalars"
+                    ));
+                }
+                scalar_text(value)
+                    .map(|value| (key.clone(), Value::String(value)))
+                    .ok_or_else(|| {
+                        format!(
+                            "local_apis.{name}.env must map variable names to strings or numeric scalars"
+                        )
+                    })
+            })
+            .collect(),
+        Some(_) => Err(format!(
+            "local_apis.{name}.env must map variable names to strings or numeric scalars"
+        )),
+    }
+}
+
+fn parse_endpoint_process_options(
+    name: &str,
+    map: &Map<String, Value>,
+) -> Result<EndpointProcessOptions, String> {
+    let args = parse_endpoint_args(name, map)?;
+    let cwd = match map.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if Path::new(value).is_absolute() => Some(PathBuf::from(value)),
+        Some(_) => return Err(format!("local_apis.{name}.cwd must be an absolute path")),
+    };
+    let env = parse_endpoint_env(name, map)?;
+    let handshake = match map.get("handshake") {
+        None | Some(Value::Null) => "none".to_owned(),
+        Some(Value::String(value))
+            if matches!(value.trim().to_ascii_lowercase().as_str(), "none" | "mcp") =>
+        {
+            value.trim().to_ascii_lowercase()
+        }
+        Some(_) => return Err(format!("local_apis.{name}.handshake must be none or mcp")),
+    };
+    Ok(EndpointProcessOptions {
+        args,
+        cwd,
+        env,
+        handshake,
+    })
+}
+
+fn parse_endpoint_actions(
+    name: &str,
+    map: &Map<String, Value>,
+    protocol: &str,
+) -> Result<BTreeMap<String, Action>, String> {
+    let raw_actions = map
+        .get("actions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("local_apis.{name}.actions must be an object"))?;
+    if raw_actions.is_empty() {
+        return Err(format!("local_apis.{name}.actions must not be empty"));
+    }
+    raw_actions
+        .iter()
+        .map(|(action_name, raw_action)| {
+            parse_action(name, action_name, raw_action, protocol)
+                .map(|action| (action_name.clone(), action))
+        })
+        .collect()
+}
+
+fn parse_endpoint_timeout(name: &str, map: &Map<String, Value>) -> Result<Duration, String> {
+    let seconds = match map.get("timeout_s") {
+        None | Some(Value::Null) => 30.0,
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.1 && *value <= 300.0)
+            .ok_or_else(|| {
+                format!("local_apis.{name}.timeout_s must be between 0.1 and 300 seconds")
+            })?,
+    };
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_endpoint_run_as(name: &str, map: &Map<String, Value>) -> Result<Option<String>, String> {
+    match map.get("run_as") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            Ok((!value.trim().is_empty()).then(|| value.trim().to_owned()))
+        }
+        Some(_) => Err(format!("local_apis.{name}.run_as must be a string")),
+    }
+}
+
 fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, String> {
     let value = yaml_to_json(raw)?;
     let map = value
@@ -343,137 +517,14 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
         ],
         &format!("local_apis.{name}"),
     )?;
-    let transport = map
-        .get("transport")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("local_apis.{name}.transport is required"))?
-        .to_owned();
-    if !matches!(transport.as_str(), "unix" | "stdio") {
-        return Err(format!(
-            "local_apis.{name}.transport must be unix or stdio, got {transport:?}"
-        ));
-    }
-    let protocol = map
-        .get("protocol")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("local_apis.{name}.protocol is required"))?
-        .to_owned();
-    if !matches!(protocol.as_str(), "http" | "jsonrpc") {
-        return Err(format!(
-            "local_apis.{name}.protocol must be http or jsonrpc, got {protocol:?}"
-        ));
-    }
-    let path = map
-        .get("path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("local_apis.{name}.path is required"))?
-        .to_owned();
-
-    if transport == "stdio" && protocol != "jsonrpc" {
-        return Err(format!(
-            "local_apis.{name} transport stdio needs protocol jsonrpc, got {protocol:?}"
-        ));
-    }
-    if transport == "stdio" && !Path::new(&path).is_absolute() {
-        return Err(format!(
-            "local_apis.{name} transport stdio needs an absolute path to the binary, got {path:?}"
-        ));
-    }
-    let scalar_text = |value: &Value| -> Option<String> {
-        match value {
-            Value::String(value) => Some(value.clone()),
-            Value::Number(value) => Some(value.to_string()),
-            _ => None,
-        }
-    };
-    let args = match map.get("args") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(values)) if values.iter().all(|value| scalar_text(value).is_some()) => {
-            values.iter().filter_map(&scalar_text).collect()
-        }
-        Some(_) => {
-            return Err(format!(
-                "local_apis.{name}.args must be a list of strings or numeric scalars"
-            ));
-        }
-    };
-    let cwd = match map.get("cwd") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) if Path::new(value).is_absolute() => Some(PathBuf::from(value)),
-        Some(_) => return Err(format!("local_apis.{name}.cwd must be an absolute path")),
-    };
-    let env = match map.get("env") {
-        None | Some(Value::Null) => Map::new(),
-        Some(Value::Object(values))
-            if values.iter().all(|(key, value)| {
-                !key.is_empty() && !key.contains('=') && scalar_text(value).is_some()
-            }) =>
-        {
-            values
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        Value::String(scalar_text(value).unwrap_or_default()),
-                    )
-                })
-                .collect()
-        }
-        Some(_) => {
-            return Err(format!(
-                "local_apis.{name}.env must map variable names to strings or numeric scalars"
-            ));
-        }
-    };
-    let handshake = match map.get("handshake") {
-        None | Some(Value::Null) => "none".to_owned(),
-        Some(Value::String(value))
-            if matches!(value.trim().to_ascii_lowercase().as_str(), "none" | "mcp") =>
-        {
-            value.trim().to_ascii_lowercase()
-        }
-        Some(_) => return Err(format!("local_apis.{name}.handshake must be none or mcp")),
-    };
-
-    let raw_actions = map
-        .get("actions")
-        .and_then(Value::as_object)
-        .ok_or_else(|| format!("local_apis.{name}.actions must be an object"))?;
-    if raw_actions.is_empty() {
-        return Err(format!("local_apis.{name}.actions must not be empty"));
-    }
-
-    let actions = raw_actions
-        .iter()
-        .map(|(action_name, raw_action)| {
-            parse_action(name, action_name, raw_action, &protocol)
-                .map(|action| (action_name.clone(), action))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-
-    let timeout_seconds = match map.get("timeout_s") {
-        None | Some(Value::Null) => 30.0,
-        Some(value) => value
-            .as_f64()
-            .filter(|value| value.is_finite() && *value >= 0.1 && *value <= 300.0)
-            .ok_or_else(|| {
-                format!("local_apis.{name}.timeout_s must be between 0.1 and 300 seconds")
-            })?,
-    };
+    let (transport, protocol, path) = parse_endpoint_basics(name, map)?;
+    let process = parse_endpoint_process_options(name, map)?;
+    let actions = parse_endpoint_actions(name, map, &protocol)?;
+    let timeout = parse_endpoint_timeout(name, map)?;
     let compatibility = valid_compatibility(map.get("compatibility"), &protocol)
         .map_err(|error| format!("local_apis.{name}.{error}"))?;
-    let run_as = match map.get("run_as") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) => (!value.trim().is_empty()).then(|| value.trim().to_owned()),
-        Some(_) => return Err(format!("local_apis.{name}.run_as must be a string")),
-    };
-    if transport == "stdio" && run_as.is_some() && !env.is_empty() {
+    let run_as = parse_endpoint_run_as(name, map)?;
+    if transport == "stdio" && run_as.is_some() && !process.env.is_empty() {
         return Err(format!(
             "local_apis.{name} sets both env and run_as; sudo would drop the variables"
         ));
@@ -483,12 +534,12 @@ fn endpoint_from_raw(name: &str, raw: &yaml_serde::Value) -> Result<Endpoint, St
         transport,
         protocol,
         path,
-        timeout: Duration::from_secs_f64(timeout_seconds),
+        timeout,
         run_as,
-        args,
-        cwd,
-        env,
-        handshake,
+        args: process.args,
+        cwd: process.cwd,
+        env: process.env,
+        handshake: process.handshake,
         actions,
         compatibility,
     })
@@ -1091,11 +1142,25 @@ fn stdio_binary_problem(path: &Path, run_as: bool) -> Option<(&'static str, Stri
     }
     #[cfg(unix)]
     {
+        use nix::unistd::{Gid, Group, Uid, User};
         use std::os::unix::fs::MetadataExt as _;
+        let private_group = |metadata: &std::fs::Metadata| {
+            let uid = Uid::from_raw(metadata.uid());
+            let gid = Gid::from_raw(metadata.gid());
+            let Ok(Some(user)) = User::from_uid(uid) else {
+                return false;
+            };
+            let Ok(Some(group)) = Group::from_gid(gid) else {
+                return false;
+            };
+            group.name == user.name
+                && user.gid == gid
+                && group.mem.iter().all(|member| member == &user.name)
+        };
         let replaceable = |metadata: &std::fs::Metadata| {
             let mode = metadata.mode();
             let world = mode & 0o002 != 0;
-            let group = mode & 0o020 != 0;
+            let group = mode & 0o020 != 0 && !private_group(metadata);
             let sticky_dir = metadata.is_dir() && mode & 0o1000 != 0;
             !sticky_dir && (world || group)
         };
@@ -1167,7 +1232,7 @@ async fn stdio_receive(
         let text = line
             .iter()
             .copied()
-            .skip_while(|byte| byte.is_ascii_whitespace())
+            .skip_while(u8::is_ascii_whitespace)
             .collect::<Vec<_>>();
         if text.is_empty() {
             continue;
@@ -1209,18 +1274,112 @@ fn unwrap_jsonrpc(message: Value) -> Result<Value, HandlerError> {
     Ok(message.get("result").cloned().unwrap_or(message))
 }
 
-async fn stop_stdio_child(child: &mut Child, guard: &mut ProcessGroupGuard) -> Option<String> {
-    let exited = match timeout(STDIO_EXIT_GRACE, child.wait()).await {
-        Ok(Ok(_)) => true,
-        Ok(Err(error)) => return Some(format!("failed waiting for stdio endpoint: {error}")),
-        Err(_) => false,
+async fn stop_stdio_child(
+    child: &mut Child,
+    guard: &mut ProcessGroupGuard,
+) -> (Option<String>, Option<i32>) {
+    let (exited, mut exit_code) = match timeout(STDIO_EXIT_GRACE, child.wait()).await {
+        Ok(Ok(status)) => (true, status.code()),
+        Ok(Err(error)) => {
+            return (
+                Some(format!("failed waiting for stdio endpoint: {error}")),
+                None,
+            );
+        }
+        Err(_) => (false, None),
     };
     let cleanup_error = guard.kill().await;
     if !exited && child.try_wait().ok().flatten().is_none() {
         let _ = child.kill().await;
-        let _ = timeout(STDIO_KILL_GRACE, child.wait()).await;
+        if let Ok(Ok(status)) = timeout(STDIO_KILL_GRACE, child.wait()).await {
+            exit_code = status.code();
+        }
     }
-    cleanup_error
+    (cleanup_error, exit_code)
+}
+
+async fn read_stderr_tail(mut stderr: ChildStderr) -> Vec<u8> {
+    let mut tail = Vec::new();
+    let mut buf = [0_u8; 4096];
+    while let Ok(read) = stderr.read(&mut buf).await {
+        if read == 0 {
+            break;
+        }
+        tail.extend_from_slice(&buf[..read]);
+        if tail.len() > STDERR_TAIL_BYTES {
+            tail.drain(..tail.len() - STDERR_TAIL_BYTES);
+        }
+    }
+    tail
+}
+
+async fn stdio_conversation(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    endpoint: &Endpoint,
+    action: &Action,
+    params: &Map<String, Value>,
+) -> Result<Value, HandlerError> {
+    let mut total_bytes = 0_usize;
+    if endpoint.handshake == "mcp" {
+        let id = format!("sentinel-local-api-init-{:08x}", rand::random::<u32>());
+        stdio_send(
+            stdin,
+            &json!({
+                "jsonrpc": "2.0", "id": id, "method": "initialize",
+                "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                    "clientInfo": {"name": "sentinelx-agent", "version": env!("CARGO_PKG_VERSION")}},
+            }),
+        )
+        .await?;
+        let reply = stdio_receive(stdin, stdout, endpoint, &id, &mut total_bytes).await?;
+        unwrap_jsonrpc(reply).map_err(|error| {
+            HandlerError::new(
+                "endpoint_error",
+                format!("initialize was refused: {}", error.message),
+            )
+        })?;
+        stdio_send(
+            stdin,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await?;
+    }
+    let id = format!("sentinel-local-api-{:08x}", rand::random::<u32>());
+    stdio_send(
+        stdin,
+        &json!({"jsonrpc": "2.0", "id": id, "method": action.method, "params": params}),
+    )
+    .await?;
+    let reply = stdio_receive(stdin, stdout, endpoint, &id, &mut total_bytes).await?;
+    unwrap_jsonrpc(reply)
+}
+
+fn add_stdio_error_context(
+    mut error: HandlerError,
+    stderr_tail: &[u8],
+    cleanup_error: Option<String>,
+    exit_code: Option<i32>,
+) -> HandlerError {
+    if !stderr_tail.is_empty() {
+        error.details.insert(
+            "stderr_tail".into(),
+            Value::String(String::from_utf8_lossy(stderr_tail).trim().to_owned()),
+        );
+    }
+    if let Some(cleanup_error) = cleanup_error {
+        error
+            .details
+            .insert("cleanup_error".into(), Value::String(cleanup_error));
+    }
+    if error.code == "bad_response"
+        && let Some(exit_code) = exit_code
+    {
+        error
+            .details
+            .insert("exit_code".into(), Value::from(exit_code));
+    }
+    error
 }
 
 async fn call_stdio_jsonrpc(
@@ -1264,91 +1423,30 @@ async fn call_stdio_jsonrpc(
         .take()
         .ok_or_else(|| HandlerError::new("internal_error", "missing stdio stdout"))?;
     let mut stdout = BufReader::new(stdout);
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| HandlerError::new("internal_error", "missing stdio stderr"))?;
-    let stderr_task = tokio::spawn(async move {
-        let mut tail = Vec::new();
-        let mut buf = [0_u8; 4096];
-        loop {
-            let read = match stderr.read(&mut buf).await {
-                Ok(read) => read,
-                Err(_) => break,
-            };
-            if read == 0 {
-                break;
-            }
-            tail.extend_from_slice(&buf[..read]);
-            if tail.len() > STDERR_TAIL_BYTES {
-                tail.drain(..tail.len() - STDERR_TAIL_BYTES);
-            }
-        }
-        tail
-    });
-    let conversation = async {
-        let mut total_bytes = 0_usize;
-        if endpoint.handshake == "mcp" {
-            let id = format!("sentinel-local-api-init-{:08x}", rand::random::<u32>());
-            stdio_send(&mut stdin, &json!({
-                "jsonrpc": "2.0", "id": id, "method": "initialize",
-                "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
-                    "clientInfo": {"name": "sentinelx-agent", "version": env!("CARGO_PKG_VERSION")}},
-            })).await?;
-            let reply =
-                stdio_receive(&mut stdin, &mut stdout, endpoint, &id, &mut total_bytes).await?;
-            unwrap_jsonrpc(reply).map_err(|error| {
-                HandlerError::new(
-                    "endpoint_error",
-                    format!("initialize was refused: {}", error.message),
-                )
-            })?;
-            stdio_send(
-                &mut stdin,
-                &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            )
-            .await?;
-        }
-        let id = format!("sentinel-local-api-{:08x}", rand::random::<u32>());
-        stdio_send(
-            &mut stdin,
-            &json!({"jsonrpc": "2.0", "id": id, "method": action.method, "params": params}),
-        )
-        .await?;
-        let reply = stdio_receive(&mut stdin, &mut stdout, endpoint, &id, &mut total_bytes).await?;
-        unwrap_jsonrpc(reply)
-    };
-    let result = match timeout(endpoint.timeout, conversation).await {
-        Ok(result) => result,
-        Err(_) => Err(HandlerError::new(
+    let stderr_task = tokio::spawn(read_stderr_tail(stderr));
+    let result = timeout(
+        endpoint.timeout,
+        stdio_conversation(&mut stdin, &mut stdout, endpoint, action, params),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(HandlerError::new(
             "timeout",
             format!("{} did not answer in time", endpoint.name),
-        )),
-    };
+        ))
+    });
     drop(stdin);
-    let cleanup_error = stop_stdio_child(&mut child, &mut guard).await;
+    let (cleanup_error, exit_code) = stop_stdio_child(&mut child, &mut guard).await;
     let stderr_tail = timeout(Duration::from_millis(500), stderr_task)
         .await
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
-    match result {
-        Ok(value) => Ok(value),
-        Err(mut error) => {
-            if !stderr_tail.is_empty() {
-                error.details.insert(
-                    "stderr_tail".into(),
-                    Value::String(String::from_utf8_lossy(&stderr_tail).trim().to_owned()),
-                );
-            }
-            if let Some(cleanup_error) = cleanup_error {
-                error
-                    .details
-                    .insert("cleanup_error".into(), Value::String(cleanup_error));
-            }
-            Err(error)
-        }
-    }
+    result.map_err(|error| add_stdio_error_context(error, &stderr_tail, cleanup_error, exit_code))
 }
 
 fn extract<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
@@ -1867,26 +1965,41 @@ actions:
         let script = dir.path().join("server.py");
         std::fs::write(
             &script,
-            r#"#!/usr/bin/env python3
-import json, sys
+            r"#!/usr/bin/env python3
+import json, os, subprocess, sys, time
 mode = sys.argv[1]
 def read(): return json.loads(sys.stdin.readline())
 def out(v):
     print(json.dumps(v), flush=True)
+if mode == 'exit_early':
+    print('boom: no config file', file=sys.stderr, flush=True)
+    sys.exit(3)
+if mode == 'hang':
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
+    with open(os.environ['PIDFILE'], 'w') as f:
+        f.write(f'{os.getpid()} {child.pid}')
+    time.sleep(600)
 if mode == 'mcp':
     init = read()
     out({'jsonrpc':'2.0','id':init['id'],'result':{'protocolVersion':init['params']['protocolVersion']}})
     note = read()
 req = read()
+if mode == 'huge':
+    out({'jsonrpc':'2.0','id':req['id'],'result':'x' * (9 * 1024 * 1024)})
+    sys.exit(0)
 if mode == 'chatty':
     out({'jsonrpc':'2.0','method':'notifications/progress','params':{}})
     out({'jsonrpc':'2.0','id':99,'method':'ping'})
     reply = read()
     result = {'ping': reply['error']['code'], 'params': req['params'], 'argv': sys.argv[1:]}
+elif mode == 'env':
+    result = {'params': req['params'], 'argv': sys.argv[1:],
+              'declared': os.environ.get('DECLARED_ONLY'),
+              'leak': os.environ.get('CARGO_MANIFEST_DIR')}
 else:
     result = {'params': req['params'], 'argv': sys.argv[1:]}
 out({'jsonrpc':'2.0','id':req['id'],'result':result})
-"#,
+",
         ).test_value()?;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).test_value()?;
         let endpoint = Endpoint {
@@ -1951,6 +2064,96 @@ out({'jsonrpc':'2.0','id':req['id'],'result':result})
             .test_value()?;
         assert_eq!(result["ping"], -32601);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_world_writable_binary_is_refused() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, endpoint) = stdio_fixture("echo")?;
+        std::fs::set_permissions(&endpoint.path, std::fs::Permissions::from_mode(0o702))
+            .test_value()?;
+        let error = call_action(&Policy::default(), &endpoint, "echo", &Map::new())
+            .await
+            .test_error()?;
+        assert_eq!(error.code, "unsafe_binary");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_environment_is_minimal_and_declared_values_arrive() -> TestResult {
+        let (_dir, mut endpoint) = stdio_fixture("env")?;
+        endpoint
+            .env
+            .insert("DECLARED_ONLY".into(), Value::String("visible".into()));
+        let result = call_action(&Policy::default(), &endpoint, "echo", &Map::new())
+            .await
+            .test_value()?;
+        assert_eq!(result["declared"], "visible");
+        assert!(result["leak"].is_null());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_early_exit_reports_stderr_and_exit_code() -> TestResult {
+        let (_dir, endpoint) = stdio_fixture("exit_early")?;
+        let error = call_action(&Policy::default(), &endpoint, "echo", &Map::new())
+            .await
+            .test_error()?;
+        assert_eq!(error.code, "bad_response");
+        assert_eq!(error.details["exit_code"], 3);
+        assert!(
+            error.details["stderr_tail"]
+                .as_str()
+                .is_some_and(|text| text.contains("boom: no config file"))
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_stdout_cap_is_enforced() -> TestResult {
+        let (_dir, endpoint) = stdio_fixture("huge")?;
+        let error = call_action(&Policy::default(), &endpoint, "echo", &Map::new())
+            .await
+            .test_error()?;
+        assert_eq!(error.code, "too_large");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_timeout_kills_the_process_group() -> TestResult {
+        use nix::{errno::Errno, sys::signal, unistd::Pid};
+        let (dir, mut endpoint) = stdio_fixture("hang")?;
+        let pidfile = dir.path().join("pids");
+        endpoint.timeout = Duration::from_millis(500);
+        endpoint.env.insert(
+            "PIDFILE".into(),
+            Value::String(pidfile.display().to_string()),
+        );
+        let error = call_action(&Policy::default(), &endpoint, "echo", &Map::new())
+            .await
+            .test_error()?;
+        assert_eq!(error.code, "timeout");
+        let pids = std::fs::read_to_string(&pidfile)
+            .test_value()?
+            .split_whitespace()
+            .map(str::parse::<i32>)
+            .collect::<Result<Vec<_>, _>>()
+            .test_value()?;
+        for _ in 0..50 {
+            if pids
+                .iter()
+                .all(|pid| signal::kill(Pid::from_raw(*pid), None) == Err(Errno::ESRCH))
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Err(std::io::Error::other(format!("stdio descendants still alive: {pids:?}")).into())
     }
 
     #[test]

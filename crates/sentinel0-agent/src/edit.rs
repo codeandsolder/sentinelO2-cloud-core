@@ -50,6 +50,29 @@ fn now_stamp() -> String {
     format!("{}-{:06}", now.as_secs(), now.subsec_micros())
 }
 
+fn validate_secret_payload(payload: &Map<String, Value>) -> Result<(), HandlerError> {
+    let secret = payload
+        .get("secret")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let leaky_option = payload
+        .get("diff")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || payload
+            .get("create")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || payload.get("backup_dir").is_some();
+    if secret && leaky_option {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            "secret edits take no diff, create or backup_dir",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), HandlerError> {
     if !MODES.contains(&mode) {
         return Err(HandlerError::new(
@@ -57,25 +80,7 @@ fn validate_payload(mode: &str, payload: &Map<String, Value>) -> Result<(), Hand
             format!("mode must be one of: {}", MODES.join(", ")),
         ));
     }
-    if payload
-        .get("secret")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && (payload
-            .get("diff")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || payload
-                .get("create")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            || payload.get("backup_dir").is_some())
-    {
-        return Err(HandlerError::new(
-            "invalid_payload",
-            "secret edits take no diff, create or backup_dir",
-        ));
-    }
+    validate_secret_payload(payload)?;
     if payload.get("validator").is_some_and(Value::is_string)
         && payload
             .get("validator_preset")
@@ -1298,8 +1303,8 @@ mod tests {
         )
         .test_value()?;
         assert_eq!(fs::read_to_string(&path).test_value()?, "TOKEN=new\n");
-        assert!(result.get("backup").is_none());
-        assert!(result.get("diff").is_none());
+        assert!(!result.contains_key("backup"));
+        assert!(!result.contains_key("diff"));
         assert_eq!(
             fs::read_dir(dir.path())
                 .test_value()?

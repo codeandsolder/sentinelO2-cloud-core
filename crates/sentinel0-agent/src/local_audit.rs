@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_edit_summary_never_contains_old_or_new_secret_material() {
+    fn secret_edit_summary_never_contains_old_or_new_secret_material() -> TestResult {
         let payload = Map::from_iter([
             ("secret".into(), Value::Bool(true)),
             ("old".into(), Value::String("hunter2-old".into())),
@@ -441,12 +441,13 @@ mod tests {
             ("path".into(), Value::String("/tmp/secret".into())),
         ]);
         let summary = summarize_payload(&payload);
-        let encoded = serde_json::to_string(&summary).expect("summary serializes");
+        let encoded = serde_json::to_string(&summary).test_value()?;
         assert!(!encoded.contains("hunter2"));
         assert_eq!(summary["old"]["omitted"], "secret");
         assert_eq!(summary["new_text"]["omitted"], "secret");
         assert_eq!(summary["old"]["chars"], 11);
         assert_eq!(summary["new_text"]["chars"], 11);
         assert_eq!(summary["path"], "/tmp/secret");
+        Ok(())
     }
 }

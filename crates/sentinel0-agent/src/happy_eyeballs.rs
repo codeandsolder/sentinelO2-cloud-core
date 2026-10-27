@@ -61,7 +61,7 @@ async fn race_tcp(addrs: Vec<SocketAddr>) -> io::Result<TcpStream> {
             Ok(Err(error)) => last_error = Some(error),
             Err(error) if error.is_cancelled() => {}
             Err(error) => {
-                last_error = Some(io::Error::other(format!("connect task failed: {error}")))
+                last_error = Some(io::Error::other(format!("connect task failed: {error}")));
             }
         }
     }
@@ -104,16 +104,14 @@ mod tests {
 
     #[test]
     fn addresses_are_interleaved_without_reordering_each_family() {
-        let addrs = vec![
-            "[2001:db8::1]:443".parse().expect("v6"),
-            "[2001:db8::2]:443".parse().expect("v6"),
-            "192.0.2.1:443".parse().expect("v4"),
-            "192.0.2.2:443".parse().expect("v4"),
-        ];
-        let got = interleave_addrs(addrs);
+        let v6_1 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443));
+        let v6_2 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 2], 443));
+        let v4_1 = SocketAddr::from(([192, 0, 2, 1], 443));
+        let v4_2 = SocketAddr::from(([192, 0, 2, 2], 443));
+        let got = interleave_addrs(vec![v6_1, v6_2, v4_1, v4_2]);
         assert!(got[0].is_ipv6());
         assert!(got[1].is_ipv4());
-        assert_eq!(got[0], "[2001:db8::1]:443".parse().expect("v6"));
-        assert_eq!(got[2], "[2001:db8::2]:443".parse().expect("v6"));
+        assert_eq!(got[0], v6_1);
+        assert_eq!(got[2], v6_2);
     }
 }
