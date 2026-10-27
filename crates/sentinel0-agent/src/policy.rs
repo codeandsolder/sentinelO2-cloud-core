@@ -993,6 +993,7 @@ services:
     transport: stdio
     protocol: jsonrpc
     path: /tmp/x
+    handshake: invalid
     actions:
       ping: { method: ping }
 ",

@@ -87,9 +87,16 @@ fn audit_value(key: Option<&str>, value: &Value) -> Value {
 /// commands and prose stay readable.
 #[must_use]
 pub fn summarize_payload(payload: &Map<String, Value>) -> Map<String, Value> {
+    let secret_edit = payload.get("secret").and_then(Value::as_bool) == Some(true);
     payload
         .iter()
-        .map(|(key, value)| (key.clone(), audit_value(Some(key), value)))
+        .map(|(key, value)| {
+            if secret_edit && matches!(key.as_str(), "new_text" | "old") {
+                let chars = value.as_str().map_or(0, |text| text.chars().count());
+                return (key.clone(), json!({"omitted": "secret", "chars": chars}));
+            }
+            (key.clone(), audit_value(Some(key), value))
+        })
         .collect()
 }
 
@@ -422,6 +429,25 @@ mod tests {
         assert!(!has_more_than_lines(&path, 3).test_value()?);
         assert!(has_more_than_lines(&path, 2).test_value()?);
 
+        Ok(())
+    }
+
+    #[test]
+    fn secret_edit_summary_never_contains_old_or_new_secret_material() -> TestResult {
+        let payload = Map::from_iter([
+            ("secret".into(), Value::Bool(true)),
+            ("old".into(), Value::String("hunter2-old".into())),
+            ("new_text".into(), Value::String("hunter2-new".into())),
+            ("path".into(), Value::String("/tmp/secret".into())),
+        ]);
+        let summary = summarize_payload(&payload);
+        let encoded = serde_json::to_string(&summary).test_value()?;
+        assert!(!encoded.contains("hunter2"));
+        assert_eq!(summary["old"]["omitted"], "secret");
+        assert_eq!(summary["new_text"]["omitted"], "secret");
+        assert_eq!(summary["old"]["chars"], 11);
+        assert_eq!(summary["new_text"]["chars"], 11);
+        assert_eq!(summary["path"], "/tmp/secret");
         Ok(())
     }
 }

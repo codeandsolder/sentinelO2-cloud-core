@@ -51,6 +51,7 @@ pub mod fsmutate;
 pub mod fsutil;
 pub mod git_ops;
 pub mod handler_error;
+mod happy_eyeballs;
 pub mod host;
 pub mod identity;
 pub mod instance_lock;
@@ -98,12 +99,9 @@ use tokio::{
     time::{Instant, interval, sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{
-    connect_async_with_config,
-    tungstenite::{
-        self, Message as WsMessage,
-        protocol::{WebSocketConfig, frame::coding::CloseCode},
-    },
+use tokio_tungstenite::tungstenite::{
+    self, Message as WsMessage,
+    protocol::{WebSocketConfig, frame::coding::CloseCode},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -476,7 +474,7 @@ impl<D: Dispatcher> Agent<D> {
             .max_message_size(Some(sentinel0_proto::MAX_BINARY_FRAME_BYTES));
         let (ws, _) = timeout(
             self.config.connect_timeout,
-            connect_async_with_config(req, Some(websocket_config), false),
+            happy_eyeballs::connect(req, Some(websocket_config)),
         )
         .await
         .map_err(|_| AgentError::Timeout("connect"))??;
