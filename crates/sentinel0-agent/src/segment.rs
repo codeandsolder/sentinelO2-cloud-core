@@ -109,7 +109,7 @@ fn scan_parameter(
 }
 
 fn scan_optional_text(
-    value: Option<&String>,
+    value: Option<&str>,
     analysis: &mut Analysis,
     depth: usize,
 ) -> Result<(), UnparseableCommand> {
@@ -139,7 +139,7 @@ fn scan_parameter_expr(
             ..
         } => {
             scan_parameter(parameter, analysis, depth)?;
-            scan_optional_text(default_value.as_ref(), analysis, depth)
+            scan_optional_text(default_value.as_deref(), analysis, depth)
         }
         ParameterExpr::IndicateErrorIfNullOrUnset {
             parameter,
@@ -147,7 +147,7 @@ fn scan_parameter_expr(
             ..
         } => {
             scan_parameter(parameter, analysis, depth)?;
-            scan_optional_text(error_message.as_ref(), analysis, depth)
+            scan_optional_text(error_message.as_deref(), analysis, depth)
         }
         ParameterExpr::UseAlternativeValue {
             parameter,
@@ -155,7 +155,7 @@ fn scan_parameter_expr(
             ..
         } => {
             scan_parameter(parameter, analysis, depth)?;
-            scan_optional_text(alternative_value.as_ref(), analysis, depth)
+            scan_optional_text(alternative_value.as_deref(), analysis, depth)
         }
         ParameterExpr::RemoveSmallestSuffixPattern {
             parameter, pattern, ..
@@ -182,7 +182,7 @@ fn scan_parameter_expr(
             parameter, pattern, ..
         } => {
             scan_parameter(parameter, analysis, depth)?;
-            scan_optional_text(pattern.as_ref(), analysis, depth)
+            scan_optional_text(pattern.as_deref(), analysis, depth)
         }
         ParameterExpr::Substring {
             parameter,
@@ -205,7 +205,7 @@ fn scan_parameter_expr(
         } => {
             scan_parameter(parameter, analysis, depth)?;
             scan_word_text(pattern, analysis, depth)?;
-            scan_optional_text(replacement.as_ref(), analysis, depth)
+            scan_optional_text(replacement.as_deref(), analysis, depth)
         }
         ParameterExpr::VariableNames { .. } | ParameterExpr::MemberKeys { .. } => Ok(()),
     }
