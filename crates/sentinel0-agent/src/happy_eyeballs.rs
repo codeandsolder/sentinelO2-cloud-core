@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr, time::Duration};
+use std::{collections::VecDeque, io, net::SocketAddr, time::Duration};
 use tokio::{net::TcpStream, task::JoinSet, time::sleep};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
@@ -16,16 +16,16 @@ fn interleave_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
         return addrs;
     };
     let first_is_v6 = first.is_ipv6();
-    let (mut first_family, mut other): (Vec<_>, Vec<_>) = addrs
+    let (mut first_family, mut other): (VecDeque<_>, VecDeque<_>) = addrs
         .into_iter()
         .partition(|addr| addr.is_ipv6() == first_is_v6);
     let mut out = Vec::with_capacity(first_family.len() + other.len());
     while !first_family.is_empty() || !other.is_empty() {
-        if !first_family.is_empty() {
-            out.push(first_family.remove(0));
+        if let Some(addr) = first_family.pop_front() {
+            out.push(addr);
         }
-        if !other.is_empty() {
-            out.push(other.remove(0));
+        if let Some(addr) = other.pop_front() {
+            out.push(addr);
         }
     }
     out
