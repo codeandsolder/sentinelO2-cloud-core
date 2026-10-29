@@ -57,7 +57,7 @@ fn default_os() -> String {
     "linux".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PreferredProfile {
     Compact,
@@ -291,7 +291,7 @@ impl Message {
 pub const TRANSFER_ID_BYTES: usize = 16;
 pub const BINARY_HEADER_BYTES: usize = 20;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BinaryFrame<'a> {
     pub transfer_id: [u8; TRANSFER_ID_BYTES],
     pub chunk_index: u32,
