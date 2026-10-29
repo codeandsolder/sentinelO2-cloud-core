@@ -786,7 +786,7 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     if rc != 0 {
         let mut message = scrub(&err, parent);
         if target.exists()
-            && let Err(error) = std::fs::remove_dir_all(&target)
+            && let Err(error) = tokio::fs::remove_dir_all(&target).await
         {
             let cleanup = format!(
                 "failed cleaning partial clone {}: {error}",
