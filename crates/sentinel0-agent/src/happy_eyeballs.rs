@@ -21,11 +21,11 @@ fn interleave_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
         .partition(|addr| addr.is_ipv6() == first_is_v6);
     let mut out = Vec::with_capacity(first_family.len() + other.len());
     while !first_family.is_empty() || !other.is_empty() {
-        if !first_family.is_empty() {
-            out.push(first_family.pop_front().expect("checked non-empty"));
+        if let Some(addr) = first_family.pop_front() {
+            out.push(addr);
         }
-        if !other.is_empty() {
-            out.push(other.pop_front().expect("checked non-empty"));
+        if let Some(addr) = other.pop_front() {
+            out.push(addr);
         }
     }
     out
