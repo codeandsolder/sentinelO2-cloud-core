@@ -362,6 +362,31 @@ fn finalize_staged_upload(
     fs::remove_file(source)
 }
 
+fn finalization_error(error: std::io::Error, source: &Path, destination: &Path) -> HandlerError {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return HandlerError::new("conflict", format!("failed finalizing upload: {error}"));
+    }
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        let folder = destination.parent().unwrap_or(destination);
+        return HandlerError::with_details(
+            "permission_denied",
+            format!(
+                "permission denied writing {:?}: the agent's OS user cannot write into {:?}, even though policy allows it; grant that user write and execute permission on the directory or choose a writable destination",
+                destination.display(),
+                folder.display()
+            ),
+            Map::from_iter([
+                (
+                    "path".into(),
+                    Value::String(destination.display().to_string()),
+                ),
+                ("source".into(), Value::String(source.display().to_string())),
+            ]),
+        );
+    }
+    HandlerError::new("io_error", format!("failed finalizing upload: {error}"))
+}
+
 async fn finalize_single_upload(
     temp: &Path,
     destination: &Path,
@@ -384,20 +409,17 @@ async fn finalize_single_upload(
             Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => None,
             Err(cleanup) => Some(cleanup),
         };
-        let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
-            "conflict"
-        } else {
-            "io_error"
-        };
-        return Err(HandlerError::new(
-            code,
-            cleanup.map_or_else(
-                || format!("failed finalizing upload: {error}"),
-                |cleanup| format!(
-                    "failed finalizing upload: {error}; staged-file cleanup also failed: {cleanup}"
-                ),
-            ),
-        ));
+        let mut mapped = finalization_error(error, temp, destination);
+        if let Some(cleanup) = cleanup {
+            mapped.details.insert(
+                "cleanup_error".into(),
+                Value::String(format!("failed cleaning staged upload: {cleanup}")),
+            );
+            mapped
+                .message
+                .push_str(&format!("; staged-file cleanup also failed: {cleanup}"));
+        }
+        return Err(mapped);
     }
     Ok(())
 }
@@ -688,16 +710,8 @@ fn finalize_chunked_upload(
             HandlerError::new("io_error", format!("cannot create destination parent: {e}"))
         })?;
     }
-    finalize_staged_upload(assembled, destination, overwrite).map_err(|error| {
-        HandlerError::new(
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                "conflict"
-            } else {
-                "io_error"
-            },
-            format!("failed finalizing upload: {error}"),
-        )
-    })
+    finalize_staged_upload(assembled, destination, overwrite)
+        .map_err(|error| finalization_error(error, assembled, destination))
 }
 
 /// # Errors
@@ -1067,6 +1081,25 @@ mod tests {
         .test_error()?;
         assert_eq!(error.code, "path_traversal");
 
+        Ok(())
+    }
+
+    #[test]
+    fn refused_upload_finalization_names_destination_not_staging_file() -> TestResult {
+        let source = Path::new("/var/lib/sentinelx/uploads/.sentinelx_uploads/abc/assembled.bin");
+        let destination = Path::new("/home/alex/Downloads/ci.tar.gz");
+        let error = finalization_error(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            source,
+            destination,
+        );
+
+        assert_eq!(error.code, "permission_denied");
+        assert!(error.message.contains("/home/alex/Downloads/ci.tar.gz"));
+        assert!(error.message.contains("/home/alex/Downloads"));
+        assert!(!error.message.contains("assembled.bin"));
+        assert_eq!(error.details["path"], destination.display().to_string());
+        assert_eq!(error.details["source"], source.display().to_string());
         Ok(())
     }
 
