@@ -1,6 +1,6 @@
-# SentinelX Rust RIR
+# SentinelO2 — unofficial SentinelX Rust RIR
 
-A compatibility-first Rust reimplementation of the official SentinelX agent.
+An **unofficial**, compatibility-first Rust reimplementation of the official SentinelX agent. This project is not affiliated with or endorsed by Pensa Software; the official agent lives at [pensados/sentinelx-cloud-core](https://github.com/pensados/sentinelx-cloud-core).
 
 **Current scope is deliberately boring:** match SentinelX 1:1 closely enough
 that the Python and Rust agents can be swapped without changing workflows,
