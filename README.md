@@ -18,11 +18,13 @@ git, upload/export, local audit, service control and local-api `run_as`. It
 reads the existing SentinelX identity and YAML policy files, so an enrolled host
 can switch implementations without re-enrollment or config migration.
 
-Known official implementation bugs are intentionally not reproduced. In
-particular, native edits advance mtime, established connections do not inherit
-stale pre-welcome reconnect penalties, background completions survive transport
-loss, and the client uses the application heartbeat as its active liveness
-mechanism rather than adding a second native WebSocket ping timer.
+SentinelO² follows corrected upstream behavior rather than preserving known
+implementation bugs. Upstream has since fixed several historical differences,
+including edit mtime handling, reconnect-backoff reset and late background-result
+replay. Intentional implementation differences — including using the application
+heartbeat rather than a second native WebSocket keepalive timer — are tracked in
+[COMPATIBILITY.md](COMPATIBILITY.md), and newly confirmed upstream defects found
+by differential testing are reported upstream.
 
 Verification currently includes:
 - the full workspace suite on the pinned Rust 1.99.1 toolchain;
