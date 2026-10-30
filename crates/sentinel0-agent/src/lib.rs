@@ -490,7 +490,7 @@ impl<D: Dispatcher> Agent<D> {
             self.config.host.clone(),
             self.config.agent_version.clone(),
             self.config.capabilities.clone(),
-            self.config.preferred_profile.clone(),
+            self.config.preferred_profile,
         );
         ws.send(WsMessage::Text(serde_json::to_string(&hello)?.into()))
             .await?;
