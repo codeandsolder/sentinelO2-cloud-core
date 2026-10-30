@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+import selectors
+import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 _AGENT_EXECUTABLE = __SENTINELX_AGENT_EXECUTABLE__
+
+_HELPER_READY_TIMEOUT_SECONDS = 15
+_HELPER_RESPONSE_GRACE_SECONDS = 20
 
 
 @dataclass(frozen=True)
@@ -58,9 +64,12 @@ class SshExecutionTarget:
             text=True,
             encoding="utf-8",
             bufsize=1,
+            process_group=0,
         )
         try:
-            ready = self._read_line("SSH helper did not report readiness")
+            ready = self._read_line(
+                "SSH helper did not report readiness", _HELPER_READY_TIMEOUT_SECONDS
+            )
             if not ready.get("ready"):
                 raise RuntimeError(f"SSH helper rejected connection: {ready!r}")
         except BaseException:
@@ -80,11 +89,16 @@ class SshExecutionTarget:
             raise RuntimeError("SSH execution target is closed")
         return process
 
-    def _read_line(self, missing: str) -> dict[str, Any]:
+    def _read_line(self, missing: str, timeout: float) -> dict[str, Any]:
         process = self._live_process()
         stdout = process.stdout
         if stdout is None:
             raise RuntimeError("SSH helper stdout is unavailable")
+        with selectors.DefaultSelector() as selector:
+            selector.register(stdout, selectors.EVENT_READ)
+            if not selector.select(timeout):
+                self._stop_helper()
+                raise TimeoutError(f"{missing} within {timeout:g} seconds")
         line = stdout.readline()
         if not line:
             stderr = process.stderr
@@ -95,7 +109,29 @@ class SshExecutionTarget:
             raise RuntimeError(f"SSH helper returned non-object JSON: {value!r}")
         return value
 
+    def _stop_helper(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        finally:
+            self._process = None
+
     def _request(self, kind: str, *, check: bool, shown_args: str | list[str], **payload: Any) -> RunResult:
+        timeout = payload.get("timeout_seconds")
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 3600:
+            raise ValueError("timeout must be an integer between 1 and 3600 seconds")
         stdin = self._live_process().stdin
         if stdin is None:
             raise RuntimeError("SSH helper stdin is unavailable")
@@ -104,7 +140,10 @@ class SshExecutionTarget:
         request = {"id": request_id, "kind": kind, **payload}
         stdin.write(json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n")
         stdin.flush()
-        response = self._read_line("SSH helper exited before answering")
+        response = self._read_line(
+            "SSH helper did not answer before the command deadline",
+            timeout + _HELPER_RESPONSE_GRACE_SECONDS,
+        )
         if response.get("id") != request_id:
             raise RuntimeError(f"SSH helper response id mismatch: wanted {request_id}, got {response.get('id')!r}")
         error = response.get("error")
@@ -174,10 +213,10 @@ class SshExecutionTarget:
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            self._stop_helper()
+            return
         finally:
             self._process = None
 
