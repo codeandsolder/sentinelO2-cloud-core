@@ -716,7 +716,7 @@ impl CoreDispatcher {
     fn allow_command_guidance(&self, offending: &str) -> String {
         let word = offending.split_whitespace().next().unwrap_or(offending);
         format!(
-            "If {word:?} is safe and routine, add it under allowed_commands with the operator's approval: (1) {}; (2) add a line for {word:?}; (3) {}; (4) confirm with capabilities that {word:?} is present. For a one-off workflow that should not change policy, use script_run instead.",
+            "If {word:?} is a plain command and is safe and routine, add it under allowed_commands with the operator's approval: (1) {}; (2) add a line for {word:?}; (3) {}; (4) confirm with capabilities that {word:?} is present. Shell assignments and stateful/meta constructs are intentionally not allowlistable; use script_run for those or for any one-off workflow that should not change policy.",
             self.config_edit_step(),
             Self::reload_agent_step()
         )
@@ -740,10 +740,10 @@ impl CoreDispatcher {
         let policy_guidance = self.policy_change_guidance();
         let command = match self.policy.exec_mode {
             ExecMode::Allowlist => format!(
-                "exec_mode is allowlist. Add the command under allowed_commands, then reload; or use the configured add_allowed_command playbook when available. {policy_guidance}"
+                "exec_mode is allowlist. Plain commands can be added under allowed_commands and then reloaded; shell assignments/stateful/meta constructs stay refused and belong in script_run. The configured add_allowed_command playbook may be used when available. {policy_guidance}"
             ),
             ExecMode::Strict => format!(
-                "exec_mode is strict. Add the command under allowed_commands, then reload; strict shell safety checks still apply. {policy_guidance}"
+                "exec_mode is strict. Plain commands can be added under allowed_commands and then reloaded; shell assignments/stateful/meta constructs stay refused, and the additional strict shell checks still apply. {policy_guidance}"
             ),
             ExecMode::Unrestricted => "exec_mode is unrestricted, so exec does not require an allowed_commands entry. OS permissions and the agent's runtime guardrails still apply.".into(),
         };

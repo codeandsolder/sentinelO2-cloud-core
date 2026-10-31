@@ -208,8 +208,12 @@ Reference surfaces:
 - `exec_mode` is the authoritative command policy: `allowlist` is the default,
   `strict` adds shell-safety restrictions, and `unrestricted` disables the
   command allowlist. `allowed_commands` uses whole-word matching (plus explicit
-  path-prefix entries) and chained commands are checked segment by segment.
-  Legacy `exec_strict` remains accepted. The older SentinelO²-only
+  path-prefix entries) and chained commands are checked segment by segment. Unlike
+  the affected upstream parser, `allowlist`/`strict` fail closed on assignment
+  words, `for`/`select`, stateful/meta shell builtins, and `printf -v`, so a prior
+  shell-state mutation cannot redirect a later allowlisted command; use
+  `script_run` for workflows that require mutable shell state. Legacy
+  `exec_strict` remains accepted. The older SentinelO²-only
   `exec.enforce_allowlist` key is also migration-compatible when `exec_mode` is
   absent (`true` -> `allowlist`, `false` -> `unrestricted`). `script_run`
   remains independent of this list, matching its historical contract.
