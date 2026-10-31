@@ -15,7 +15,7 @@ Reference surfaces:
   dossier issue. The resolving SentinelO² update commit advances only that
   component's version/SHA baseline and closes the corresponding issue.
 - Checked-in semantic fixtures under `fixtures/official-v1.13/`, generated
-  from the official Python protocol by `tools/generate_official_fixtures.py`.
+  from the official Python protocol by `.github/scripts/generate_official_fixtures.py`.
 
 ## Matched and tested
 

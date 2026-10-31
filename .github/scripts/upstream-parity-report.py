@@ -12,6 +12,7 @@ import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import NotRequired, TypedDict, cast
 
 API = "https://api.github.com"
 USER_AGENT = "sentinelo2-upstream-parity/2.0"
@@ -20,7 +21,72 @@ MAX_PATCH_TOTAL = 32000
 MAX_CHANGELOG = 9000
 
 
-def request_json(path: str):
+class HeadResponse(TypedDict):
+    sha: str
+
+
+class CommitBody(TypedDict):
+    message: str
+
+
+class CommitEntry(TypedDict):
+    sha: str
+    commit: CommitBody
+
+
+class FileChange(TypedDict):
+    filename: str
+    status: NotRequired[str]
+    additions: NotRequired[int]
+    deletions: NotRequired[int]
+    patch: NotRequired[str]
+
+
+class CompareResponse(TypedDict, total=False):
+    status: str
+    commits: list[CommitEntry]
+    files: list[FileChange]
+
+
+class ContentsResponse(TypedDict, total=False):
+    encoding: str
+    content: str
+
+
+class ComponentConfig(TypedDict):
+    repo: str
+    reviewed_sha: str
+    reviewed_version: NotRequired[str]
+    branch: NotRequired[str]
+
+
+class Release(TypedDict):
+    component: str
+    repo: str
+    previous_version: str | None
+    previous_sha: str
+    version: str
+    release_sha: str
+    subject: str
+
+
+class ReleaseMeta(Release):
+    marker: str
+    title: str
+    body_file: str
+
+
+class ComponentMeta(TypedDict):
+    repo: str
+    reviewed_sha: str
+    reviewed_version: str | None
+    head_sha: str
+    head_version: str | None
+    commits_since_review: int
+    release_count: int
+
+
+def request_json(path: str) -> object:
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     headers = {
         "Accept": "application/vnd.github+json",
@@ -34,19 +100,26 @@ def request_json(path: str):
         return json.load(response)
 
 
-def repo_head(repo: str, branch: str) -> dict:
-    return request_json(
-        f"/repos/{repo}/commits/{urllib.parse.quote(branch, safe='')}"
+def repo_head(repo: str, branch: str) -> HeadResponse:
+    return cast(
+        "HeadResponse",
+        request_json(f"/repos/{repo}/commits/{urllib.parse.quote(branch, safe='')}"),
     )
 
 
-def compare(repo: str, base: str, head: str) -> dict:
-    return request_json(f"/repos/{repo}/compare/{base}...{head}?per_page=100")
+def compare(repo: str, base: str, head: str) -> CompareResponse:
+    return cast(
+        "CompareResponse",
+        request_json(f"/repos/{repo}/compare/{base}...{head}?per_page=100"),
+    )
 
 
 def file_text(repo: str, path: str, ref: str) -> str:
-    payload = request_json(
-        f"/repos/{repo}/contents/{urllib.parse.quote(path, safe='/')}?ref={urllib.parse.quote(ref, safe='')}"
+    payload = cast(
+        "ContentsResponse",
+        request_json(
+            f"/repos/{repo}/contents/{urllib.parse.quote(path, safe='/')}?ref={urllib.parse.quote(ref, safe='')}"
+        ),
     )
     if payload.get("encoding") != "base64":
         return ""
@@ -54,15 +127,20 @@ def file_text(repo: str, path: str, ref: str) -> str:
 
 
 def package_version(pyproject: str) -> str | None:
-    match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
-    return match.group(1) if match else None
+    match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.MULTILINE)
+    if match is None:
+        return None
+    version = match.group(1)
+    if not isinstance(version, str):
+        raise TypeError("version capture is not text")
+    return version
 
 
 def changelog_section(changelog: str, version: str) -> str:
-    start = re.search(rf"^##\s+{re.escape(version)}\b.*$", changelog, re.M)
+    start = re.search(rf"^##\s+{re.escape(version)}\b.*$", changelog, re.MULTILINE)
     if not start:
         return ""
-    next_heading = re.search(r"^##\s+", changelog[start.end() :], re.M)
+    next_heading = re.search(r"^##\s+", changelog[start.end() :], re.MULTILINE)
     end = start.end() + next_heading.start() if next_heading else len(changelog)
     return changelog[start.start() : end].strip()[:MAX_CHANGELOG]
 
@@ -97,11 +175,9 @@ def relevant_for_patch(path: str) -> bool:
     }
 
 
-def short_sha(value: str) -> str:
-    return value[:12]
-
-
-def release_points(component: str, cfg: dict, head_sha: str) -> tuple[list[dict], int]:
+def release_points(
+    component: str, cfg: ComponentConfig, head_sha: str
+) -> tuple[list[Release], int]:
     """Return version-bump commits after the reviewed baseline, in commit order."""
     if head_sha == cfg["reviewed_sha"]:
         return [], 0
@@ -116,7 +192,7 @@ def release_points(component: str, cfg: dict, head_sha: str) -> tuple[list[dict]
     commits = overall.get("commits") or []
     previous_version = cfg.get("reviewed_version")
     previous_sha = cfg["reviewed_sha"]
-    releases: list[dict] = []
+    releases: list[Release] = []
 
     for commit in commits:
         sha = commit["sha"]
@@ -141,7 +217,9 @@ def release_points(component: str, cfg: dict, head_sha: str) -> tuple[list[dict]
     return releases, len(commits)
 
 
-def markdown_for_release(release: dict, delta: dict, changelog: str) -> str:
+def markdown_for_release(
+    release: Release, delta: CompareResponse, changelog: str
+) -> str:
     repo = release["repo"]
     old = release["previous_sha"]
     new = release["release_sha"]
@@ -156,12 +234,14 @@ def markdown_for_release(release: dict, delta: dict, changelog: str) -> str:
         "",
         f"# SentinelX upstream {component} {version}",
         "",
-        "This issue is an immutable release-scoped port/review dossier. "
-        "It should be closed by the SentinelO² update commit that ports or explicitly reviews this release.",
+        (
+            "This issue is an immutable release-scoped port/review dossier. "
+            "It should be closed by the SentinelO² update commit that ports or explicitly reviews this release."
+        ),
         "",
         f"- Repository: {repo}",
-        f"- Previous reviewed release: {release.get('previous_version') or '?'} ({short_sha(old)})",
-        f"- Release: {version} ({short_sha(new)})",
+        f"- Previous reviewed release: {release.get('previous_version') or '?'} ({old[:12]})",
+        f"- Release: {version} ({new[:12]})",
         f"- Release commit subject: {release['subject']}",
         f"- Compare: https://github.com/{repo}/compare/{old}...{new}",
         f"- Compare status: {delta.get('status', 'unknown')}",
@@ -174,13 +254,13 @@ def markdown_for_release(release: dict, delta: dict, changelog: str) -> str:
             sha = commit["sha"]
             subject = commit["commit"]["message"].splitlines()[0]
             lines.append(
-                f"- https://github.com/{repo}/commit/{sha} {short_sha(sha)} {subject}"
+                f"- https://github.com/{repo}/commit/{sha} {sha[:12]} {subject}"
             )
     else:
         lines.append("- No commits returned by compare API.")
 
     grouped: dict[str, list[str]] = {}
-    by_name = {}
+    by_name: dict[str, FileChange] = {}
     for item in files:
         grouped.setdefault(classify(item["filename"]), []).append(item["filename"])
         by_name[item["filename"]] = item
@@ -201,7 +281,7 @@ def markdown_for_release(release: dict, delta: dict, changelog: str) -> str:
         lines += ["", "## Release notes", "", changelog]
 
     patch_budget = MAX_PATCH_TOTAL
-    patches = []
+    patches: list[tuple[str, str, bool]] = []
     for item in files:
         path = item["filename"]
         patch = item.get("patch")
@@ -229,8 +309,10 @@ def markdown_for_release(release: dict, delta: dict, changelog: str) -> str:
         "- Prefer translating upstream regression tests with each behavior port.",
         "- Re-run protocol fixtures/differentials, pinned Rust CI, fuzz and real-WebSocket tests.",
         "- Update COMPATIBILITY.md and the project Notion summary for material differences.",
-        f"- Advance only the `{component}` entry in `.github/upstream-parity.json` "
-        f"to version `{version}` and SHA `{new}` in the commit that resolves this issue.",
+        (
+            f"- Advance only the `{component}` entry in `.github/upstream-parity.json` "
+            f"to version `{version}` and SHA `{new}` in the commit that resolves this issue."
+        ),
         "- Use `Closes #<this issue>` in that update commit/PR so the release issue closes when the commit lands on main.",
         "- Record intentional non-ports next to the compatibility baseline so they are not rediscovered.",
         "",
@@ -246,10 +328,14 @@ def main() -> int:
     parser.add_argument("--out-dir", required=True, type=Path)
     args = parser.parse_args()
 
-    baseline = json.loads(args.baseline.read_text())
+    baseline = cast(
+        "dict[str, ComponentConfig]",
+        json.loads(args.baseline.read_text(encoding="utf-8")),
+    )
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    meta = {"releases": [], "components": {}}
+    release_meta: list[ReleaseMeta] = []
+    component_meta: dict[str, ComponentMeta] = {}
     for component in ("core", "protocol"):
         cfg = baseline[component]
         head = repo_head(cfg["repo"], cfg.get("branch", "main"))
@@ -258,7 +344,7 @@ def main() -> int:
         current_version = package_version(
             file_text(cfg["repo"], "pyproject.toml", head["sha"])
         )
-        meta["components"][component] = {
+        component_meta[component] = {
             "repo": cfg["repo"],
             "reviewed_sha": cfg["reviewed_sha"],
             "reviewed_version": cfg.get("reviewed_version"),
@@ -274,7 +360,9 @@ def main() -> int:
             )
             changelog = ""
             try:
-                text = file_text(release["repo"], "CHANGELOG.md", release["release_sha"])
+                text = file_text(
+                    release["repo"], "CHANGELOG.md", release["release_sha"]
+                )
                 changelog = changelog_section(text, release["version"])
             except (OSError, KeyError, ValueError):
                 # Some upstreams do not carry a changelog. The release commit,
@@ -283,18 +371,20 @@ def main() -> int:
 
             safe_version = re.sub(r"[^A-Za-z0-9._-]+", "_", release["version"])
             body = args.out_dir / f"{component}-{safe_version}.md"
-            body.write_text(markdown_for_release(release, delta, changelog))
-            marker = f"automation-upstream-release:{component}:{release['version']}"
-            meta["releases"].append(
-                {
-                    **release,
-                    "marker": marker,
-                    "title": f"upstream {component} {release['version']} parity",
-                    "body_file": str(body),
-                }
+            body.write_text(
+                markdown_for_release(release, delta, changelog), encoding="utf-8"
             )
+            marker = f"automation-upstream-release:{component}:{release['version']}"
+            entry: ReleaseMeta = {
+                **release,
+                "marker": marker,
+                "title": f"upstream {component} {release['version']} parity",
+                "body_file": str(body),
+            }
+            release_meta.append(entry)
 
-    args.meta.write_text(json.dumps(meta, indent=2) + "\n")
+    meta = {"releases": release_meta, "components": component_meta}
+    args.meta.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return 0
 
 
