@@ -45,15 +45,72 @@ const READ_ONLY_FILTERS: &[&str] = &[
     "readlink",
     "date",
 ];
-const POSITION_FREE: &[&str] = &["cd"];
 const SAFE_BUILTINS: &[&str] = &[
-    "set", "test", "[", "[[", "true", "false", ":", "read", "shift", "break", "continue", "exit",
-    "return", "wait",
+    "test", "[", "[[", "true", "false", ":", "break", "continue", "exit", "return", "wait",
+];
+// These mutate the parent shell or execute/resolve another command. A textual
+// command-name allowlist cannot stay meaningful once they can alter the state
+// used to interpret the rest of the same `bash -lc` program.
+const STATEFUL_OR_META_BUILTINS: &[&str] = &[
+    ".",
+    "alias",
+    "bg",
+    "builtin",
+    "cd",
+    "command",
+    "declare",
+    "dirs",
+    "disown",
+    "enable",
+    "eval",
+    "exec",
+    "export",
+    "fc",
+    "fg",
+    "getopts",
+    "hash",
+    "history",
+    "let",
+    "local",
+    "mapfile",
+    "popd",
+    "pushd",
+    "read",
+    "readarray",
+    "readonly",
+    "set",
+    "shift",
+    "shopt",
+    "source",
+    "suspend",
+    "trap",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
 ];
 const MAX_NESTING: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnparseableCommand(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignmentKind {
+    None,
+    Only,
+    WithCommand,
+}
+
+impl AssignmentKind {
+    const fn any(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn only(self) -> bool {
+        matches!(self, Self::Only)
+    }
+}
 
 #[derive(Debug)]
 struct CommandInfo {
@@ -61,7 +118,7 @@ struct CommandInfo {
     program: String,
     arguments: Vec<String>,
     filter_position: bool,
-    assignments_only: bool,
+    assignment_kind: AssignmentKind,
     has_unsafe_redirection: bool,
 }
 
@@ -132,15 +189,13 @@ fn scan_parameter_expr(
             parameter,
             default_value,
             ..
-        }
-        | ParameterExpr::AssignDefaultValues {
-            parameter,
-            default_value,
-            ..
         } => {
             scan_parameter(parameter, analysis, depth)?;
             scan_optional_text(default_value.as_deref(), analysis, depth)
         }
+        ParameterExpr::AssignDefaultValues { .. } => Err(UnparseableCommand(
+            "assignment-style parameter expansion is not supported by exec policy".into(),
+        )),
         ParameterExpr::IndicateErrorIfNullOrUnset {
             parameter,
             error_message,
@@ -233,8 +288,11 @@ fn scan_word_pieces(
             WordPiece::ParameterExpansion(expression) => {
                 scan_parameter_expr(expression, analysis, depth)?;
             }
-            WordPiece::ArithmeticExpression(expression) => {
-                scan_word_text(&expression.value, analysis, depth)?;
+            WordPiece::ArithmeticExpression(_) => {
+                return Err(UnparseableCommand(
+                    "arithmetic expansion can mutate shell state and is not supported by exec policy"
+                        .into(),
+                ));
             }
             WordPiece::Text(_)
             | WordPiece::SingleQuotedText(_)
@@ -410,10 +468,7 @@ fn command_arguments(simple: &SimpleCommand) -> Vec<String> {
         .collect()
 }
 
-fn only_assignments(simple: &SimpleCommand) -> bool {
-    if simple.word_or_name.is_some() {
-        return false;
-    }
+fn assignment_kind(simple: &SimpleCommand) -> AssignmentKind {
     let items = simple
         .prefix
         .as_ref()
@@ -427,10 +482,20 @@ fn only_assignments(simple: &SimpleCommand) -> bool {
                 .flat_map(|suffix| suffix.0.iter()),
         )
         .collect::<Vec<_>>();
-    !items.is_empty()
+    if !items
+        .iter()
+        .any(|item| matches!(item, CommandPrefixOrSuffixItem::AssignmentWord(_, _)))
+    {
+        AssignmentKind::None
+    } else if simple.word_or_name.is_none()
         && items
             .iter()
             .all(|item| matches!(item, CommandPrefixOrSuffixItem::AssignmentWord(_, _)))
+    {
+        AssignmentKind::Only
+    } else {
+        AssignmentKind::WithCommand
+    }
 }
 
 fn option_takes_value(name: &str, option: &str) -> bool {
@@ -534,7 +599,7 @@ fn walk_simple(
         }
     }
 
-    let assignments_only = only_assignments(simple);
+    let assignment_kind = assignment_kind(simple);
     let Some(program) = simple.word_or_name.as_ref() else {
         push_before_nested(
             analysis,
@@ -544,7 +609,7 @@ fn walk_simple(
                 program: String::new(),
                 arguments: Vec::new(),
                 filter_position,
-                assignments_only,
+                assignment_kind,
                 has_unsafe_redirection: unsafe_redirection,
             },
         );
@@ -558,7 +623,7 @@ fn walk_simple(
             program: unquote_str(&program.value),
             arguments: command_arguments(simple),
             filter_position,
-            assignments_only,
+            assignment_kind,
             has_unsafe_redirection: unsafe_redirection,
         },
     );
@@ -595,7 +660,7 @@ fn walk_command(
                     program: "[[".into(),
                     arguments: Vec::new(),
                     filter_position,
-                    assignments_only: false,
+                    assignment_kind: AssignmentKind::None,
                     has_unsafe_redirection: unsafe_redirection,
                 },
             );
@@ -643,17 +708,6 @@ fn walk_compound_list(
     Ok(())
 }
 
-fn scan_words<'a>(
-    words: impl IntoIterator<Item = &'a Word>,
-    analysis: &mut Analysis,
-    depth: usize,
-) -> Result<(), UnparseableCommand> {
-    for word in words {
-        scan_word(word, analysis, depth)?;
-    }
-    Ok(())
-}
-
 fn walk_compound(
     command: &CompoundCommand,
     analysis: &mut Analysis,
@@ -668,12 +722,9 @@ fn walk_compound(
         )),
         CompoundCommand::BraceGroup(command) => walk_compound_list(&command.list, analysis, depth),
         CompoundCommand::Subshell(command) => walk_compound_list(&command.list, analysis, depth),
-        CompoundCommand::ForClause(command) => {
-            if let Some(values) = &command.values {
-                scan_words(values, analysis, depth)?;
-            }
-            walk_compound_list(&command.body.list, analysis, depth)
-        }
+        CompoundCommand::ForClause(_) => Err(UnparseableCommand(
+            "for/select clauses mutate shell state and are not supported by exec policy".into(),
+        )),
         CompoundCommand::CaseClause(_) => Err(UnparseableCommand(
             "case clauses are not supported by exec policy".into(),
         )),
@@ -725,7 +776,7 @@ pub fn split_top_level(command: &str) -> Vec<String> {
             analysis
                 .commands
                 .into_iter()
-                .filter(|command| !command.assignments_only)
+                .filter(|command| !command.assignment_kind.only())
                 .map(|command| command.rendered)
                 .collect()
         },
@@ -755,11 +806,30 @@ pub fn file_redirection(command: &str) -> Option<String> {
 
 fn first_unauthorised(policy: &Policy, analysis: Analysis, chain: bool) -> Option<String> {
     for command in analysis.commands {
-        if command.assignments_only || policy.is_command_allowed(&command.rendered) {
-            continue;
+        // Assignments can affect command resolution directly (PATH), alter what an
+        // otherwise allowlisted executable loads (LD_PRELOAD, PYTHONPATH, ...), or
+        // persist for later segments. A variable blacklist would always be partial.
+        if command.assignment_kind.any() {
+            return Some(command.rendered);
         }
         let name = command.program.as_str();
-        if POSITION_FREE.contains(&name) || (chain && SAFE_BUILTINS.contains(&name)) {
+        if STATEFUL_OR_META_BUILTINS.contains(&name) {
+            return Some(command.rendered);
+        }
+        // Bash printf is normally harmless, but `printf -v NAME ...` writes a
+        // shell variable and can therefore mutate PATH or another runtime hook.
+        if name == "printf"
+            && command
+                .arguments
+                .first()
+                .is_some_and(|arg| arg.starts_with("-v"))
+        {
+            return Some(command.rendered);
+        }
+        if policy.is_command_allowed(&command.rendered) {
+            continue;
+        }
+        if chain && SAFE_BUILTINS.contains(&name) {
             if command.has_unsafe_redirection {
                 return Some(command.rendered);
             }
@@ -898,7 +968,10 @@ mod tests {
             unauthorised_chain(&empty, "> /tmp/owned"),
             Ok(Some("> /tmp/owned".into()))
         );
-        assert_eq!(unauthorised_chain(&empty, "FOO=bar"), Ok(None));
+        assert_eq!(
+            unauthorised_chain(&empty, "FOO=bar"),
+            Ok(Some("FOO=bar".into()))
+        );
         assert!(unauthorised_chain(&empty, "echo '").is_err());
         assert!(unauthorised_segment(&empty, "echo '").is_err());
     }
@@ -918,7 +991,7 @@ mod tests {
         let policy = policy(&["make", "ls", "printf"]);
         assert_eq!(
             unauthorised_chain(&policy, "cd /tmp && make | head"),
-            Ok(None)
+            Ok(Some("cd /tmp".into()))
         );
         assert_eq!(
             unauthorised_chain(&policy, "make; curl bad"),
@@ -928,11 +1001,51 @@ mod tests {
             unauthorised_chain(&policy, "printf '%s' \"$(id)\""),
             Ok(Some("id".into()))
         );
-        assert_eq!(
-            unauthorised_chain(&policy, "for x in 1 2; do printf '%s' \"$x\"; done"),
-            Ok(None)
-        );
+        assert!(unauthorised_chain(&policy, "for x in 1 2; do printf '%s' \"$x\"; done").is_err());
         assert!(unauthorised_chain(&policy, "case x in x) ls;; *) curl bad;; esac").is_err());
+    }
+
+    #[test]
+    fn shell_state_cannot_redirect_an_allowlisted_command() {
+        let policy = policy(&["ls"]);
+        assert_eq!(
+            unauthorised_chain(&policy, "PATH=/tmp/attacker:$PATH; ls"),
+            Ok(Some("PATH=/tmp/attacker:$PATH".into()))
+        );
+        assert_eq!(
+            unauthorised_chain(&policy, "LD_PRELOAD=/tmp/evil.so ls"),
+            Ok(Some("LD_PRELOAD=/tmp/evil.so ls".into()))
+        );
+        assert!(unauthorised_chain(&policy, "for PATH in /tmp/attacker; do ls; done").is_err());
+    }
+
+    #[test]
+    fn parent_shell_mutators_are_refused_even_when_named_in_the_allowlist() {
+        let policy = policy(&["ls", "cd", "read", "export", "command", "eval"]);
+        for command in [
+            "cd /tmp; ls",
+            "read PATH; ls",
+            "export PATH=/tmp/attacker; ls",
+            "command ls",
+            "eval ls",
+        ] {
+            assert!(
+                matches!(unauthorised_chain(&policy, command), Ok(Some(_))),
+                "unexpectedly allowed {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn printf_cannot_write_shell_state_but_normal_printf_still_works() {
+        let policy = policy(&["ls", "printf"]);
+        assert_eq!(
+            unauthorised_chain(&policy, "printf -v PATH /tmp/attacker; ls"),
+            Ok(Some("printf -v PATH /tmp/attacker".into()))
+        );
+        assert_eq!(unauthorised_chain(&policy, "printf '%s' ok"), Ok(None));
+        assert!(unauthorised_chain(&policy, ": ${PATH:=/tmp/attacker}; ls").is_err());
+        assert!(unauthorised_chain(&policy, r#": "$((PATH=123))"; ls"#).is_err());
     }
 
     #[test]
@@ -967,13 +1080,13 @@ mod tests {
             unauthorised_chain(&policy, "cat <<EOF\n'$(id)'\nEOF"),
             Ok(Some("id".into()))
         );
-        assert_eq!(
-            unauthorised_chain(&policy, "printf '%s' \"$((1 | 2))\""),
-            Ok(None)
+        assert!(
+            unauthorised_chain(&policy, "printf '%s' \"$((1 | 2))\"").is_err(),
+            "checked exec rejects arithmetic expansion because it can mutate shell state"
         );
-        assert_eq!(
-            unauthorised_chain(&policy, "printf '%s' \"$((1 + $(id)))\""),
-            Ok(Some("id".into()))
+        assert!(
+            unauthorised_chain(&policy, "printf '%s' \"$((1 + $(id)))\"").is_err(),
+            "arithmetic expansion is rejected before nested shell evaluation"
         );
         assert!(unauthorised_chain(&policy, "cat <<EOF\nmissing terminator").is_err());
     }
