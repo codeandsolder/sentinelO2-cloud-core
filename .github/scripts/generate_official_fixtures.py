@@ -2,8 +2,7 @@
 """Generate Sentinel0 compatibility fixtures from the official Python protocol.
 
 Usage:
-    SENTINELX_PROTOCOL_DIR=/path/to/sentinelx-cloud-protocol \
-      python tools/generate_official_fixtures.py
+    uv run --project .github/scripts --locked python .github/scripts/generate_official_fixtures.py
 
 The generated files are semantic JSON fixtures, not Python implementation
 snapshots. Rust tests consume them without requiring Python at test time.
@@ -12,19 +11,11 @@ snapshots. Rust tests consume them without requiring Python at test time.
 from __future__ import annotations
 
 import json
-import os
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import get_args
+from typing import Protocol, get_args
 
-ROOT = Path(__file__).resolve().parents[1]
-PROTO_ROOT = Path(
-    os.environ.get("SENTINELX_PROTOCOL_DIR", "/srv/scratch/sentinelx-protocol-reference")
-)
-sys.path.insert(0, str(PROTO_ROOT / "python"))
-
-from sentinelx_protocol import (  # noqa: E402
+from sentinelx_protocol import (
     BINARY_HEADER_BYTES,
     HEARTBEAT_INTERVAL_SECONDS,
     HEARTBEAT_TIMEOUT_SECONDS,
@@ -48,17 +39,23 @@ from sentinelx_protocol import (  # noqa: E402
     bound_response,
     encode_binary_frame,
 )
-from sentinelx_protocol.messages import OpType  # noqa: E402
+from sentinelx_protocol.messages import OpType
+
+ROOT = Path(__file__).resolve().parents[2]
 
 OUT = ROOT / "fixtures" / "official-v1.13"
 OUT.mkdir(parents=True, exist_ok=True)
 
 
-def semantic(model):
+class JsonModel(Protocol):
+    def model_dump_json(self) -> str: ...
+
+
+def semantic(model: JsonModel) -> object:
     return json.loads(model.model_dump_json())
 
 
-def write(name: str, value) -> None:
+def write(name: str, value: object) -> None:
     (OUT / name).write_text(
         json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -112,7 +109,7 @@ write(
                     exec_timeout_max=3600,
                 ),
             ),
-            capabilities=list(get_args(OpType)) + ["opaque_ref"],
+            capabilities=[*get_args(OpType), "opaque_ref"],
             preferred_profile="full",
         )
     ),
@@ -140,19 +137,18 @@ write(
     ),
 )
 
-requests = []
-for op in get_args(OpType):
-    requests.append(
-        semantic(
-            RequestMessage(
-                id=f"req_{op}",
-                op=op,
-                payload={"fixture": True, "op": op},
-                deadline=ts,
-                opaque_ref="fixture-ref",
-            )
+requests = [
+    semantic(
+        RequestMessage(
+            id=f"req_{op}",
+            op=op,
+            payload={"fixture": True, "op": op},
+            deadline=ts,
+            opaque_ref="fixture-ref",
         )
     )
+    for op in get_args(OpType)
+]
 write("requests_all_ops.json", requests)
 
 write(
@@ -183,7 +179,9 @@ write("ping.json", semantic(PingMessage(timestamp=ts)))
 write("pong.json", semantic(PongMessage(timestamp=ts)))
 write(
     "event.json",
-    semantic(EventMessage(kind="job_completed", data={"job_id": "job_fixture"}, timestamp=ts)),
+    semantic(
+        EventMessage(kind="job_completed", data={"job_id": "job_fixture"}, timestamp=ts)
+    ),
 )
 write(
     "error.json",
@@ -210,41 +208,71 @@ bounding_cases = []
 for name, response, soft_limit in [
     (
         "large_ascii_result",
-        {"type": "response", "id": "bound_1", "ok": True,
-         "result": {"output": "A" * 10000, "small": "keep"}},
+        {
+            "type": "response",
+            "id": "bound_1",
+            "ok": True,
+            "result": {"output": "A" * 10000, "small": "keep"},
+        },
         4096,
     ),
     (
         "nested_largest_first",
-        {"type": "response", "id": "bound_2", "ok": True,
-         "result": {"a": {"text": "B" * 6000}, "b": {"text": "C" * 8000}}},
+        {
+            "type": "response",
+            "id": "bound_2",
+            "ok": True,
+            "result": {"a": {"text": "B" * 6000}, "b": {"text": "C" * 8000}},
+        },
         4096,
     ),
     (
         "large_error_message",
-        {"type": "response", "id": "bound_3", "ok": False,
-         "result": None, "error": {"code": "huge", "message": "E" * 10000}},
+        {
+            "type": "response",
+            "id": "bound_3",
+            "ok": False,
+            "result": None,
+            "error": {"code": "huge", "message": "E" * 10000},
+        },
         4096,
     ),
     (
         "untrimmable_non_strings",
-        {"type": "response", "id": "bound_4", "ok": True,
-         "result": {"numbers": list(range(3000))}},
+        {
+            "type": "response",
+            "id": "bound_4",
+            "ok": True,
+            "result": {"numbers": list(range(3000))},
+        },
         4096,
     ),
     (
         "large_list_of_objects",
-        {"type": "response", "id": "bound_5", "ok": True,
-         "result": {"items": [{"id": i, "kind": "fixture"} for i in range(200)],
-                    "summary": "keep"}},
+        {
+            "type": "response",
+            "id": "bound_5",
+            "ok": True,
+            "result": {
+                "items": [{"id": i, "kind": "fixture"} for i in range(200)],
+                "summary": "keep",
+            },
+        },
         4096,
     ),
     (
         "large_dict_result",
-        {"type": "response", "id": "bound_6", "ok": True,
-         "result": {"services": {f"svc-{i:04}": {"status": "ok", "n": i}
-                                  for i in range(200)},
-                    "summary": "keep"}},
+        {
+            "type": "response",
+            "id": "bound_6",
+            "ok": True,
+            "result": {
+                "services": {
+                    f"svc-{i:04}": {"status": "ok", "n": i} for i in range(200)
+                },
+                "summary": "keep",
+            },
+        },
         4096,
     ),
 ]:

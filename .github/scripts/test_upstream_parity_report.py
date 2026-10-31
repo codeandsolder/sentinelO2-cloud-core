@@ -20,17 +20,19 @@ SPEC.loader.exec_module(MODULE)
 
 
 class UpstreamParityReportTests(unittest.TestCase):
-    def test_cli_reports_operational_failure_without_secondary_exception(self):
+    def test_cli_reports_operational_failure_without_secondary_exception(self) -> None:
         stderr = io.StringIO()
         with (
-            mock.patch.object(MODULE, "main", side_effect=urllib.error.URLError("boom")),
+            mock.patch.object(
+                MODULE, "main", side_effect=urllib.error.URLError("boom")
+            ),
             contextlib.redirect_stderr(stderr),
         ):
             self.assertEqual(MODULE.cli(), 1)
         self.assertIn("upstream parity detector failed", stderr.getvalue())
         self.assertIn("boom", stderr.getvalue())
 
-    def test_unreleased_commits_do_not_create_issue_dossiers(self):
+    def test_unreleased_commits_do_not_create_issue_dossiers(self) -> None:
         cfg = {
             "repo": "upstream/core",
             "reviewed_sha": "a" * 40,
@@ -59,7 +61,7 @@ class UpstreamParityReportTests(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(releases, [])
 
-    def test_multiple_version_bumps_become_distinct_release_dossiers(self):
+    def test_multiple_version_bumps_become_distinct_release_dossiers(self) -> None:
         baseline = {
             "core": {
                 "repo": "upstream/core",
@@ -113,10 +115,10 @@ class UpstreamParityReportTests(unittest.TestCase):
             ],
         }
 
-        def repo_head(repo, _branch):
+        def repo_head(repo: str, _branch: str) -> dict[str, str]:
             return {"sha": d if repo == "upstream/core" else "p" * 40}
 
-        def compare(repo, base, head):
+        def compare(repo: str, base: str, head: str) -> object:
             if repo != "upstream/core":
                 raise AssertionError("protocol compare should not run")
             if (base, head) == ("a" * 40, d):
@@ -127,7 +129,7 @@ class UpstreamParityReportTests(unittest.TestCase):
                 return release_12
             raise AssertionError((base, head))
 
-        def file_text(repo, path, ref):
+        def file_text(repo: str, path: str, ref: str) -> str:
             if path == "pyproject.toml":
                 versions = {
                     "a" * 40: "1.0.0",
@@ -147,11 +149,11 @@ class UpstreamParityReportTests(unittest.TestCase):
             return ""
 
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            baseline_path = tmp / "baseline.json"
-            meta_path = tmp / "meta.json"
-            out_dir = tmp / "dossiers"
-            baseline_path.write_text(json.dumps(baseline))
+            tmp_path = Path(tmp)
+            baseline_path = tmp_path / "baseline.json"
+            meta_path = tmp_path / "meta.json"
+            out_dir = tmp_path / "dossiers"
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
             argv = [
                 str(SCRIPT),
                 "--baseline",
@@ -175,8 +177,8 @@ class UpstreamParityReportTests(unittest.TestCase):
             self.assertEqual(releases[0]["previous_sha"], "a" * 40)
             self.assertEqual(releases[1]["previous_sha"], c)
 
-            first = Path(releases[0]["body_file"]).read_text()
-            second = Path(releases[1]["body_file"]).read_text()
+            first = Path(releases[0]["body_file"]).read_text(encoding="utf-8")
+            second = Path(releases[1]["body_file"]).read_text(encoding="utf-8")
             self.assertIn("automation-upstream-release:core:1.1.0", first)
             self.assertIn("## 1.1.0 - first", first)
             self.assertNotIn("## 1.2.0 - second", first)

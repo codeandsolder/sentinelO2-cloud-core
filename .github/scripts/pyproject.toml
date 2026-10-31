@@ -1,0 +1,10 @@
+[project]
+name = "sentinelo2-ci-tools"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "sentinelx-cloud-protocol @ git+https://github.com/pensados/sentinelx-cloud-protocol.git@00169f8fddbab11082f7ff0f24ef5c7e321c9a47",
+]
+
+[tool.uv]
+package = false

@@ -1,4 +1,6 @@
-"""Small standard-library execution helpers staged beside SentinelO2 Python scripts."""
+// Runtime compatibility payload staged as sentinelx_runtime.py for Python script_run jobs.
+// Rust owns the payload; it is exercised through the script integration tests.
+pub(super) const SOURCE: &str = r#""""Small standard-library execution helpers staged beside SentinelO2 Python scripts."""
 
 from __future__ import annotations
 
@@ -223,3 +225,4 @@ class SshExecutionTarget:
 
 def exec_ssh(destination: str) -> SshExecutionTarget:
     return SshExecutionTarget(destination)
+"#;

@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     fs,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -362,7 +363,7 @@ fn finalize_staged_upload(
     fs::remove_file(source)
 }
 
-fn finalization_error(error: std::io::Error, source: &Path, destination: &Path) -> HandlerError {
+fn finalization_error(error: &std::io::Error, source: &Path, destination: &Path) -> HandlerError {
     if error.kind() == std::io::ErrorKind::AlreadyExists {
         return HandlerError::new("conflict", format!("failed finalizing upload: {error}"));
     }
@@ -409,15 +410,16 @@ async fn finalize_single_upload(
             Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => None,
             Err(cleanup) => Some(cleanup),
         };
-        let mut mapped = finalization_error(error, temp, destination);
+        let mut mapped = finalization_error(&error, temp, destination);
         if let Some(cleanup) = cleanup {
             mapped.details.insert(
                 "cleanup_error".into(),
                 Value::String(format!("failed cleaning staged upload: {cleanup}")),
             );
-            mapped
-                .message
-                .push_str(&format!("; staged-file cleanup also failed: {cleanup}"));
+            let _ = write!(
+                mapped.message,
+                "; staged-file cleanup also failed: {cleanup}"
+            );
         }
         return Err(mapped);
     }
@@ -711,7 +713,7 @@ fn finalize_chunked_upload(
         })?;
     }
     finalize_staged_upload(assembled, destination, overwrite)
-        .map_err(|error| finalization_error(error, assembled, destination))
+        .map_err(|error| finalization_error(&error, assembled, destination))
 }
 
 /// # Errors
@@ -1085,11 +1087,11 @@ mod tests {
     }
 
     #[test]
-    fn refused_upload_finalization_names_destination_not_staging_file() -> TestResult {
+    fn refused_upload_finalization_names_destination_not_staging_file() {
         let source = Path::new("/var/lib/sentinelx/uploads/.sentinelx_uploads/abc/assembled.bin");
         let destination = Path::new("/home/alex/Downloads/ci.tar.gz");
         let error = finalization_error(
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
             source,
             destination,
         );
@@ -1100,7 +1102,6 @@ mod tests {
         assert!(!error.message.contains("assembled.bin"));
         assert_eq!(error.details["path"], destination.display().to_string());
         assert_eq!(error.details["source"], source.display().to_string());
-        Ok(())
     }
 
     #[tokio::test]

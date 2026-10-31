@@ -1,3 +1,5 @@
+mod python_runtime_source;
+
 use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     jobs::BACKGROUND_TIMEOUT_MAX_SECS,
@@ -23,7 +25,7 @@ use tokio::fs as async_fs;
 const TIMEOUT_MIN: u64 = 1;
 const TIMEOUT_MAX: u64 = 600;
 const PYTHON_RUNTIME_NAME: &str = "sentinelx_runtime.py";
-const PYTHON_RUNTIME_SOURCE: &str = include_str!("python_runtime.py");
+const PYTHON_RUNTIME_SOURCE: &str = python_runtime_source::SOURCE;
 
 fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
     match error.raw_os_error() {

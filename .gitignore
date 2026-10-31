@@ -1,1 +1,5 @@
 /target/
+
+# Python CI/tooling caches
+__pycache__/
+*.py[cod]
