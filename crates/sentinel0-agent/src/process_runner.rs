@@ -10,12 +10,16 @@ use std::{
     collections::{HashSet, VecDeque},
     env,
     ffi::OsString,
+    fmt::Write as _,
     io,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt as _, process::Command, task::JoinHandle};
+
+#[cfg(unix)]
+use wait_timeout::ChildExt as _;
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
@@ -201,8 +205,6 @@ impl ProcessGroupKill {
         if targets.is_empty() {
             return None;
         }
-        use wait_timeout::ChildExt as _;
-
         let mut child = match std::process::Command::new(command)
             .args(["-n", "kill", "-9", "--"])
             .args(targets)
@@ -220,10 +222,10 @@ impl ProcessGroupKill {
                 let wait_error = child.wait().err();
                 let mut message = "timed out invoking sudo kill".to_owned();
                 if let Some(error) = kill_error {
-                    message.push_str(&format!("; failed killing sudo helper: {error}"));
+                    let _ = write!(message, "; failed killing sudo helper: {error}");
                 }
                 if let Some(error) = wait_error {
-                    message.push_str(&format!("; failed reaping sudo helper: {error}"));
+                    let _ = write!(message, "; failed reaping sudo helper: {error}");
                 }
                 Some(message)
             }
@@ -283,6 +285,24 @@ impl ProcessGroupKill {
     }
 
     #[cfg(unix)]
+    fn sudo_kill_group_blocking(
+        command: &Path,
+        path: &std::ffi::OsStr,
+        pid: Option<u32>,
+    ) -> Option<String> {
+        let Some(pid) = pid else {
+            return Some("child PID was unavailable; process group could not be killed".into());
+        };
+        let target = format!("-{pid}");
+        let sudo_error = Self::sudo_kill_blocking(command, path, &[target]);
+        if sudo_error.is_some() {
+            fallback_result(sudo_error, Self::direct_kill_group(Some(pid)))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(unix)]
     fn kill_blocking(&self, pid: Option<u32>) -> Option<String> {
         let descendants = descendant_snapshot(pid);
         match self {
@@ -291,17 +311,7 @@ impl ProcessGroupKill {
                 Self::direct_kill_descendants(&descendants),
             ),
             Self::Sudo { command, path } => {
-                let group_error = if let Some(pid) = pid {
-                    let target = format!("-{pid}");
-                    let sudo_error = Self::sudo_kill_blocking(command, path, &[target]);
-                    if sudo_error.is_some() {
-                        fallback_result(sudo_error, Self::direct_kill_group(Some(pid)))
-                    } else {
-                        None
-                    }
-                } else {
-                    Some("child PID was unavailable; process group could not be killed".into())
-                };
+                let group_error = Self::sudo_kill_group_blocking(command, path, pid);
                 let targets = descendants
                     .iter()
                     .copied()

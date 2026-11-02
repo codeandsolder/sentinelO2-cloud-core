@@ -270,6 +270,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
     fn hub_url_forms_normalize_to_the_same_bases() {
         for (given, http, ws) in [
@@ -309,14 +311,13 @@ mod tests {
         }
     }
     #[test]
-    fn internal_commit_cli_requires_exactly_two_paths() {
+    fn internal_commit_cli_requires_exactly_two_paths() -> TestResult {
         let args = Args::try_parse_from([
             "sentinelx-core",
             "--internal-commit-new",
             "/tmp/source",
             "/tmp/target",
-        ])
-        .expect("internal commit arguments");
+        ])?;
         assert_eq!(
             args.internal_commit_new.as_deref(),
             Some(&[PathBuf::from("/tmp/source"), PathBuf::from("/tmp/target")][..])
@@ -324,43 +325,38 @@ mod tests {
         assert!(
             Args::try_parse_from(["sentinelx-core", "--internal-commit-new", "/tmp/only"]).is_err()
         );
+        Ok(())
     }
 
     #[test]
-    fn internal_commit_is_no_clobber_and_applies_plain_create_mode() {
+    fn internal_commit_is_no_clobber_and_applies_plain_create_mode() -> TestResult {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir()?;
         let source = dir.path().join("source");
         let target = dir.path().join("target");
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&source)
-            .expect("source");
-        std::fs::write(&source, b"payload").expect("source content");
-        let expected_mode =
-            sentinel0_agent::fsutil::regular_create_mode(dir.path()).expect("plain create mode");
-        run_internal_commit_new(&[source.clone(), target.clone()]).expect("commit");
-        assert_eq!(std::fs::read(&target).expect("target content"), b"payload");
+            .open(&source)?;
+        std::fs::write(&source, b"payload")?;
+        let expected_mode = sentinel0_agent::fsutil::regular_create_mode(dir.path())?;
+        run_internal_commit_new(&[source, target.clone()])?;
+        assert_eq!(std::fs::read(&target)?, b"payload");
         assert_eq!(
-            std::fs::metadata(&target)
-                .expect("target metadata")
-                .permissions()
-                .mode()
-                & 0o777,
+            std::fs::metadata(&target)?.permissions().mode() & 0o777,
             expected_mode
         );
 
         let second = dir.path().join("second");
-        std::fs::write(&second, b"replacement").expect("second source");
-        let error = run_internal_commit_new(&[second.clone(), target.clone()])
-            .expect_err("existing target must win");
+        std::fs::write(&second, b"replacement")?;
+        let error = match run_internal_commit_new(&[second, target.clone()]) {
+            Ok(()) => return Err("existing target was unexpectedly overwritten".into()),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            std::fs::read(&target).expect("preserved target"),
-            b"payload"
-        );
+        assert_eq!(std::fs::read(&target)?, b"payload");
+        Ok(())
     }
 }

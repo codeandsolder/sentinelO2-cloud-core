@@ -807,10 +807,8 @@ mod tests {
         assert!(serialized_size(&response) <= RESPONSE_SOFT_LIMIT_BYTES);
         assert_eq!(response["result"]["exit_code"], 2);
         assert_eq!(response["result"]["stderr"], "boom");
-        let details = response["error"]["details"]
-            .as_object()
-            .expect("details object");
-        assert!(details.contains_key("truncated") || details.contains_key("omitted"));
+        let details = &response["error"]["details"];
+        assert!(details.get("truncated").is_some() || details.get("omitted").is_some());
     }
 
     #[test]
@@ -824,10 +822,8 @@ mod tests {
         });
         assert!(bound_response_default(&mut response).is_some());
         assert!(serialized_size(&response) <= RESPONSE_SOFT_LIMIT_BYTES);
-        let details = response["error"]["details"]
-            .as_object()
-            .expect("details object");
-        assert!(details.contains_key("truncated") || details.contains_key("omitted"));
+        let details = &response["error"]["details"];
+        assert!(details.get("truncated").is_some() || details.get("omitted").is_some());
     }
 
     #[test]

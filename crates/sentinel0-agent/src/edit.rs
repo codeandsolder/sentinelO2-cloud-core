@@ -651,7 +651,7 @@ struct CreatedParentDirs {
 }
 
 impl CreatedParentDirs {
-    fn keep(&mut self) {
+    const fn keep(&mut self) {
         self.keep = true;
     }
 }
@@ -738,16 +738,12 @@ fn require_recovery_backup(recovery_backup: Option<&Path>) -> Result<&Path, Hand
     })
 }
 
-fn atomic_replace(
+fn create_replacement_temp(
+    parent: &Path,
     target: &Path,
     content: &str,
     original_meta: Option<&fs::Metadata>,
-    recovery_backup: Option<&Path>,
-) -> Result<bool, HandlerError> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| HandlerError::new("write_failed", "target has no parent directory"))?;
-    let mut created_parents = ensure_parent_dirs(parent)?;
+) -> Result<tempfile::NamedTempFile, HandlerError> {
     let prefix = format!(
         ".{}.sentinel0-",
         target
@@ -769,81 +765,95 @@ fn atomic_replace(
             format!("failed creating temp file: {error}"),
         )
     })?;
+    temp.write_all(content.as_bytes()).map_err(|error| {
+        HandlerError::new("write_failed", format!("failed writing temp file: {error}"))
+    })?;
+    Ok(temp)
+}
 
-    temp.write_all(content.as_bytes())
-        .map_err(|e| HandlerError::new("write_failed", format!("failed writing temp file: {e}")))?;
-    if let Some(meta) = original_meta {
-        temp.as_file()
-            .set_permissions(fs::Permissions::from_mode(meta.mode()))
-            .map_err(|e| {
-                HandlerError::new(
-                    "write_failed",
-                    format!("failed preserving permissions: {e}"),
-                )
-            })?;
-
-        let candidate_meta = temp.as_file().metadata().map_err(|e| {
+fn preserve_replacement_metadata(
+    temp: &tempfile::NamedTempFile,
+    target: &Path,
+    content: &str,
+    meta: &fs::Metadata,
+    recovery_backup: Option<&Path>,
+) -> Result<bool, HandlerError> {
+    temp.as_file()
+        .set_permissions(fs::Permissions::from_mode(meta.mode()))
+        .map_err(|error| {
             HandlerError::new(
                 "write_failed",
-                format!("failed reading replacement metadata: {e}"),
+                format!("failed preserving permissions: {error}"),
             )
         })?;
-        if candidate_meta.uid() != meta.uid() || candidate_meta.gid() != meta.gid() {
-            match nix::unistd::chown(
-                temp.path(),
-                Some(nix::unistd::Uid::from_raw(meta.uid())),
-                Some(nix::unistd::Gid::from_raw(meta.gid())),
-            ) {
-                Ok(()) => {}
-                Err(nix::errno::Errno::EPERM | nix::errno::Errno::EACCES)
-                    if target.exists() && !target.is_symlink() =>
-                {
-                    // Replacing the inode here would hand the file to the agent.
-                    // In-place mutation is only safe when a durable recovery copy
-                    // already exists: otherwise a short write or crash can corrupt
-                    // a secret/no-backup edit irreversibly.
-                    let recovery_backup = require_recovery_backup(recovery_backup)?;
-                    if let Err(mut write_error) =
-                        write_in_place_preserving_metadata(target, content)
-                    {
-                        let recovery = fs::read_to_string(recovery_backup)
-                            .map_err(|error| format!("failed reading recovery backup: {error}"))
-                            .and_then(|original| {
-                                write_in_place_preserving_metadata(target, &original).map_err(
-                                    |error| {
-                                        format!(
-                                            "failed restoring recovery backup: {}",
-                                            error.message
-                                        )
-                                    },
-                                )
-                            });
-                        match recovery {
-                            Ok(()) => write_error
-                                .message
-                                .push_str("; original content restored from recovery backup"),
-                            Err(recovery_error) => {
-                                write_error.message.push_str("; recovery also failed: ");
-                                write_error.message.push_str(&recovery_error);
-                            }
-                        }
-                        return Err(write_error);
-                    }
-                    return Ok(true);
-                }
-                Err(error) => {
-                    return Err(HandlerError::new(
-                        "write_failed",
-                        format!("failed preserving owner/group: {error}"),
-                    ));
-                }
+    let candidate_meta = temp.as_file().metadata().map_err(|error| {
+        HandlerError::new(
+            "write_failed",
+            format!("failed reading replacement metadata: {error}"),
+        )
+    })?;
+    if candidate_meta.uid() == meta.uid() && candidate_meta.gid() == meta.gid() {
+        return Ok(false);
+    }
+
+    match nix::unistd::chown(
+        temp.path(),
+        Some(nix::unistd::Uid::from_raw(meta.uid())),
+        Some(nix::unistd::Gid::from_raw(meta.gid())),
+    ) {
+        Ok(()) => Ok(false),
+        Err(nix::errno::Errno::EPERM | nix::errno::Errno::EACCES)
+            if target.exists() && !target.is_symlink() =>
+        {
+            write_with_recovery(target, content, recovery_backup)?;
+            Ok(true)
+        }
+        Err(error) => Err(HandlerError::new(
+            "write_failed",
+            format!("failed preserving owner/group: {error}"),
+        )),
+    }
+}
+
+fn write_with_recovery(
+    target: &Path,
+    content: &str,
+    recovery_backup: Option<&Path>,
+) -> Result<(), HandlerError> {
+    // Replacing the inode would hand the file to the agent. In-place mutation is
+    // only safe when a durable recovery copy already exists: otherwise a short
+    // write or crash can corrupt a secret/no-backup edit irreversibly.
+    let recovery_backup = require_recovery_backup(recovery_backup)?;
+    if let Err(mut write_error) = write_in_place_preserving_metadata(target, content) {
+        let recovery = fs::read_to_string(recovery_backup)
+            .map_err(|error| format!("failed reading recovery backup: {error}"))
+            .and_then(|original| {
+                write_in_place_preserving_metadata(target, &original)
+                    .map_err(|error| format!("failed restoring recovery backup: {}", error.message))
+            });
+        match recovery {
+            Ok(()) => write_error
+                .message
+                .push_str("; original content restored from recovery backup"),
+            Err(recovery_error) => {
+                write_error.message.push_str("; recovery also failed: ");
+                write_error.message.push_str(&recovery_error);
             }
         }
+        return Err(write_error);
     }
-    temp.as_file()
-        .sync_all()
-        .map_err(|e| HandlerError::new("write_failed", format!("failed syncing temp file: {e}")))?;
-    if original_meta.is_none() {
+    Ok(())
+}
+
+fn commit_replacement(
+    temp: tempfile::NamedTempFile,
+    target: &Path,
+    creating: bool,
+) -> Result<(), HandlerError> {
+    temp.as_file().sync_all().map_err(|error| {
+        HandlerError::new("write_failed", format!("failed syncing temp file: {error}"))
+    })?;
+    if creating {
         install_file_no_replace(temp.path(), target).map_err(|error| {
             HandlerError::new(
                 if error.kind() == io::ErrorKind::AlreadyExists {
@@ -862,6 +872,27 @@ fn atomic_replace(
             )
         })?;
     }
+    Ok(())
+}
+
+fn atomic_replace(
+    target: &Path,
+    content: &str,
+    original_meta: Option<&fs::Metadata>,
+    recovery_backup: Option<&Path>,
+) -> Result<bool, HandlerError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| HandlerError::new("write_failed", "target has no parent directory"))?;
+    let mut created_parents = ensure_parent_dirs(parent)?;
+    let temp = create_replacement_temp(parent, target, content, original_meta)?;
+    if let Some(meta) = original_meta
+        && preserve_replacement_metadata(&temp, target, content, meta, recovery_backup)?
+    {
+        created_parents.keep();
+        return Ok(true);
+    }
+    commit_replacement(temp, target, original_meta.is_none())?;
     created_parents.keep();
     Ok(false)
 }

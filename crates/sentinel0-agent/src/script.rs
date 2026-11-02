@@ -651,7 +651,7 @@ mod tests {
     async fn invalid_environment_is_rejected_before_staging() -> TestResult {
         for env in [
             Map::from_iter([("BAD=NAME".into(), Value::String("x".into()))]),
-            Map::from_iter([("".into(), Value::String("x".into()))]),
+            Map::from_iter([(String::new(), Value::String("x".into()))]),
             Map::from_iter([("X".into(), Value::String("a\0b".into()))]),
         ] {
             let dir = tempdir().test_value()?;

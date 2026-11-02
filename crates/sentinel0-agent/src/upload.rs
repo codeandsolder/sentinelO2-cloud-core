@@ -729,25 +729,18 @@ fn finalize_chunked_upload(
         .map_err(|error| finalization_error(&error, assembled, destination))
 }
 
-/// # Errors
-/// Returns an error when the staged upload cannot be validated or finalized safely.
-pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
-    let id = require_str(payload, "upload_id")?;
-    let id = valid_upload_id(Some(&Value::String(id.into())))?;
-    let dir = upload_dir(policy, &id)?;
-    let meta_bytes = fs::read(meta_path(&dir))
-        .map_err(|_| HandlerError::new("not_found", format!("upload_id not found: {id}")))?;
-    let meta: UploadMeta = serde_json::from_slice(&meta_bytes)
-        .map_err(|e| HandlerError::new("invalid_state", format!("bad upload metadata: {e}")))?;
-
+fn validated_upload_parts(dir: &Path) -> Result<Vec<PathBuf>, HandlerError> {
     let mut indexed_parts = Vec::new();
-    for entry in fs::read_dir(dir.join("parts"))
-        .map_err(|e| HandlerError::new("invalid_state", format!("cannot read upload parts: {e}")))?
-    {
-        let entry = entry.map_err(|e| {
+    for entry in fs::read_dir(dir.join("parts")).map_err(|error| {
+        HandlerError::new(
+            "invalid_state",
+            format!("cannot read upload parts: {error}"),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
             HandlerError::new(
                 "invalid_state",
-                format!("cannot read upload part entry: {e}"),
+                format!("cannot read upload part entry: {error}"),
             )
         })?;
         let path = entry.path();
@@ -775,10 +768,14 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
     if indexed_parts.is_empty() {
         return Err(HandlerError::new("invalid_state", "no chunks uploaded"));
     }
+    require_contiguous_parts(&indexed_parts)?;
+    Ok(indexed_parts.into_iter().map(|(_, path)| path).collect())
+}
 
+fn require_contiguous_parts(indexed_parts: &[(u32, PathBuf)]) -> Result<(), HandlerError> {
     let mut missing = Vec::new();
     let mut expected = 0_u32;
-    for (index, _) in &indexed_parts {
+    for (index, _) in indexed_parts {
         while expected < *index && missing.len() < 100 {
             missing.push(expected);
             expected = expected.saturating_add(1);
@@ -788,46 +785,66 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
         }
         expected = index.saturating_add(1);
     }
-    if !missing.is_empty() {
-        let shown = missing.iter().take(20).copied().collect::<Vec<_>>();
-        return Err(HandlerError::with_details(
-            "incomplete_upload",
-            format!("chunks must be numbered 0..N-1 with none missing; missing: {shown:?}"),
-            Map::from_iter([(
-                "missing".into(),
-                Value::Array(missing.into_iter().map(Value::from).collect()),
-            )]),
-        ));
+    if missing.is_empty() {
+        return Ok(());
     }
+    let shown = missing.iter().take(20).copied().collect::<Vec<_>>();
+    Err(HandlerError::with_details(
+        "incomplete_upload",
+        format!("chunks must be numbered 0..N-1 with none missing; missing: {shown:?}"),
+        Map::from_iter([(
+            "missing".into(),
+            Value::Array(missing.into_iter().map(Value::from).collect()),
+        )]),
+    ))
+}
 
-    let assembled = dir.join("assembled.bin");
-    let parts = indexed_parts
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect::<Vec<_>>();
-    let (total, sha256) = assemble_upload_parts(parts, &assembled)?;
-
+fn validate_completed_upload(
+    meta: &UploadMeta,
+    payload: &Map<String, Value>,
+    total: u64,
+    sha256: &str,
+) -> Result<(), HandlerError> {
     if meta.total_size != 0 && meta.total_size != total {
         return Err(HandlerError::new(
             "size_mismatch",
             format!("expected {}, got {total}", meta.total_size),
         ));
     }
-    if let Some(expected) = payload.get("sha256").and_then(Value::as_str) {
-        let expected = expected.trim().to_ascii_lowercase();
-        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(HandlerError::new(
-                "invalid_sha256",
-                "expected a 64-character hexadecimal SHA-256 digest",
-            ));
-        }
-        if expected != sha256 {
-            return Err(HandlerError::new(
-                "checksum_mismatch",
-                format!("sha256 mismatch: assembled={sha256}, expected={expected}"),
-            ));
-        }
+    let Some(expected) = payload.get("sha256").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(HandlerError::new(
+            "invalid_sha256",
+            "expected a 64-character hexadecimal SHA-256 digest",
+        ));
     }
+    if expected != sha256 {
+        return Err(HandlerError::new(
+            "checksum_mismatch",
+            format!("sha256 mismatch: assembled={sha256}, expected={expected}"),
+        ));
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns an error when the staged upload cannot be validated or finalized safely.
+pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+    let id = require_str(payload, "upload_id")?;
+    let id = valid_upload_id(Some(&Value::String(id.into())))?;
+    let dir = upload_dir(policy, &id)?;
+    let meta_bytes = fs::read(meta_path(&dir))
+        .map_err(|_| HandlerError::new("not_found", format!("upload_id not found: {id}")))?;
+    let meta: UploadMeta = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| HandlerError::new("invalid_state", format!("bad upload metadata: {e}")))?;
+
+    let parts = validated_upload_parts(&dir)?;
+    let assembled = dir.join("assembled.bin");
+    let (total, sha256) = assemble_upload_parts(parts, &assembled)?;
+    validate_completed_upload(&meta, payload, total, &sha256)?;
 
     let destination = authorised_persisted_destination(policy, &meta)?;
     finalize_chunked_upload(&assembled, &destination, meta.overwrite)?;
