@@ -139,6 +139,8 @@ fn build_command(
             "--python".into(),
             policy.tooling.uv_python.clone(),
             "python".into(),
+            "-c".into(),
+            "import os,runpy,sys; p=sys.argv[1]; sys.argv=sys.argv[1:]; sys.path.insert(1, os.path.dirname(os.path.abspath(p))); runpy.run_path(p, run_name='__main__')".into(),
             script.display().to_string(),
         ],
         "pwsh" => vec![
@@ -173,6 +175,8 @@ fn build_command(
         if let Some(cwd) = cwd {
             command_argv.extend([
                 policy.tooling.command("bash").display().to_string(),
+                "--noprofile".into(),
+                "--norc".into(),
                 "-c".into(),
                 "cd \"$1\" || { echo \"sentinelx: cannot enter $1\" >&2; exit 126; }; shift; exec \"$@\"".into(),
                 "bash".into(),
@@ -234,6 +238,20 @@ fn parse_script_request(payload: &Map<String, Value>) -> Result<ScriptRequest<'_
             ));
         }
     };
+    for (name, value) in &env {
+        if name.is_empty() || name.contains('=') || name.contains('\0') {
+            return Err(HandlerError::new(
+                "invalid_payload",
+                format!("invalid environment variable name {name:?}"),
+            ));
+        }
+        if value.as_str().is_some_and(|value| value.contains('\0')) {
+            return Err(HandlerError::new(
+                "invalid_payload",
+                format!("environment variable {name:?} contains NUL"),
+            ));
+        }
+    }
     let background = payload
         .get("background")
         .and_then(Value::as_bool)
@@ -501,13 +519,17 @@ fn timed_out_result(
 /// Returns an error when the script request is invalid, disallowed, cannot be staged, or execution fails.
 pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let request = parse_script_request(payload)?;
+    let mut execution_env = request.env.clone();
+    if let Some(cwd) = request.cwd {
+        execution_env.insert("PWD".into(), Value::String(cwd.to_owned()));
+    }
     let staged = prepare_script(policy, &request).await?;
     let (command_argv, spawn_cwd) = build_command(
         policy,
         request.interpreter,
         staged.script_path(),
         &request.args,
-        &request.env,
+        &execution_env,
         request.sudo,
         request.cwd,
     );
@@ -525,7 +547,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         &command_argv,
         Duration::from_secs(request.timeout_seconds),
         spawn_cwd.as_deref(),
-        Some(&request.env),
+        Some(&execution_env),
         killer,
     )
     .await;
@@ -626,6 +648,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_environment_is_rejected_before_staging() -> TestResult {
+        for env in [
+            Map::from_iter([("BAD=NAME".into(), Value::String("x".into()))]),
+            Map::from_iter([("".into(), Value::String("x".into()))]),
+            Map::from_iter([("X".into(), Value::String("a\0b".into()))]),
+        ] {
+            let dir = tempdir().test_value()?;
+            let policy = Policy {
+                upload_base: dir.path().to_owned(),
+                ..Policy::default()
+            };
+            let error = handle(
+                &policy,
+                &Map::from_iter([
+                    ("interpreter".into(), Value::String("bash".into())),
+                    ("content".into(), Value::String("true".into())),
+                    ("env".into(), Value::Object(env)),
+                    ("cleanup".into(), Value::Bool(false)),
+                ]),
+            )
+            .await
+            .test_error()?;
+            assert_eq!(error.code, "invalid_payload");
+            assert!(
+                !dir.path().join(".sentinelx_uploads").exists(),
+                "invalid env created staging state"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bash_script_captures_output_and_exit_code() -> TestResult {
         let dir = tempdir().test_value()?;
         let policy = Policy {
@@ -684,6 +738,47 @@ mod tests {
         .test_value()?;
         assert_eq!(result["returncode"], 0);
         assert_eq!(result["output"], "True");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn python_cwd_is_importable_and_pwd_matches_it() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let cwd = dir.path().join("project");
+        fs::create_dir(&cwd).test_value()?;
+        fs::write(cwd.join("sibling.py"), "VALUE = 42\n").test_value()?;
+        let uv = dir.path().join("uv");
+        fs::write(
+            &uv,
+            b"#!/bin/sh\nset -eu\n[ \"$1\" = run ]; shift\n[ \"$1\" = --no-project ]; shift\n[ \"$1\" = --python ]; shift 2\n[ \"$1\" = python ]; shift\nexec python3 \"$@\"\n",
+        )
+        .test_value()?;
+        fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).test_value()?;
+        let mut policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        policy.tooling.executables.insert("uv".into(), uv);
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("python3".into())),
+                (
+                    "content".into(),
+                    Value::String(
+                        "import os\nfrom sibling import VALUE\nprint(VALUE)\nprint(os.environ['PWD'])"
+                            .into(),
+                    ),
+                ),
+                ("cwd".into(), Value::String(cwd.display().to_string())),
+            ]),
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["returncode"], 0);
+        let output = result["output"].as_str().test_value()?;
+        assert!(output.lines().any(|line| line == "42"));
+        assert!(output.lines().any(|line| line == cwd.display().to_string()));
         Ok(())
     }
 

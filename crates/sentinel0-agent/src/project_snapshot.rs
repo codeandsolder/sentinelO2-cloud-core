@@ -68,6 +68,7 @@ async fn run_git(
         RunOptions {
             cwd: None,
             env: Some(&env),
+            sanitize_bash_startup: false,
             stdin: None,
             stdout_limit: MAX_GIT_STDOUT,
             stderr_limit: MAX_GIT_STDERR,

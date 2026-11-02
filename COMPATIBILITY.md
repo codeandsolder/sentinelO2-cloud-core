@@ -5,9 +5,9 @@ the official SentinelX agent. Sentinel0² architecture work is out of scope unti
 the compatibility replacement is complete and has been used in anger.
 
 Reference surfaces:
-- `pensados/sentinelx-cloud-protocol` protocol package 1.13.2.
-- `pensados/sentinelx-cloud-core` 0.23.35 behavior at reviewed upstream commit
-  `57ebce1cae7249be694d2f0dec421b63e401b582`, with known bugs fixed rather
+- `pensados/sentinelx-cloud-protocol` protocol package 1.13.5.
+- `pensados/sentinelx-cloud-core` 0.23.56 behavior at reviewed upstream commit
+  `af4ea00167505f60b0c1261000d4f0d91b5ece2c`, with known bugs fixed rather
   than intentionally reproduced.
 - `.github/upstream-parity.json` is the durable reviewed-release baseline.
   Scheduled maintenance ignores unreleased same-version commits; each upstream
@@ -26,7 +26,7 @@ Reference surfaces:
   distinguishes hub rejection from network failure. A policy close (`1008`)
   is classified as `enrollment_rejected`, matching the upstream close/frame
   race as well as explicit JSON error frames.
-- SentinelX protocol 1.13.2 constants and all 31 official operation names.
+- SentinelX protocol 1.13.5 constants and all 31 official operation names.
 - Strict JSON message parsing equivalent to Pydantic `extra="forbid"`.
 - `opaque_ref` maximum length of 256 characters.
 - Hello / welcome / request / response / ping / pong / event / error semantic
@@ -65,10 +65,12 @@ Reference surfaces:
 - Handler panics are converted to structured `internal_error` responses rather
   than taking down the connection loop.
 - Official response bounding is checked against Python-generated fixtures and
-  applied to foreground and background responses. Protocol 1.13.2 semantics are
-  matched: oversized strings, nested lists and nested maps are trimmed in place,
-  list/object element types stay intact, and `_truncation.omitted` reports JSON
-  Pointer paths plus kept/omitted counts instead of injecting marker elements.
+  applied to foreground and background responses. Protocol 1.13.5 semantics are
+  matched: oversized strings, nested lists and nested maps are trimmed in place;
+  error messages/details have their own bounded diagnostic budget so they cannot
+  evict a useful operation result; error codes are always capped to 128 characters;
+  request/response IDs are capped to 256 characters; and `_truncation.omitted`
+  reports JSON Pointer paths plus kept/omitted counts instead of marker elements.
 - 0.18 `_sx_timing` metadata is attached to ordinary foreground results for Hub-side timing; the hosted Hub consumes and strips it before caller-visible tool output.
 - Sentinel0² additionally attaches caller-visible `response_time` to every successful foreground `result` map as compact UTC `HH:MM:SS`. Background acknowledgements are stamped too. Keeping this additive extension inside `result` preserves the strict v1 response envelope while giving chat/model clients a cheap clock sample on every normal tool return. The former `agent.response_timestamp_interval_seconds` option is still accepted for config compatibility but is ignored.
 
@@ -127,6 +129,10 @@ Reference surfaces:
   results explicitly `partial`, with bounded `unreadable_dirs` evidence and a
   warning that absence was not proven.
 - Upstream 0.23.29–0.23.35 parity adds fresh edit mtimes, writable-handle cross-filesystem upload finalization with destination-oriented permission errors, stdio JSON-RPC/MCP local APIs with fixed argv and bounded child cleanup, 250 ms Happy-Eyeballs address racing for both normal and enrollment connections, secret edits with backup/diff/audit suppression, and fail-closed exec concessions including empty-allowlist deny-all, relative file operands, file-reading options and redirections.
+- Upstream 0.23.36–0.23.56 was reviewed cumulatively. Applicable Linux behavior is matched natively rather than copying the Python helper structure: process cancellation snapshots descendants before process-group kill and also terminates `setsid` escapees; Bash execution starts without profile/rc/BASH_ENV/exported-function hooks; custom edit validators and privileged edit commit helpers share the central bounded process lifecycle; script `cwd` is reflected in `PWD` and Python import order; hub URLs normalize optional `/agent/connect`; whole audit entries are capped to 64 KiB; upload chunk indexes are bounded without allocation proportional to the largest index; and trusted URL fetches retain DNS pinning plus proxy bypass prevention. The upstream Windows `icacls` timeout change is non-applicable to this Unix agent.
+- The 0.23.52/0.23.53 edit/create invariants are matched more strictly on Linux: a create commits with `RENAME_NOREPLACE` (with the same safe hard-link fallback used by `tempfile`) and a sudo create runs the same no-clobber commit primitive in a narrowly scoped privileged helper, so a path that appears after validation is never overwritten even on filesystems without hard-link support. Failed creates remove only empty parent directories that the edit itself created. Installations with custom narrow sudoers must permit the agent binary's hidden `--internal-commit-new` helper for `sudo=true` creates, analogous to upstream's exact-path `pensa-safe-edit` sudo rule; stock upstream installations already grant broader passwordless sudo.
+  Existing-file unprivileged in-place fallback is permitted only when a durable recovery backup exists, and a failed in-place write restores that copy before returning.
+- Upstream 0.23.54/0.23.55 total-budget cleanup fixes were reviewed. SentinelO² does not wrap git/project-snapshot subprocesses in a second outer cancellation budget: each child receives the authoritative bounded timeout directly from the central runner, which reports `left_running` and cleanup errors itself. The Python double-timeout propagation bug therefore has no corresponding Rust path.
 - Applicable Linux/cross-platform behavior through upstream 0.23.35 is
   matched. This includes host-valid config-edit guidance; `exec_mode`
   (`allowlist` by default, `strict`, `unrestricted`); whole-word command

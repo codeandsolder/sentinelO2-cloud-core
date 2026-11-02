@@ -105,7 +105,7 @@ pub fn file(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 
 /// # Errors
 /// Returns an error when the staged edit cannot be validated or finalized safely.
-pub fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+pub async fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let upload_id = require_str(payload, "upload_id")?;
     let mode = require_str(payload, "mode")?;
     require_str(payload, "path")?;
@@ -150,7 +150,7 @@ pub fn complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult 
         );
     }
 
-    let mut result = edit::edit(policy, &edit_payload)?;
+    let mut result = edit::edit(policy, &edit_payload).await?;
     if let Err(error) = fs::remove_dir_all(&dir) {
         let message = format!(
             "edit committed but upload-session cleanup failed for {}: {error}",
@@ -169,8 +169,8 @@ mod tests {
     use crate::test_support::{TestResult, TestValue as _};
     use tempfile::tempdir;
 
-    #[test]
-    fn chunked_write_flows_through_native_editor() -> TestResult {
+    #[tokio::test]
+    async fn chunked_write_flows_through_native_editor() -> TestResult {
         let dir = tempdir().test_value()?;
         let target = dir.path().join("x.txt");
         fs::write(&target, "before").test_value()?;
@@ -201,6 +201,7 @@ mod tests {
                 ("mode".into(), Value::String("write".into())),
             ]),
         )
+        .await
         .test_value()?;
         assert_eq!(result["ok"], true);
         assert_eq!(fs::read_to_string(target).test_value()?, "after");

@@ -1,7 +1,8 @@
 use crate::{
+    fsutil::install_file_no_replace,
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
-    process_output::read_bounded_sync,
+    process_runner::{self, ProcessFailure, ProcessGroupKill, ProcessOutcome, RunOptions},
 };
 use rand::RngExt;
 use regex::RegexBuilder;
@@ -10,10 +11,9 @@ use similar::{ChangeTag, TextDiff};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{self, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -417,107 +417,110 @@ fn validator_argv(
     Ok((!argv.is_empty()).then_some(argv))
 }
 
-fn timed_out_validator_error(child: &mut std::process::Child, pid: u32) -> HandlerError {
-    let mut cleanup_error = None;
-    #[cfg(unix)]
-    {
-        let process_group = nix::unistd::Pid::from_raw(pid.cast_signed());
-        if let Err(error) =
-            nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL)
-            && error != nix::errno::Errno::ESRCH
-        {
-            let message = format!("failed killing validator process group: {error}");
-            tracing::warn!(%message);
-            cleanup_error = Some(message);
+fn process_failure(code: &'static str, context: &str, failure: ProcessFailure) -> HandlerError {
+    match failure {
+        ProcessFailure::Setup(error) => error,
+        ProcessFailure::Spawn(error) => HandlerError::new(code, format!("{context}: {error}")),
+        ProcessFailure::Capture {
+            error,
+            cleanup_error,
+        } => {
+            let mut details = Map::new();
+            if let Some(cleanup_error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(cleanup_error));
+            }
+            HandlerError::with_details(code, format!("{context}: {error}"), details)
         }
     }
-    if let Err(error) = child.wait() {
-        let message = format!("failed reaping timed-out validator: {error}");
-        tracing::warn!(%message);
-        cleanup_error.get_or_insert(message);
-    }
-    let details = cleanup_error.map_or_else(Map::new, |error| {
-        Map::from_iter([("cleanup_error".into(), Value::String(error))])
-    });
-    HandlerError::with_details(
-        "validation_timeout",
-        format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
-        details,
-    )
 }
 
-fn execute_validator(policy: &Policy, argv: &[String]) -> Result<(), HandlerError> {
-    use wait_timeout::ChildExt as _;
+fn uses_sudo(policy: &Policy, argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let configured = policy.tooling.command("sudo");
+    Path::new(program) == configured
+        || (Path::new(program).file_name() == Some(std::ffi::OsStr::new("sudo"))
+            && configured.file_name() == Some(std::ffi::OsStr::new("sudo")))
+}
 
-    let mut command = Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
+fn killer_for_argv(policy: &Policy, argv: &[String]) -> Result<ProcessGroupKill, HandlerError> {
+    if uses_sudo(policy, argv) {
+        ProcessGroupKill::sudo(policy)
+    } else {
+        Ok(ProcessGroupKill::Direct)
     }
-    policy.tooling.configure_std(&mut command)?;
-    let mut child = command.spawn().map_err(|e| {
-        HandlerError::new(
+}
+
+async fn execute_validator(policy: &Policy, argv: &[String]) -> Result<(), HandlerError> {
+    let outcome = process_runner::run_argv_with_limits(
+        policy,
+        argv,
+        VALIDATOR_TIMEOUT,
+        RunOptions {
+            cwd: None,
+            env: None,
+            sanitize_bash_startup: false,
+            stdin: None,
+            stdout_limit: VALIDATOR_CAPTURE_BYTES / 2,
+            stderr_limit: VALIDATOR_CAPTURE_BYTES / 2,
+            killer: killer_for_argv(policy, argv)?,
+        },
+    )
+    .await
+    .map_err(|failure| {
+        process_failure(
             "validation_failed",
-            format!("failed starting validator {:?}: {e}", argv[0]),
+            &format!(
+                "failed running validator {:?}",
+                argv.first().map_or("", String::as_str)
+            ),
+            failure,
         )
     })?;
-    let pid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| HandlerError::new("validation_failed", "validator stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| HandlerError::new("validation_failed", "validator stderr was not piped"))?;
-    let per_stream = VALIDATOR_CAPTURE_BYTES / 2;
-    let stdout_reader = std::thread::spawn(move || read_bounded_sync(stdout, per_stream));
-    let stderr_reader = std::thread::spawn(move || read_bounded_sync(stderr, per_stream));
-    let Some(status) = child.wait_timeout(VALIDATOR_TIMEOUT).map_err(|e| {
-        HandlerError::new("validation_failed", format!("validator wait failed: {e}"))
-    })?
-    else {
-        return Err(timed_out_validator_error(&mut child, pid));
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| HandlerError::new("validation_failed", "validator stdout reader panicked"))?
-        .map_err(|e| {
-            HandlerError::new("validation_failed", format!("validator stdout failed: {e}"))
-        })?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| HandlerError::new("validation_failed", "validator stderr reader panicked"))?
-        .map_err(|e| {
-            HandlerError::new("validation_failed", format!("validator stderr failed: {e}"))
-        })?;
-    if status.success() {
-        return Ok(());
+
+    match outcome {
+        ProcessOutcome::Completed { captured, .. } if captured.status.success() => Ok(()),
+        ProcessOutcome::Completed { captured, .. } => {
+            let tail = [
+                captured.stdout.rendered_trimmed_lossy(),
+                captured.stderr.rendered_trimmed_lossy(),
+            ]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
+            Err(HandlerError::new(
+                "validation_failed",
+                if tail.is_empty() {
+                    "validation failed".into()
+                } else {
+                    format!("validation failed: {tail}")
+                },
+            ))
+        }
+        ProcessOutcome::TimedOut {
+            captured,
+            cleanup_error,
+            ..
+        } => {
+            let mut details = Map::new();
+            if captured.left_running {
+                details.insert("left_running".into(), Value::Bool(true));
+            }
+            if let Some(cleanup_error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(cleanup_error));
+            }
+            Err(HandlerError::with_details(
+                "validation_timeout",
+                format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
+                details,
+            ))
+        }
     }
-    let tail = [
-        stdout.rendered_trimmed_lossy(),
-        stderr.rendered_trimmed_lossy(),
-    ]
-    .into_iter()
-    .filter(|text| !text.is_empty())
-    .collect::<Vec<_>>()
-    .join(" / ");
-    Err(HandlerError::new(
-        "validation_failed",
-        if tail.is_empty() {
-            "validation failed".into()
-        } else {
-            format!("validation failed: {tail}")
-        },
-    ))
 }
 
-fn run_validator(
+async fn run_validator(
     policy: &Policy,
     staged_path: &Path,
     target_path: &Path,
@@ -566,7 +569,7 @@ fn run_validator(
     let Some(argv) = validator_argv(policy, &validate_path, preset, custom)? else {
         return Ok(None);
     };
-    execute_validator(policy, &argv)?;
+    execute_validator(policy, &argv).await?;
     drop(systemd_verify_dir);
     Ok(Some(argv))
 }
@@ -641,16 +644,110 @@ fn write_in_place_preserving_metadata(target: &Path, content: &str) -> Result<()
     Ok(())
 }
 
+#[derive(Debug)]
+struct CreatedParentDirs {
+    paths: Vec<PathBuf>,
+    keep: bool,
+}
+
+impl CreatedParentDirs {
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for CreatedParentDirs {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        for path in self.paths.iter().rev() {
+            match fs::remove_dir(path) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed cleaning parent directory created by failed edit"
+                ),
+            }
+        }
+    }
+}
+
+fn missing_parent_dirs(parent: &Path) -> Result<Vec<PathBuf>, HandlerError> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(parent);
+    while let Some(path) = cursor {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(HandlerError::new(
+                        "write_failed",
+                        format!("parent path is not a directory: {}", path.display()),
+                    ));
+                }
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(path.to_owned());
+                cursor = path.parent();
+            }
+            Err(error) => {
+                return Err(HandlerError::new(
+                    "write_failed",
+                    format!("failed inspecting parent {}: {error}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(missing)
+}
+
+fn ensure_parent_dirs(parent: &Path) -> Result<CreatedParentDirs, HandlerError> {
+    let missing = missing_parent_dirs(parent)?;
+    let mut created = CreatedParentDirs {
+        paths: Vec::new(),
+        keep: false,
+    };
+    for path in missing.into_iter().rev() {
+        match fs::create_dir(&path) {
+            Ok(()) => created.paths.push(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(error) => {
+                return Err(HandlerError::new(
+                    "write_failed",
+                    format!("failed creating parent {}: {error}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn require_recovery_backup(recovery_backup: Option<&Path>) -> Result<&Path, HandlerError> {
+    recovery_backup.ok_or_else(|| {
+        HandlerError::new(
+            "write_failed",
+            "cannot preserve target ownership with an atomic replacement, and no recovery backup exists; retry with sudo=true or allow a backup",
+        )
+    })
+}
+
 fn atomic_replace(
     target: &Path,
     content: &str,
     original_meta: Option<&fs::Metadata>,
+    recovery_backup: Option<&Path>,
 ) -> Result<bool, HandlerError> {
     let parent = target
         .parent()
         .ok_or_else(|| HandlerError::new("write_failed", "target has no parent directory"))?;
-    fs::create_dir_all(parent)
-        .map_err(|e| HandlerError::new("write_failed", format!("failed creating parent: {e}")))?;
+    let mut created_parents = ensure_parent_dirs(parent)?;
     let prefix = format!(
         ".{}.sentinel0-",
         target
@@ -702,9 +799,36 @@ fn atomic_replace(
                     if target.exists() && !target.is_symlink() =>
                 {
                     // Replacing the inode here would hand the file to the agent.
-                    // The backup already exists, so preserve the original inode
-                    // (and therefore owner/group/mode/ACLs) and write through it.
-                    write_in_place_preserving_metadata(target, content)?;
+                    // In-place mutation is only safe when a durable recovery copy
+                    // already exists: otherwise a short write or crash can corrupt
+                    // a secret/no-backup edit irreversibly.
+                    let recovery_backup = require_recovery_backup(recovery_backup)?;
+                    if let Err(mut write_error) =
+                        write_in_place_preserving_metadata(target, content)
+                    {
+                        let recovery = fs::read_to_string(recovery_backup)
+                            .map_err(|error| format!("failed reading recovery backup: {error}"))
+                            .and_then(|original| {
+                                write_in_place_preserving_metadata(target, &original).map_err(
+                                    |error| {
+                                        format!(
+                                            "failed restoring recovery backup: {}",
+                                            error.message
+                                        )
+                                    },
+                                )
+                            });
+                        match recovery {
+                            Ok(()) => write_error
+                                .message
+                                .push_str("; original content restored from recovery backup"),
+                            Err(recovery_error) => {
+                                write_error.message.push_str("; recovery also failed: ");
+                                write_error.message.push_str(&recovery_error);
+                            }
+                        }
+                        return Err(write_error);
+                    }
                     return Ok(true);
                 }
                 Err(error) => {
@@ -719,16 +843,191 @@ fn atomic_replace(
     temp.as_file()
         .sync_all()
         .map_err(|e| HandlerError::new("write_failed", format!("failed syncing temp file: {e}")))?;
-    temp.persist(target).map_err(|error| {
-        HandlerError::new(
-            "write_failed",
-            format!("atomic replace failed: {}", error.error),
-        )
-    })?;
+    if original_meta.is_none() {
+        install_file_no_replace(temp.path(), target).map_err(|error| {
+            HandlerError::new(
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    "target_exists"
+                } else {
+                    "write_failed"
+                },
+                format!("atomic create failed: {error}"),
+            )
+        })?;
+    } else {
+        temp.persist(target).map_err(|error| {
+            HandlerError::new(
+                "write_failed",
+                format!("atomic replace failed: {}", error.error),
+            )
+        })?;
+    }
+    created_parents.keep();
     Ok(false)
 }
 
-fn sudo_replace(
+const SUDO_EDIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn run_sudo_edit_step(
+    policy: &Policy,
+    argv: &[String],
+    context: &str,
+) -> Result<(), HandlerError> {
+    let outcome = process_runner::run_argv(
+        policy,
+        argv,
+        SUDO_EDIT_TIMEOUT,
+        None,
+        None,
+        ProcessGroupKill::sudo(policy)?,
+    )
+    .await
+    .map_err(|failure| process_failure("write_failed", context, failure))?;
+    match outcome {
+        ProcessOutcome::Completed { captured, .. } if captured.status.success() => Ok(()),
+        ProcessOutcome::Completed { captured, .. } => {
+            let tail = [
+                captured.stdout.rendered_trimmed_lossy(),
+                captured.stderr.rendered_trimmed_lossy(),
+            ]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
+            Err(HandlerError::new(
+                "write_failed",
+                if tail.is_empty() {
+                    format!("{context}: {}", captured.status)
+                } else {
+                    format!("{context}: {}: {tail}", captured.status)
+                },
+            ))
+        }
+        ProcessOutcome::TimedOut {
+            captured,
+            cleanup_error,
+            ..
+        } => {
+            let mut details = Map::new();
+            if captured.left_running {
+                details.insert("left_running".into(), Value::Bool(true));
+            }
+            if let Some(cleanup_error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(cleanup_error));
+            }
+            Err(HandlerError::with_details(
+                "write_failed",
+                format!(
+                    "{context}: timed out after {} seconds",
+                    SUDO_EDIT_TIMEOUT.as_secs()
+                ),
+                details,
+            ))
+        }
+    }
+}
+
+async fn cleanup_sudo_temp(policy: &Policy, temp: &Path, context: &str) -> Option<String> {
+    let argv = vec![
+        policy.tooling.command("sudo").display().to_string(),
+        "-n".into(),
+        "rm".into(),
+        "-f".into(),
+        "--".into(),
+        temp.display().to_string(),
+    ];
+    run_sudo_edit_step(policy, &argv, context)
+        .await
+        .err()
+        .map(|error| error.message)
+}
+
+async fn cleanup_sudo_dirs(policy: &Policy, dirs: &[PathBuf]) {
+    for dir in dirs {
+        let argv = vec![
+            policy.tooling.command("sudo").display().to_string(),
+            "-n".into(),
+            "rmdir".into(),
+            "--".into(),
+            dir.display().to_string(),
+        ];
+        if let Err(error) = run_sudo_edit_step(policy, &argv, "sudo parent cleanup failed").await {
+            tracing::debug!(
+                path = %dir.display(),
+                message = %error.message,
+                "leaving parent directory that is no longer safely removable"
+            );
+        }
+    }
+}
+
+async fn run_sudo_commit_new(
+    policy: &Policy,
+    source: &Path,
+    target: &Path,
+) -> Result<(), HandlerError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        HandlerError::new(
+            "write_failed",
+            format!("failed locating agent executable for privileged commit: {error}"),
+        )
+    })?;
+    let argv = vec![
+        policy.tooling.command("sudo").display().to_string(),
+        "-n".into(),
+        executable.display().to_string(),
+        "--internal-commit-new".into(),
+        source.display().to_string(),
+        target.display().to_string(),
+    ];
+    let outcome = process_runner::run_argv(
+        policy,
+        &argv,
+        SUDO_EDIT_TIMEOUT,
+        None,
+        None,
+        ProcessGroupKill::sudo(policy)?,
+    )
+    .await
+    .map_err(|failure| process_failure("write_failed", "sudo atomic create failed", failure))?;
+
+    match outcome {
+        ProcessOutcome::Completed { captured, .. } if captured.status.success() => Ok(()),
+        ProcessOutcome::Completed { captured, .. } if captured.status.code() == Some(17) => {
+            Err(HandlerError::new(
+                "target_exists",
+                format!(
+                    "{} appeared while the edit was being prepared",
+                    target.display()
+                ),
+            ))
+        }
+        ProcessOutcome::Completed { captured, .. } => Err(HandlerError::new(
+            "write_failed",
+            format!("sudo atomic create failed: {}", captured.status),
+        )),
+        ProcessOutcome::TimedOut {
+            captured,
+            cleanup_error,
+            ..
+        } => {
+            let mut details = Map::new();
+            if captured.left_running {
+                details.insert("left_running".into(), Value::Bool(true));
+            }
+            if let Some(cleanup_error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(cleanup_error));
+            }
+            Err(HandlerError::with_details(
+                "write_failed",
+                "sudo atomic create timed out",
+                details,
+            ))
+        }
+    }
+}
+
+async fn sudo_replace(
     policy: &Policy,
     target: &Path,
     staged: &Path,
@@ -737,6 +1036,11 @@ fn sudo_replace(
     let parent = target
         .parent()
         .ok_or_else(|| HandlerError::new("write_failed", "target has no parent directory"))?;
+    let new_dirs = if original_meta.is_none() {
+        missing_parent_dirs(parent)?
+    } else {
+        Vec::new()
+    };
     let temp = parent.join(format!(
         ".{}.sentinel0-{:016x}.tmp",
         target
@@ -746,54 +1050,81 @@ fn sudo_replace(
         rand::rng().random::<u64>()
     ));
 
-    let mut install = Command::new(policy.tooling.command("sudo"));
-    install.arg("-n").arg("install");
+    let mut install = vec![
+        policy.tooling.command("sudo").display().to_string(),
+        "-n".into(),
+        "install".into(),
+    ];
     if let Some(meta) = original_meta {
-        install
-            .arg("-m")
-            .arg(format!("{:o}", meta.mode() & 0o7777))
-            .arg("-o")
-            .arg(meta.uid().to_string())
-            .arg("-g")
-            .arg(meta.gid().to_string());
+        install.extend([
+            "-m".into(),
+            format!("{:o}", meta.mode() & 0o7777),
+            "-o".into(),
+            meta.uid().to_string(),
+            "-g".into(),
+            meta.gid().to_string(),
+        ]);
+    } else {
+        install.extend(["-D".into(), "-m".into(), "600".into()]);
     }
-    policy.tooling.configure_std(&mut install)?;
-    let status = install
-        .arg(staged)
-        .arg(&temp)
-        .status()
-        .map_err(|e| HandlerError::new("write_failed", format!("sudo install failed: {e}")))?;
-    let cleanup_temp = |context: &str| -> Option<String> {
-        let mut cleanup = Command::new(policy.tooling.command("sudo"));
-        cleanup.args(["-n", "rm", "-f"]).arg(&temp);
-        if let Err(error) = policy.tooling.configure_std(&mut cleanup) {
-            return Some(format!("{context}; temp cleanup setup failed: {error}"));
-        }
-        match cleanup.status() {
-            Ok(status) if status.success() => None,
-            Ok(status) => Some(format!(
-                "{context}; temp cleanup command exited with {status}"
-            )),
-            Err(error) => Some(format!("{context}; temp cleanup failed: {error}")),
-        }
-    };
-
-    if !status.success() {
-        let message =
-            cleanup_temp("sudo install failed").unwrap_or_else(|| "sudo install failed".into());
-        return Err(HandlerError::new("write_failed", message));
+    install.extend([
+        "--".into(),
+        staged.display().to_string(),
+        temp.display().to_string(),
+    ]);
+    if let Err(error) = run_sudo_edit_step(policy, &install, "sudo install failed").await {
+        let cleanup = cleanup_sudo_temp(policy, &temp, "sudo install temp cleanup failed").await;
+        cleanup_sudo_dirs(policy, &new_dirs).await;
+        let message = error.message;
+        return Err(HandlerError::new(
+            "write_failed",
+            cleanup.map_or_else(
+                || message.clone(),
+                |cleanup| format!("{message}; {cleanup}"),
+            ),
+        ));
     }
 
-    let mut mv = Command::new(policy.tooling.command("sudo"));
-    mv.args(["-n", "mv", "-f"]).arg(&temp).arg(target);
-    policy.tooling.configure_std(&mut mv)?;
-    let status = mv
-        .status()
-        .map_err(|e| HandlerError::new("write_failed", format!("sudo mv failed: {e}")))?;
-    if !status.success() {
-        let message = cleanup_temp("sudo atomic rename failed")
-            .unwrap_or_else(|| "sudo atomic rename failed".into());
-        return Err(HandlerError::new("write_failed", message));
+    if original_meta.is_none() {
+        if let Err(error) = run_sudo_commit_new(policy, &temp, target).await {
+            let cleanup = cleanup_sudo_temp(policy, &temp, "sudo create temp cleanup failed").await;
+            cleanup_sudo_dirs(policy, &new_dirs).await;
+            let message = error.message;
+            return Err(HandlerError::new(
+                error.code,
+                cleanup.map_or_else(
+                    || message.clone(),
+                    |cleanup| format!("{message}; {cleanup}"),
+                ),
+            ));
+        }
+        if let Some(cleanup) =
+            cleanup_sudo_temp(policy, &temp, "sudo committed-temp cleanup failed").await
+        {
+            tracing::warn!(%cleanup, "sudo create committed but adjacent temp cleanup failed");
+        }
+        return Ok(());
+    }
+
+    let mv = vec![
+        policy.tooling.command("sudo").display().to_string(),
+        "-n".into(),
+        "mv".into(),
+        "-f".into(),
+        "--".into(),
+        temp.display().to_string(),
+        target.display().to_string(),
+    ];
+    if let Err(error) = run_sudo_edit_step(policy, &mv, "sudo atomic rename failed").await {
+        let cleanup = cleanup_sudo_temp(policy, &temp, "sudo rename temp cleanup failed").await;
+        let message = error.message;
+        return Err(HandlerError::new(
+            "write_failed",
+            cleanup.map_or_else(
+                || message.clone(),
+                |cleanup| format!("{message}; {cleanup}"),
+            ),
+        ));
     }
     Ok(())
 }
@@ -873,7 +1204,7 @@ fn stage_edit(
     Ok(staged)
 }
 
-fn apply_edit(
+async fn apply_edit(
     policy: &Policy,
     target: &EditTarget,
     staged: &Path,
@@ -916,10 +1247,15 @@ fn apply_edit(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let in_place = if sudo {
-        sudo_replace(policy, &target.path, staged, target.metadata.as_ref())?;
+        sudo_replace(policy, &target.path, staged, target.metadata.as_ref()).await?;
         false
     } else {
-        atomic_replace(&target.path, updated, target.metadata.as_ref())?
+        atomic_replace(
+            &target.path,
+            updated,
+            target.metadata.as_ref(),
+            backup.as_deref(),
+        )?
     };
     Ok((backup, in_place))
 }
@@ -983,7 +1319,7 @@ fn edit_result(outcome: EditOutcome<'_>) -> BTreeMap<String, Value> {
 
 /// # Errors
 /// Returns an error when the edit request is invalid, disallowed, or cannot be applied safely.
-pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+pub async fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let started = Instant::now();
     let raw_path = require_str(payload, "path")?;
     let mode = require_str(payload, "mode")?;
@@ -1003,7 +1339,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     }
 
     let staged = stage_edit(policy, &target.path, &updated)?;
-    let validator = run_validator(policy, staged.path(), &target.path, payload)?;
+    let validator = run_validator(policy, staged.path(), &target.path, payload).await?;
     let diff = payload
         .get("diff")
         .and_then(Value::as_bool)
@@ -1013,7 +1349,7 @@ pub fn edit(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (backup, in_place) = apply_edit(policy, &target, staged.path(), &updated, payload)?;
+    let (backup, in_place) = apply_edit(policy, &target, staged.path(), &updated, payload).await?;
     let sudo = payload
         .get("sudo")
         .and_then(Value::as_bool)
@@ -1040,6 +1376,52 @@ mod tests {
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
+    #[test]
+    fn create_commit_never_overwrites_a_target_that_appeared_after_validation() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let target = dir.path().join("new.txt");
+        fs::write(&target, "racer won").test_value()?;
+        let error = atomic_replace(&target, "our content", None, None).test_error()?;
+        assert_eq!(error.code, "target_exists");
+        assert_eq!(fs::read_to_string(target).test_value()?, "racer won");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_parent_dirs_are_deepest_first_and_stop_at_existing_parent() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let existing = dir.path().join("existing");
+        fs::create_dir(&existing).test_value()?;
+        let a = existing.join("a");
+        let b = a.join("b");
+        assert_eq!(missing_parent_dirs(&b).test_value()?, vec![b, a]);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_create_removes_only_parent_directories_it_created() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let preserved = dir.path().join("preserved");
+        fs::create_dir(&preserved).test_value()?;
+        let created_root = preserved.join("new-a");
+        let target = created_root.join("new-b").join("x".repeat(300));
+        let error = atomic_replace(&target, "data", None, None).test_error()?;
+        assert_eq!(error.code, "write_failed");
+        assert!(preserved.exists());
+        assert!(!created_root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn in_place_fallback_requires_a_durable_recovery_copy() -> TestResult {
+        let error = require_recovery_backup(None).test_error()?;
+        assert_eq!(error.code, "write_failed");
+        assert!(error.message.contains("sudo=true"));
+        let path = Path::new("/tmp/recovery-copy");
+        assert_eq!(require_recovery_backup(Some(path)).test_value()?, path);
+        Ok(())
+    }
+
     fn policy(root: &Path) -> Policy {
         Policy {
             upload_base: root.to_owned(),
@@ -1051,8 +1433,117 @@ mod tests {
         }
     }
 
-    #[test]
-    fn edit_updates_mtime_instead_of_preserving_stale_source_timestamp() -> TestResult {
+    async fn wait_for_path(path: &Path) -> bool {
+        for _ in 0..150 {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    async fn wait_for_process_exit(pid: i32) -> bool {
+        for _ in 0..150 {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
+            match stat {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+                Ok(stat) => {
+                    if stat
+                        .rsplit_once(") ")
+                        .is_some_and(|(_, tail)| tail.starts_with('Z'))
+                    {
+                        return true;
+                    }
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn cancelling_edit_kills_escaped_validator_descendants_before_any_commit() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let target = dir.path().join("target.txt");
+        fs::write(&target, "old").test_value()?;
+        let child_pid = dir.path().join("escaped.pid");
+        let validator = dir.path().join("validator.sh");
+        fs::write(
+            &validator,
+            format!(
+                "#!/bin/sh\nsetsid sh -c 'echo $$ > {}; sleep 30' &\nwhile [ ! -s {} ]; do sleep 0.01; done\nsleep 30\n",
+                child_pid.display(),
+                child_pid.display(),
+            ),
+        )
+        .test_value()?;
+        fs::set_permissions(&validator, fs::Permissions::from_mode(0o755)).test_value()?;
+
+        let task_policy = policy(dir.path());
+        let payload = Map::from_iter([
+            ("path".into(), Value::String(target.display().to_string())),
+            ("mode".into(), Value::String("write".into())),
+            ("new_text".into(), Value::String("new".into())),
+            (
+                "validator".into(),
+                Value::String(validator.display().to_string()),
+            ),
+        ]);
+        let task = tokio::spawn(async move { edit(&task_policy, &payload).await });
+        assert!(
+            wait_for_path(&child_pid).await,
+            "validator descendant never started"
+        );
+        let pid = fs::read_to_string(&child_pid)
+            .test_value()?
+            .trim()
+            .parse::<i32>()
+            .test_value()?;
+
+        task.abort();
+        let _ = task.await;
+        let exited = wait_for_process_exit(pid).await;
+        if !exited {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(
+            exited,
+            "escaped validator descendant {pid} survived edit cancellation"
+        );
+        assert_eq!(fs::read_to_string(&target).test_value()?, "old");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_validator_for_create_leaves_no_target_parent_directories() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let parent = dir.path().join("new-a/new-b");
+        let target = parent.join("target.txt");
+        let error = edit(
+            &policy(dir.path()),
+            &Map::from_iter([
+                ("path".into(), Value::String(target.display().to_string())),
+                ("mode".into(), Value::String("write".into())),
+                ("new_text".into(), Value::String("new".into())),
+                ("create".into(), Value::Bool(true)),
+                ("validator".into(), Value::String("/bin/false".into())),
+            ]),
+        )
+        .await
+        .test_error()?;
+        assert_eq!(error.code, "validation_failed");
+        assert!(!parent.exists());
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_updates_mtime_instead_of_preserving_stale_source_timestamp() -> TestResult {
         let dir = tempdir().test_value()?;
         let path = dir.path().join("x.txt");
         fs::write(&path, "old").test_value()?;
@@ -1067,6 +1558,7 @@ mod tests {
                 ("new_text".into(), Value::String("new".into())),
             ]),
         )
+        .await
         .test_value()?;
         assert_eq!(result["ok"], true);
         assert_eq!(fs::read_to_string(&path).test_value()?, "new");
@@ -1076,8 +1568,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn dry_run_create_leaves_target_tree_absent() -> TestResult {
+    #[tokio::test]
+    async fn dry_run_create_leaves_target_tree_absent() -> TestResult {
         let dir = tempdir().test_value()?;
         let target = dir.path().join("share").join("nested").join("new.txt");
 
@@ -1092,6 +1584,7 @@ mod tests {
                 ("diff".into(), Value::Bool(true)),
             ]),
         )
+        .await
         .test_value()?;
 
         assert_eq!(result["dry_run"], true);
@@ -1103,8 +1596,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn dry_run_existing_file_leaves_no_sibling_temp_or_content_change() -> TestResult {
+    #[tokio::test]
+    async fn dry_run_existing_file_leaves_no_sibling_temp_or_content_change() -> TestResult {
         let dir = tempdir().test_value()?;
         let target = dir.path().join("config.yaml");
         fs::write(&target, "a: 1\n").test_value()?;
@@ -1124,6 +1617,7 @@ mod tests {
                 ("diff".into(), Value::Bool(true)),
             ]),
         )
+        .await
         .test_value()?;
 
         assert_eq!(result["dry_run"], true);
@@ -1140,8 +1634,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn missing_target_without_create_leaves_parents_absent() -> TestResult {
+    #[tokio::test]
+    async fn missing_target_without_create_leaves_parents_absent() -> TestResult {
         let dir = tempdir().test_value()?;
         let target = dir.path().join("missing").join("x.txt");
         let error = edit(
@@ -1152,6 +1646,7 @@ mod tests {
                 ("new_text".into(), Value::String("x\n".into())),
             ]),
         )
+        .await
         .test_error()?;
 
         assert_eq!(error.code, "target_not_found");
@@ -1160,8 +1655,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn yaml_validation_rejects_bad_candidate_without_touching_target() -> TestResult {
+    #[tokio::test]
+    async fn yaml_validation_rejects_bad_candidate_without_touching_target() -> TestResult {
         let dir = tempdir().test_value()?;
         let path = dir.path().join("x.yaml");
         fs::write(&path, "ok: true\n").test_value()?;
@@ -1174,6 +1669,7 @@ mod tests {
                 ("validator_preset".into(), Value::String("yaml".into())),
             ]),
         )
+        .await
         .test_error()?;
         assert_eq!(error.code, "validation_failed");
         assert_eq!(fs::read_to_string(&path).test_value()?, "ok: true\n");
@@ -1210,8 +1706,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn systemd_drop_in_is_refused_before_the_target_changes() -> TestResult {
+    #[tokio::test]
+    async fn systemd_drop_in_is_refused_before_the_target_changes() -> TestResult {
         let dir = tempdir().test_value()?;
         let dropin_dir = dir.path().join("demo.service.d");
         fs::create_dir(&dropin_dir).test_value()?;
@@ -1230,6 +1726,7 @@ mod tests {
                 ("validator_preset".into(), Value::String("systemd".into())),
             ]),
         )
+        .await
         .test_error()?;
 
         assert_eq!(error.code, "validator_unsupported");
@@ -1241,8 +1738,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn systemd_unit_is_verified_under_its_real_filename() -> TestResult {
+    #[tokio::test]
+    async fn systemd_unit_is_verified_under_its_real_filename() -> TestResult {
         let dir = tempdir().test_value()?;
         let policy = policy(dir.path());
         if !policy.tooling.command("systemd-analyze").exists() {
@@ -1271,6 +1768,7 @@ mod tests {
                 ("dry_run".into(), Value::Bool(true)),
             ]),
         )
+        .await
         .test_value()?;
 
         let validator = result["validator"].as_array().test_value()?;
@@ -1287,8 +1785,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn secret_edit_writes_without_backup_or_diff_and_rejects_leaky_options() -> TestResult {
+    #[tokio::test]
+    async fn secret_edit_writes_without_backup_or_diff_and_rejects_leaky_options() -> TestResult {
         let dir = tempdir().test_value()?;
         let path = dir.path().join("secret.env");
         fs::write(&path, "TOKEN=old\n").test_value()?;
@@ -1301,6 +1799,7 @@ mod tests {
                 ("secret".into(), Value::Bool(true)),
             ]),
         )
+        .await
         .test_value()?;
         assert_eq!(fs::read_to_string(&path).test_value()?, "TOKEN=new\n");
         assert!(!result.contains_key("backup"));
@@ -1332,6 +1831,7 @@ mod tests {
                     (key.into(), value),
                 ]),
             )
+            .await
             .test_error()?;
             assert_eq!(error.code, "invalid_payload");
         }

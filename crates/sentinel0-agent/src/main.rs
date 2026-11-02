@@ -38,9 +38,74 @@ struct Args {
     relay_timeout: f64,
     #[arg(long, hide = true)]
     ssh_execution_target: Option<String>,
+    #[arg(long, hide = true, num_args = 2, value_names = ["SOURCE", "TARGET"])]
+    internal_commit_new: Option<Vec<PathBuf>>,
+}
+
+const EXIT_INTERNAL_TARGET_EXISTS: i32 = 17;
+
+fn run_internal_commit_new(paths: &[PathBuf]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let [source, target] = paths else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internal commit requires SOURCE and TARGET",
+        ));
+    };
+    let source_parent = source.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internal commit source has no parent directory",
+        )
+    })?;
+    let target_parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internal commit target has no parent directory",
+        )
+    })?;
+    if source_parent != target_parent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internal commit source must be adjacent to its target",
+        ));
+    }
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let source_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let expected_prefix = format!(".{target_name}.sentinel0-");
+    if !source_name.starts_with(&expected_prefix) || !source_name.ends_with(".tmp") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internal commit source is not a SentinelO² adjacent edit temp",
+        ));
+    }
+    if !std::fs::symlink_metadata(source)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internal commit source must be a regular file",
+        ));
+    }
+    let mode = sentinel0_agent::fsutil::regular_create_mode(target_parent)?;
+    std::fs::set_permissions(source, std::fs::Permissions::from_mode(mode))?;
+    sentinel0_agent::fsutil::install_file_no_replace(source, target)
+}
+
+fn normalized_hub_base(hub: &str) -> &str {
+    hub.trim_end_matches('/')
+        .strip_suffix("/agent/connect")
+        .unwrap_or_else(|| hub.trim_end_matches('/'))
+        .trim_end_matches('/')
 }
 
 fn ws_base(hub: &str) -> String {
+    let hub = normalized_hub_base(hub);
     hub.strip_prefix("https://").map_or_else(
         || {
             hub.strip_prefix("http://")
@@ -51,6 +116,7 @@ fn ws_base(hub: &str) -> String {
 }
 
 fn http_base(hub: &str) -> String {
+    let hub = normalized_hub_base(hub);
     hub.strip_prefix("wss://").map_or_else(
         || {
             hub.strip_prefix("ws://")
@@ -213,6 +279,115 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         sentinel0_agent::ssh_target::run_helper(destination).await?;
         return Ok(());
     }
+    if let Some(paths) = args.internal_commit_new.as_deref() {
+        match run_internal_commit_new(paths) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                eprintln!("target already exists");
+                std::process::exit(EXIT_INTERNAL_TARGET_EXISTS);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     init_tracing(&args.log_level);
     run_agent(args).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_url_forms_normalize_to_the_same_bases() {
+        for (given, http, ws) in [
+            (
+                "wss://localhost:8000/agent/connect",
+                "https://localhost:8000",
+                "wss://localhost:8000",
+            ),
+            (
+                "wss://localhost:8000/agent/connect/",
+                "https://localhost:8000",
+                "wss://localhost:8000",
+            ),
+            (
+                "https://localhost:8000",
+                "https://localhost:8000",
+                "wss://localhost:8000",
+            ),
+            (
+                "https://mcp.sentinelx.app/",
+                "https://mcp.sentinelx.app",
+                "wss://mcp.sentinelx.app",
+            ),
+            (
+                "ws://10.0.0.5:8000",
+                "http://10.0.0.5:8000",
+                "ws://10.0.0.5:8000",
+            ),
+            (
+                "http://10.0.0.5:8000/agent/connect",
+                "http://10.0.0.5:8000",
+                "ws://10.0.0.5:8000",
+            ),
+        ] {
+            assert_eq!(http_base(given), http, "{given}");
+            assert_eq!(ws_base(given), ws, "{given}");
+        }
+    }
+    #[test]
+    fn internal_commit_cli_requires_exactly_two_paths() {
+        let args = Args::try_parse_from([
+            "sentinelx-core",
+            "--internal-commit-new",
+            "/tmp/source",
+            "/tmp/target",
+        ])
+        .expect("internal commit arguments");
+        assert_eq!(
+            args.internal_commit_new.as_deref(),
+            Some(&[PathBuf::from("/tmp/source"), PathBuf::from("/tmp/target")][..])
+        );
+        assert!(
+            Args::try_parse_from(["sentinelx-core", "--internal-commit-new", "/tmp/only"]).is_err()
+        );
+    }
+
+    #[test]
+    fn internal_commit_is_no_clobber_and_applies_plain_create_mode() {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        let source = dir.path().join(".target.sentinel0-first.tmp");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&source)
+            .expect("source");
+        std::fs::write(&source, b"payload").expect("source content");
+        let expected_mode =
+            sentinel0_agent::fsutil::regular_create_mode(dir.path()).expect("plain create mode");
+        run_internal_commit_new(&[source.clone(), target.clone()]).expect("commit");
+        assert_eq!(std::fs::read(&target).expect("target content"), b"payload");
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            expected_mode
+        );
+
+        let second = dir.path().join(".target.sentinel0-second.tmp");
+        std::fs::write(&second, b"replacement").expect("second source");
+        let error = run_internal_commit_new(&[second.clone(), target.clone()])
+            .expect_err("existing target must win");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&target).expect("preserved target"),
+            b"payload"
+        );
+    }
 }

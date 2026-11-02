@@ -1198,10 +1198,8 @@ impl CoreDispatcher {
                     scan_deadline.unwrap_or_else(Instant::now),
                     scan_budget,
                 ),
-                Op::Edit => edit::edit(&policy, &payload),
                 Op::EditUploadInit => crate::edit_upload::init(&policy),
                 Op::EditUploadFile => crate::edit_upload::file(&policy, &payload),
-                Op::EditUploadComplete => crate::edit_upload::complete(&policy, &payload),
                 Op::UploadInit => crate::upload::upload_init(&policy, &payload),
                 Op::UploadChunk => crate::upload::upload_chunk(&policy, &payload),
                 Op::UploadComplete => crate::upload::upload_complete(&policy, &payload),
@@ -1288,13 +1286,16 @@ impl CoreDispatcher {
             },
             Op::Service => (self.service(&payload, false).await, None),
             Op::Restart => (self.service(&payload, true).await, None),
+            Op::Edit => (edit::edit(&self.policy, &payload).await, None),
+            Op::EditUploadComplete => (
+                crate::edit_upload::complete(&self.policy, &payload).await,
+                None,
+            ),
             Op::Read
             | Op::List
             | Op::Search
-            | Op::Edit
             | Op::EditUploadInit
             | Op::EditUploadFile
-            | Op::EditUploadComplete
             | Op::UploadInit
             | Op::UploadChunk
             | Op::UploadComplete

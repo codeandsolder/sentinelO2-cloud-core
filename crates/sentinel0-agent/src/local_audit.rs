@@ -16,6 +16,7 @@ const RETENTION_CHECK_EVERY: usize = 100;
 const TAIL_BLOCK: usize = 64 * 1024;
 const MAX_AUDIT_TEXT_CHARS: usize = 65_536;
 const AUDIT_TEXT_HEAD_CHARS: usize = 2_048;
+const MAX_ENTRY_BYTES: usize = 64 * 1024;
 
 fn looks_tokenish(text: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_alphanumeric())
@@ -179,6 +180,87 @@ fn maybe_trim(path: &Path) -> std::io::Result<()> {
     file.commit()
 }
 
+fn payload_summary(payload: &Value) -> Value {
+    let raw = serde_json::to_vec(payload).unwrap_or_default();
+    let rendered = String::from_utf8_lossy(&raw);
+    let chars = rendered.chars().count();
+    let head = rendered
+        .chars()
+        .take(AUDIT_TEXT_HEAD_CHARS)
+        .collect::<String>();
+    let keys = payload.as_object().map(|object| {
+        let mut keys = object.keys().cloned().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.truncate(50);
+        keys
+    });
+    json!({
+        "_summarized": true,
+        "chars": chars,
+        "sha256": sha256_hex(&raw),
+        "keys": keys,
+        "head": head,
+    })
+}
+
+fn bounded_entry_line(mut entry: Value) -> Result<Vec<u8>, serde_json::Error> {
+    let mut line = serde_json::to_vec(&entry)?;
+    if line.len() <= MAX_ENTRY_BYTES {
+        return Ok(line);
+    }
+
+    if let Some(object) = entry.as_object_mut()
+        && let Some(payload) = object.get_mut("payload")
+    {
+        *payload = payload_summary(payload);
+    }
+    line = serde_json::to_vec(&entry)?;
+    if line.len() > MAX_ENTRY_BYTES
+        && let Some(payload) = entry.get_mut("payload")
+        && let Some(summary) = payload.as_object_mut()
+    {
+        summary.retain(|key, _| matches!(key.as_str(), "_summarized" | "chars" | "sha256"));
+    }
+
+    line = serde_json::to_vec(&entry)?;
+    if line.len() > MAX_ENTRY_BYTES
+        && let Some(object) = entry.as_object_mut()
+    {
+        for (key, value) in object {
+            if matches!(key.as_str(), "timestamp" | "op") {
+                continue;
+            }
+            let Some(text) = value.as_str() else {
+                continue;
+            };
+            if text.chars().count() <= AUDIT_TEXT_HEAD_CHARS {
+                continue;
+            }
+            let chars = text.chars().count();
+            let head = text.chars().take(AUDIT_TEXT_HEAD_CHARS).collect::<String>();
+            *value = Value::String(format!("{head}... [{chars} chars, truncated]"));
+        }
+    }
+
+    line = serde_json::to_vec(&entry)?;
+    if line.len() > MAX_ENTRY_BYTES {
+        let bytes = line.len();
+        let timestamp = entry.get("timestamp").cloned().unwrap_or(Value::Null);
+        let op = entry.get("op").cloned().unwrap_or(Value::Null);
+        let ok = entry.get("ok").cloned().unwrap_or(Value::Null);
+        entry = json!({
+            "timestamp": timestamp,
+            "op": op,
+            "ok": ok,
+            "truncated": true,
+            "bytes": bytes,
+        });
+        line = serde_json::to_vec(&entry)?;
+    }
+    debug_assert!(line.len() <= MAX_ENTRY_BYTES);
+    Ok(line)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RecordMeta<'a> {
     pub opaque_ref: Option<&'a str>,
@@ -233,7 +315,7 @@ pub(crate) fn record(op: &str, payload: &Map<String, Value>, meta: RecordMeta<'_
                 map.insert("result_returncode".into(), Value::from(value));
             }
         }
-        let line = serde_json::to_vec(&entry)?;
+        let line = bounded_entry_line(entry)?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         file.write_all(&line)?;
         file.write_all(b"\n")?;
@@ -448,6 +530,47 @@ mod tests {
         assert_eq!(summary["old"]["chars"], 11);
         assert_eq!(summary["new_text"]["chars"], 11);
         assert_eq!(summary["path"], "/tmp/secret");
+        Ok(())
+    }
+    #[test]
+    fn whole_entry_cap_handles_many_small_payload_values_and_utf8_bytes() -> TestResult {
+        let items = (0..4_500)
+            .map(|index| Value::String(format!("item-{index:04}-{}", "😀".repeat(40))))
+            .collect::<Vec<_>>();
+        let entry = json!({
+            "timestamp": "2026-11-02T20:00:00Z",
+            "op": "local_api",
+            "payload": {"endpoint": "e", "action": "a", "params": {"items": items}},
+            "ok": true,
+            "error": null,
+            "duration_ms": 1,
+        });
+        let line = bounded_entry_line(entry).test_value()?;
+        assert!(line.len() <= MAX_ENTRY_BYTES, "{}", line.len());
+        let decoded: Value = serde_json::from_slice(&line).test_value()?;
+        assert_eq!(decoded["payload"]["_summarized"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn whole_entry_cap_also_bounds_top_level_error_text() -> TestResult {
+        let entry = json!({
+            "timestamp": "2026-11-02T20:00:00Z",
+            "op": "exec",
+            "payload": {"command": "false"},
+            "ok": false,
+            "error": "E".repeat(300_000),
+            "duration_ms": 1,
+        });
+        let line = bounded_entry_line(entry).test_value()?;
+        assert!(line.len() <= MAX_ENTRY_BYTES, "{}", line.len());
+        let decoded: Value = serde_json::from_slice(&line).test_value()?;
+        assert_eq!(decoded["op"], "exec");
+        assert!(
+            decoded["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("EEE") && error.contains("truncated"))
+        );
         Ok(())
     }
 }

@@ -59,6 +59,6 @@
     "os": "linux"
   },
   "preferred_profile": "full",
-  "protocol_version": "1.13.2",
+  "protocol_version": "1.13.5",
   "type": "hello"
 }

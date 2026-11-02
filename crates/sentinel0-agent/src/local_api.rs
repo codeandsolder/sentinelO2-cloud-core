@@ -933,6 +933,7 @@ async fn call_via_run_as(
         RunOptions {
             cwd: None,
             env: None,
+            sanitize_bash_startup: false,
             stdin: Some(payload),
             stdout_limit: MAX_RESPONSE_BYTES,
             stderr_limit: RELAY_STDERR_BYTES,
