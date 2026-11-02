@@ -78,6 +78,7 @@ async fn run_git_capture(
         RunOptions {
             cwd: None,
             env: Some(&env),
+            sanitize_bash_startup: false,
             stdin,
             stdout_limit,
             stderr_limit: MAX_GIT_STDERR,

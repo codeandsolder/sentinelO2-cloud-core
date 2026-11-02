@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::process_output::LEFT_RUNNING_NOTE;
 use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
@@ -86,14 +84,58 @@ pub async fn run_shell(
     env: Option<&Map<String, Value>>,
 ) -> HandlerResult {
     let bash = policy.tooling.command("bash").display().to_string();
-    run_argv(
+    let argv = [
+        bash,
+        "--noprofile".into(),
+        "--norc".into(),
+        "-c".into(),
+        command.into(),
+    ];
+    let outcome = process_runner::run_bash_argv(
         policy,
-        &[bash, "-lc".into(), command.into()],
+        &argv,
         timeout_duration,
         cwd.map(Path::new),
         env,
+        ProcessGroupKill::Direct,
     )
-    .await
+    .await;
+    match outcome {
+        Ok(ProcessOutcome::Completed { captured, duration }) => {
+            let rc = captured.status.code().unwrap_or(-1);
+            let mut out = process_result(merged_output(&captured), duration, rc);
+            add_capture_metadata(&mut out, &captured.stdout, &captured.stderr);
+            Ok(out)
+        }
+        Ok(ProcessOutcome::TimedOut {
+            captured,
+            duration,
+            cleanup_error,
+        }) => {
+            let mut out = process_result(timeout_output(&captured), duration, -1);
+            add_timeout_metadata(&mut out, &captured, cleanup_error);
+            Ok(out)
+        }
+        Err(ProcessFailure::Setup(error)) => Err(error),
+        Err(ProcessFailure::Spawn(error)) => Err(HandlerError::new(
+            "exec_failed",
+            format!("failed starting Bash: {error}"),
+        )),
+        Err(ProcessFailure::Capture {
+            error,
+            cleanup_error,
+        }) => {
+            let mut details = Map::new();
+            if let Some(cleanup_error) = cleanup_error {
+                details.insert("cleanup_error".into(), Value::String(cleanup_error));
+            }
+            Err(HandlerError::with_details(
+                "exec_failed",
+                format!("command output capture failed: {error}"),
+                details,
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +186,41 @@ mod tests {
             .test_value()?;
         assert_eq!(result["output"], "⚠️ Sin salida");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shell_ignores_profiles_bash_env_and_exported_functions() -> TestResult {
+        let dir = tempfile::tempdir().test_value()?;
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).test_value()?;
+        for name in [".bash_profile", ".bash_login", ".profile", ".bashrc"] {
+            std::fs::write(home.join(name), "echo PROFILE_HIJACKED\n").test_value()?;
+        }
+        let bash_env = dir.path().join("bash_env.sh");
+        std::fs::write(&bash_env, "echo BASH_ENV_HIJACKED\n").test_value()?;
+        let env = Map::from_iter([
+            ("HOME".into(), Value::String(home.display().to_string())),
+            (
+                "BASH_ENV".into(),
+                Value::String(bash_env.display().to_string()),
+            ),
+            (
+                "BASH_FUNC_printf%%".into(),
+                Value::String("() { echo FUNCTION_HIJACKED; }".into()),
+            ),
+        ]);
+        let result = run_shell(
+            &Policy::default(),
+            "printf clean",
+            SUCCESS_TEST_TIMEOUT,
+            None,
+            Some(&env),
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["returncode"], 0);
+        assert_eq!(result["output"], "clean");
         Ok(())
     }
 
@@ -292,7 +369,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn escaped_descendant_is_reported_without_extending_timeout_indefinitely() -> TestResult {
+    async fn timeout_kills_descendants_that_escape_the_process_group() -> TestResult {
         let dir = tempfile::tempdir().test_value()?;
         let pidfile = dir.path().join("escaped.pid");
         let mut env = Map::new();
@@ -317,19 +394,17 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(result["timed_out"], true);
-        assert_eq!(result["left_running"], true);
+        assert!(!result.contains_key("left_running"));
         let output = result["output"].as_str().test_value()?;
         assert!(output.starts_with("⏱️ Timeout. Output written before the timeout:"));
         assert!(output.contains("started"));
-        assert!(output.contains(LEFT_RUNNING_NOTE));
 
         let stamp = child_stamp_from(&pidfile).await?;
-        let escaped = nix::unistd::Pid::from_raw(stamp.pid.cast_signed());
-        match nix::sys::signal::kill(escaped, nix::sys::signal::Signal::SIGKILL) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(error) => return Err(error.into()),
-        }
-        assert!(wait_for_process_exit(stamp).await);
+        assert!(
+            wait_for_process_exit(stamp).await,
+            "escaped descendant {} survived timeout cleanup",
+            stamp.pid
+        );
         Ok(())
     }
 

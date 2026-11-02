@@ -933,6 +933,7 @@ async fn call_via_run_as(
         RunOptions {
             cwd: None,
             env: None,
+            sanitize_bash_startup: false,
             stdin: Some(payload),
             stdout_limit: MAX_RESPONSE_BYTES,
             stderr_limit: RELAY_STDERR_BYTES,
@@ -2001,15 +2002,20 @@ else:
 out({'jsonrpc':'2.0','id':req['id'],'result':result})
 ",
         ).test_value()?;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).test_value()?;
+        // Execute a stable interpreter binary instead of the mutable fixture script itself.
+        // That keeps heavily parallel test runs out of Linux ETXTBSY if the freshly written
+        // fixture is ever observed open for writing; it is unrelated to stdio transport.
+        // Python still sees exactly [mode] in sys.argv[1..], so the argv assertions
+        // below keep testing the same protocol contract.
+        let python = Policy::default().tooling.command("python3");
         let endpoint = Endpoint {
             name: "fixture".into(),
             transport: "stdio".into(),
             protocol: "jsonrpc".into(),
-            path: script.display().to_string(),
+            path: python.display().to_string(),
             timeout: Duration::from_secs(5),
             run_as: None,
-            args: vec![mode.into()],
+            args: vec![script.display().to_string(), mode.into()],
             cwd: None,
             env: Map::new(),
             handshake: if mode == "mcp" {
@@ -2070,9 +2076,12 @@ out({'jsonrpc':'2.0','id':req['id'],'result':result})
     #[tokio::test]
     async fn stdio_world_writable_binary_is_refused() -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
-        let (_dir, endpoint) = stdio_fixture("echo")?;
-        std::fs::set_permissions(&endpoint.path, std::fs::Permissions::from_mode(0o702))
+        let (dir, mut endpoint) = stdio_fixture("echo")?;
+        let unsafe_program = dir.path().join("world-writable");
+        std::fs::write(&unsafe_program, b"not executed").test_value()?;
+        std::fs::set_permissions(&unsafe_program, std::fs::Permissions::from_mode(0o702))
             .test_value()?;
+        endpoint.path = unsafe_program.display().to_string();
         let error = call_action(&Policy::default(), &endpoint, "echo", &Map::new())
             .await
             .test_error()?;

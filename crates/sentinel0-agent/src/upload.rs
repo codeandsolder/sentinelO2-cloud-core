@@ -1,5 +1,5 @@
 use crate::{
-    fsutil::rename_no_replace,
+    fsutil::install_file_no_replace,
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
     staging,
@@ -22,6 +22,7 @@ use std::{
 use tokio::{fs as async_fs, io::AsyncWriteExt, net::lookup_host};
 
 pub const MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const MAX_CHUNK_INDEX: u32 = 100_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadMeta {
@@ -333,7 +334,7 @@ fn finalize_staged_upload(
     let first = if overwrite {
         fs::rename(source, destination)
     } else {
-        rename_no_replace(source, destination)
+        install_file_no_replace(source, destination)
     };
     match first {
         Ok(()) => return Ok(()),
@@ -358,7 +359,7 @@ fn finalize_staged_upload(
     if overwrite {
         fs::rename(&adjacent, destination)?;
     } else {
-        rename_no_replace(&adjacent, destination)?;
+        install_file_no_replace(&adjacent, destination)?;
     }
     fs::remove_file(source)
 }
@@ -560,6 +561,12 @@ pub fn write_transfer_part_at(
     index: u32,
     data: &[u8],
 ) -> Result<usize, HandlerError> {
+    if index >= MAX_CHUNK_INDEX {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            format!("index must be between 0 and {}", MAX_CHUNK_INDEX - 1),
+        ));
+    }
     let id = valid_upload_id(Some(&Value::String(upload_id.into())))?;
     let root = staging::staging_root(upload_base)
         .map_err(|e| HandlerError::new("io_error", e.to_string()))?;
@@ -604,9 +611,15 @@ pub fn upload_chunk(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
     let index = u32::try_from(index).map_err(|_| {
         HandlerError::new(
             "invalid_payload",
-            "index exceeds the chunked upload protocol limit",
+            format!("index must be between 0 and {}", MAX_CHUNK_INDEX - 1),
         )
     })?;
+    if index >= MAX_CHUNK_INDEX {
+        return Err(HandlerError::new(
+            "invalid_payload",
+            format!("index must be between 0 and {}", MAX_CHUNK_INDEX - 1),
+        ));
+    }
     let encoded = require_str(payload, "content_base64")?;
     let bytes = STANDARD
         .decode(encoded)
@@ -716,6 +729,107 @@ fn finalize_chunked_upload(
         .map_err(|error| finalization_error(&error, assembled, destination))
 }
 
+fn validated_upload_parts(dir: &Path) -> Result<Vec<PathBuf>, HandlerError> {
+    let mut indexed_parts = Vec::new();
+    for entry in fs::read_dir(dir.join("parts")).map_err(|error| {
+        HandlerError::new(
+            "invalid_state",
+            format!("cannot read upload parts: {error}"),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            HandlerError::new(
+                "invalid_state",
+                format!("cannot read upload part entry: {error}"),
+            )
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("part") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return Err(HandlerError::new(
+                "invalid_state",
+                "unexpected files among the upload chunks",
+            ));
+        };
+        let index = stem.parse::<u32>().map_err(|_| {
+            HandlerError::new("invalid_state", "unexpected files among the upload chunks")
+        })?;
+        if index >= MAX_CHUNK_INDEX || stem != format!("{index:08}") {
+            return Err(HandlerError::new(
+                "invalid_state",
+                "unexpected files among the upload chunks",
+            ));
+        }
+        indexed_parts.push((index, path));
+    }
+    indexed_parts.sort_unstable_by_key(|(index, _)| *index);
+    if indexed_parts.is_empty() {
+        return Err(HandlerError::new("invalid_state", "no chunks uploaded"));
+    }
+    require_contiguous_parts(&indexed_parts)?;
+    Ok(indexed_parts.into_iter().map(|(_, path)| path).collect())
+}
+
+fn require_contiguous_parts(indexed_parts: &[(u32, PathBuf)]) -> Result<(), HandlerError> {
+    let mut missing = Vec::new();
+    let mut expected = 0_u32;
+    for (index, _) in indexed_parts {
+        while expected < *index && missing.len() < 100 {
+            missing.push(expected);
+            expected = expected.saturating_add(1);
+        }
+        if missing.len() >= 100 {
+            break;
+        }
+        expected = index.saturating_add(1);
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let shown = missing.iter().take(20).copied().collect::<Vec<_>>();
+    Err(HandlerError::with_details(
+        "incomplete_upload",
+        format!("chunks must be numbered 0..N-1 with none missing; missing: {shown:?}"),
+        Map::from_iter([(
+            "missing".into(),
+            Value::Array(missing.into_iter().map(Value::from).collect()),
+        )]),
+    ))
+}
+
+fn validate_completed_upload(
+    meta: &UploadMeta,
+    payload: &Map<String, Value>,
+    total: u64,
+    sha256: &str,
+) -> Result<(), HandlerError> {
+    if meta.total_size != 0 && meta.total_size != total {
+        return Err(HandlerError::new(
+            "size_mismatch",
+            format!("expected {}, got {total}", meta.total_size),
+        ));
+    }
+    let Some(expected) = payload.get("sha256").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(HandlerError::new(
+            "invalid_sha256",
+            "expected a 64-character hexadecimal SHA-256 digest",
+        ));
+    }
+    if expected != sha256 {
+        return Err(HandlerError::new(
+            "checksum_mismatch",
+            format!("sha256 mismatch: assembled={sha256}, expected={expected}"),
+        ));
+    }
+    Ok(())
+}
+
 /// # Errors
 /// Returns an error when the staged upload cannot be validated or finalized safely.
 pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -727,41 +841,10 @@ pub fn upload_complete(policy: &Policy, payload: &Map<String, Value>) -> Handler
     let meta: UploadMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| HandlerError::new("invalid_state", format!("bad upload metadata: {e}")))?;
 
-    let mut parts = fs::read_dir(dir.join("parts"))
-        .map_err(|e| HandlerError::new("invalid_state", format!("cannot read upload parts: {e}")))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("part"))
-        .collect::<Vec<_>>();
-    parts.sort();
-    if parts.is_empty() {
-        return Err(HandlerError::new("invalid_state", "no chunks uploaded"));
-    }
-
+    let parts = validated_upload_parts(&dir)?;
     let assembled = dir.join("assembled.bin");
     let (total, sha256) = assemble_upload_parts(parts, &assembled)?;
-
-    if meta.total_size != 0 && meta.total_size != total {
-        return Err(HandlerError::new(
-            "size_mismatch",
-            format!("expected {}, got {total}", meta.total_size),
-        ));
-    }
-    if let Some(expected) = payload.get("sha256").and_then(Value::as_str) {
-        let expected = expected.trim().to_ascii_lowercase();
-        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(HandlerError::new(
-                "invalid_sha256",
-                "expected a 64-character hexadecimal SHA-256 digest",
-            ));
-        }
-        if expected != sha256 {
-            return Err(HandlerError::new(
-                "checksum_mismatch",
-                format!("sha256 mismatch: assembled={sha256}, expected={expected}"),
-            ));
-        }
-    }
+    validate_completed_upload(&meta, payload, total, &sha256)?;
 
     let destination = authorised_persisted_destination(policy, &meta)?;
     finalize_chunked_upload(&assembled, &destination, meta.overwrite)?;
@@ -810,6 +893,54 @@ mod tests {
             upload_base: root.to_owned(),
             ..Policy::default()
         }
+    }
+
+    #[test]
+    fn chunk_index_cap_applies_to_shared_binary_write_path() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = policy(dir.path());
+        let upload_id = "0011223344556677";
+        upload_init(
+            &policy,
+            &Map::from_iter([
+                ("upload_id".into(), Value::String(upload_id.into())),
+                ("target_path".into(), Value::String("x.bin".into())),
+            ]),
+        )
+        .test_value()?;
+        write_transfer_part_at(&policy.upload_base, upload_id, MAX_CHUNK_INDEX - 1, b"x")
+            .test_value()?;
+        let error = write_transfer_part_at(&policy.upload_base, upload_id, MAX_CHUNK_INDEX, b"x")
+            .test_error()?;
+        assert_eq!(error.code, "invalid_payload");
+        Ok(())
+    }
+
+    #[test]
+    fn upload_complete_reports_gaps_without_allocating_to_largest_index() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = policy(dir.path());
+        let upload_id = "8899aabbccddeeff";
+        upload_init(
+            &policy,
+            &Map::from_iter([
+                ("upload_id".into(), Value::String(upload_id.into())),
+                ("target_path".into(), Value::String("x.bin".into())),
+            ]),
+        )
+        .test_value()?;
+        write_transfer_part(&policy, upload_id, 0, b"a").test_value()?;
+        write_transfer_part(&policy, upload_id, MAX_CHUNK_INDEX - 1, b"z").test_value()?;
+        let error = upload_complete(
+            &policy,
+            &Map::from_iter([("upload_id".into(), Value::String(upload_id.into()))]),
+        )
+        .test_error()?;
+        assert_eq!(error.code, "incomplete_upload");
+        assert_eq!(error.details["missing"].as_array().map(Vec::len), Some(100));
+        assert_eq!(error.details["missing"][0], 1);
+        assert_eq!(error.details["missing"][99], 100);
+        Ok(())
     }
 
     #[test]

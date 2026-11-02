@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: &str = "1.13.2";
+pub const PROTOCOL_VERSION: &str = "1.13.5";
 pub const PROTOCOL_MAJOR: u32 = 1;
+pub const MAX_ID_LENGTH: usize = 256;
+pub const MAX_ERROR_CODE_LENGTH: usize = 128;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const RECOMMENDED_CHUNK_BYTES: usize = 262_144;
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -198,6 +200,7 @@ pub enum Message {
         heartbeat_interval_seconds: u64,
     },
     Request {
+        #[serde(deserialize_with = "deserialize_id")]
         id: String,
         op: Op,
         #[serde(default)]
@@ -207,6 +210,7 @@ pub enum Message {
         opaque_ref: Option<String>,
     },
     Response {
+        #[serde(deserialize_with = "deserialize_id")]
         id: String,
         ok: bool,
         result: Option<BTreeMap<String, Value>>,
@@ -225,6 +229,7 @@ pub enum Message {
         timestamp: DateTime<Utc>,
     },
     Error {
+        #[serde(deserialize_with = "deserialize_error_code")]
         code: String,
         message: String,
         #[serde(default = "yes")]
@@ -239,6 +244,39 @@ const fn yes() -> bool {
     true
 }
 
+fn deserialize_bounded_string<'de, D>(
+    deserializer: D,
+    max_chars: usize,
+    label: &str,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let value = String::deserialize(deserializer)?;
+    if value.chars().count() > max_chars {
+        return Err(D::Error::custom(format!(
+            "{label} exceeds {max_chars} characters"
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_ID_LENGTH, "id")
+}
+
+fn deserialize_error_code<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_ERROR_CODE_LENGTH, "error code")
+}
+
 fn deserialize_opaque_ref<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -247,9 +285,11 @@ where
 
     let value = Option::<String>::deserialize(deserializer)?;
     if let Some(ref value) = value
-        && value.chars().count() > 256
+        && value.chars().count() > MAX_ID_LENGTH
     {
-        return Err(D::Error::custom("opaque_ref exceeds 256 characters"));
+        return Err(D::Error::custom(format!(
+            "opaque_ref exceeds {MAX_ID_LENGTH} characters"
+        )));
     }
     Ok(value)
 }
@@ -257,6 +297,7 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseError {
+    #[serde(deserialize_with = "deserialize_error_code")]
     pub code: String,
     pub message: String,
     pub details: Option<BTreeMap<String, Value>>,
@@ -371,5 +412,32 @@ mod tests {
             "surprise": true
         });
         assert!(serde_json::from_value::<Message>(bad).is_err());
+    }
+    #[test]
+    fn request_and_response_ids_are_bounded_by_characters() {
+        let accepted = "é".repeat(MAX_ID_LENGTH);
+        let request = serde_json::json!({
+            "type":"request","id":accepted,"op":"ping","payload":{},"deadline":null
+        });
+        assert!(serde_json::from_value::<Message>(request).is_ok());
+
+        let rejected = serde_json::json!({
+            "type":"response","id":"x".repeat(MAX_ID_LENGTH + 1),"ok":true,
+            "result":{},"error":null
+        });
+        assert!(serde_json::from_value::<Message>(rejected).is_err());
+    }
+
+    #[test]
+    fn response_and_fatal_error_codes_are_bounded() {
+        let response = serde_json::json!({
+            "type":"response","id":"x","ok":false,"result":null,
+            "error":{"code":"x".repeat(MAX_ERROR_CODE_LENGTH + 1),"message":"bad","details":null}
+        });
+        assert!(serde_json::from_value::<Message>(response).is_err());
+        let fatal = serde_json::json!({
+            "type":"error","code":"x".repeat(MAX_ERROR_CODE_LENGTH + 1),"message":"bad","fatal":true
+        });
+        assert!(serde_json::from_value::<Message>(fatal).is_err());
     }
 }

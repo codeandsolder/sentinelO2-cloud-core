@@ -1,3 +1,4 @@
+use crate::MAX_ERROR_CODE_LENGTH;
 use num_traits::ToPrimitive;
 use serde_json::{Map, Value, json};
 
@@ -401,17 +402,210 @@ fn insert_meta(response: &mut Value, meta: &Value) {
     }
 }
 
+fn shrink_value(root: &mut Value, budget: usize) -> bool {
+    for _ in 0..MAX_PASSES {
+        let current = serialized_size(root);
+        if current <= budget {
+            return true;
+        }
+        let string_ref = largest_string_path(root);
+        let container_ref = largest_container_path(root);
+        if string_ref.is_none() && container_ref.is_none() {
+            return false;
+        }
+        if let Some((path, container_size)) = container_ref
+            && string_ref
+                .as_ref()
+                .is_none_or(|(_, string_size)| container_size > *string_size)
+        {
+            let Some(target) = value_at(root, &path) else {
+                return false;
+            };
+            let Some(n_items) = container_len(target) else {
+                return false;
+            };
+            if n_items < 2 {
+                return false;
+            }
+            let proportional = nonnegative_f64_to_usize(
+                usize_to_f64(n_items)
+                    * (usize_to_f64(budget) / usize_to_f64(current))
+                    * SHRINK_SLACK,
+            );
+            let keep = proportional.max(1).min(n_items - 1);
+            let Some(target) = value_at_mut(root, &path) else {
+                return false;
+            };
+            if !trim_container(target, keep) {
+                return false;
+            }
+            continue;
+        }
+        let Some((path, raw_len)) = string_ref else {
+            return false;
+        };
+        let proportional = nonnegative_f64_to_usize(
+            usize_to_f64(raw_len) * (usize_to_f64(budget) / usize_to_f64(current)) * SHRINK_SLACK,
+        );
+        let keep = proportional
+            .max(MIN_TRUNCATABLE)
+            .min(raw_len.saturating_sub(1));
+        let Some(Value::String(text)) = value_at_mut(root, &path) else {
+            return false;
+        };
+        *text = truncate_text(text, keep);
+    }
+    serialized_size(root) <= budget
+}
+
+fn cut_error_code(response: &mut Value) {
+    let Some(Value::String(code)) = response
+        .get_mut("error")
+        .and_then(Value::as_object_mut)
+        .and_then(|error| error.get_mut("code"))
+    else {
+        return;
+    };
+    if code.chars().count() > MAX_ERROR_CODE_LENGTH {
+        *code = code.chars().take(MAX_ERROR_CODE_LENGTH).collect();
+    }
+}
+
+fn cap_error_message(response: &mut Value, cap: usize) {
+    let Some(Value::String(message)) = response
+        .get_mut("error")
+        .and_then(Value::as_object_mut)
+        .and_then(|error| error.get_mut("message"))
+    else {
+        return;
+    };
+    if message.len() > cap {
+        *message = truncate_text(message, cap.max(MIN_TRUNCATABLE));
+    }
+}
+
+fn fit_error_message(response: &mut Value, soft_limit: usize) {
+    for _ in 0..4 {
+        let current_envelope = serialized_size(response);
+        if current_envelope <= soft_limit {
+            return;
+        }
+        let over = current_envelope - soft_limit;
+        let Some(Value::String(message)) = response
+            .get_mut("error")
+            .and_then(Value::as_object_mut)
+            .and_then(|error| error.get_mut("message"))
+        else {
+            return;
+        };
+        let current = message.len();
+        let keep = current.saturating_sub(over.saturating_add(256));
+        if keep >= current {
+            return;
+        }
+        *message = truncate_text(
+            message,
+            keep.max(MIN_TRUNCATABLE).min(current.saturating_sub(1)),
+        );
+    }
+}
+
+fn details_size(response: &Value) -> Option<usize> {
+    response
+        .get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| error.get("details"))
+        .filter(|details| !details.is_null())
+        .map(serialized_size)
+}
+
+fn cap_details(response: &mut Value, cap: usize) {
+    let Some(error) = response.get_mut("error").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(details) = error.get_mut("details") else {
+        return;
+    };
+    if details.is_null() {
+        return;
+    }
+    let before = serialized_size(details);
+    if before <= cap {
+        return;
+    }
+    if matches!(details, Value::Object(_) | Value::Array(_)) {
+        let _ = shrink_value(details, cap);
+    }
+    if serialized_size(details) > cap {
+        *details = json!({"omitted": format!("details too large to deliver ({before} bytes)")});
+    }
+}
+
+fn fit_details(response: &mut Value, soft_limit: usize, details_before: Option<usize>) {
+    let envelope = serialized_size(response);
+    let over = envelope.saturating_sub(soft_limit);
+    let Some(error) = response.get_mut("error").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(details) = error.get_mut("details") else {
+        return;
+    };
+    if details.is_null() {
+        return;
+    }
+    let before = details_before.unwrap_or_else(|| serialized_size(details));
+    let current = serialized_size(details);
+    if over > 0 && matches!(details, Value::Object(_) | Value::Array(_)) {
+        let budget = current
+            .saturating_sub(over.saturating_add(META_RESERVE))
+            .max(1);
+        let _ = shrink_value(details, budget);
+    }
+    // Reborrow the whole response after mutating details.
+    if serialized_size(response) > soft_limit {
+        if let Some(details) = response
+            .get_mut("error")
+            .and_then(Value::as_object_mut)
+            .and_then(|error| error.get_mut("details"))
+        {
+            *details = json!({"omitted": format!("details too large to deliver ({before} bytes)")});
+        }
+    } else if let Some(details) = response
+        .get_mut("error")
+        .and_then(Value::as_object_mut)
+        .and_then(|error| error.get_mut("details"))
+        && let Some(object) = details.as_object_mut()
+        && serialized_size(&Value::Object(object.clone())) < before
+    {
+        object.insert(
+            "truncated".into(),
+            Value::String(format!("details trimmed from {before} bytes")),
+        );
+    }
+    fit_error_message(response, soft_limit);
+}
+
 pub fn bound_response(response: &mut Value, soft_limit: usize) -> Option<Value> {
     const OMITTED_MAX_ENTRIES: usize = 20;
 
+    // error.code has a schema maximum and is not otherwise a truncatable result
+    // field. Cut it even when the envelope is already small enough.
+    cut_error_code(response);
     let original = serialized_size(response);
     if original <= soft_limit {
         return None;
     }
 
+    let details_before = details_size(response);
     let budget = soft_limit.saturating_sub(META_RESERVE);
 
     if response.get("result").is_some_and(Value::is_object) {
+        // Diagnostics share the envelope with the operation result. Bound them
+        // first so a huge rejection message/details cannot evict returncode,
+        // stderr, or other useful result fields.
+        cap_error_message(response, budget / 2);
+        cap_details(response, budget / 4);
+
         let mut omitted = Vec::new();
         if !shrink_largest(response, "result", budget, Some(&mut omitted)) {
             response["result"] = json!({"note": "result omitted: too large to bound field-wise"});
@@ -438,19 +632,17 @@ pub fn bound_response(response: &mut Value, soft_limit: usize) -> Option<Value> 
         }
         insert_meta(response, &meta);
 
-        loop {
-            if serialized_size(response) <= soft_limit {
-                break;
-            }
-            let popped = meta
-                .as_object_mut()
-                .and_then(|object| object.get_mut("omitted"))
-                .and_then(Value::as_array_mut)
-                .and_then(Vec::pop);
-            if popped.is_none() {
-                break;
-            }
+        while serialized_size(response) > soft_limit
+            && meta
+                .as_object()
+                .and_then(|object| object.get("omitted"))
+                .and_then(Value::as_array)
+                .is_some_and(|entries| !entries.is_empty())
+        {
             if let Some(object) = meta.as_object_mut() {
+                if let Some(entries) = object.get_mut("omitted").and_then(Value::as_array_mut) {
+                    entries.pop();
+                }
                 let more = object
                     .get("omitted_more")
                     .and_then(Value::as_u64)
@@ -461,6 +653,8 @@ pub fn bound_response(response: &mut Value, soft_limit: usize) -> Option<Value> 
             insert_meta(response, &meta);
         }
 
+        fit_error_message(response, soft_limit);
+        fit_details(response, soft_limit, details_before);
         let delivered = serialized_size(response);
         if let Some(object) = meta.as_object_mut() {
             object.insert("delivered_bytes".into(), Value::from(delivered));
@@ -482,7 +676,8 @@ pub fn bound_response(response: &mut Value, soft_limit: usize) -> Option<Value> 
     if response.get("result").is_none_or(Value::is_null) {
         response["result"] = Value::Object(Map::from_iter([(TRUNCATION_KEY.into(), meta.clone())]));
     }
-
+    fit_error_message(response, soft_limit);
+    fit_details(response, soft_limit, details_before);
     let delivered = serialized_size(response);
     if let Some(object) = meta.as_object_mut() {
         object.insert("delivered_bytes".into(), Value::from(delivered));
@@ -580,6 +775,70 @@ mod tests {
                 PathPart::Index(3),
             ]),
             "/a~1b/c~0d/3"
+        );
+    }
+    #[test]
+    fn huge_error_message_cannot_evict_a_small_result() {
+        let mut response = json!({
+            "type":"response","id":"r1","ok":false,
+            "result":{"stdout":"ok","returncode":1},
+            "error":{"code":"script_failed","message":"E".repeat(400_000)}
+        });
+        assert!(bound_response_default(&mut response).is_some());
+        assert!(serialized_size(&response) <= RESPONSE_SOFT_LIMIT_BYTES);
+        assert_eq!(response["result"]["returncode"], 1);
+        assert_eq!(response["error"]["code"], "script_failed");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.len() < 400_000)
+        );
+    }
+
+    #[test]
+    fn huge_error_details_are_bounded_without_evicting_result() {
+        let mut response = json!({
+            "type":"response","id":"req-1","ok":false,
+            "result":{"exit_code":2,"stderr":"boom"},
+            "error":{"code":"command_not_allowed","message":"not allowed",
+                     "details":{"command":"x".repeat(300_000)}}
+        });
+        assert!(bound_response_default(&mut response).is_some());
+        assert!(serialized_size(&response) <= RESPONSE_SOFT_LIMIT_BYTES);
+        assert_eq!(response["result"]["exit_code"], 2);
+        assert_eq!(response["result"]["stderr"], "boom");
+        let details = &response["error"]["details"];
+        assert!(details.get("truncated").is_some() || details.get("omitted").is_some());
+    }
+
+    #[test]
+    fn details_with_many_small_keys_are_replaced_when_fieldwise_trimming_cannot_help() {
+        let details = (0..60_000)
+            .map(|i| (format!("k{i}"), Value::from(i)))
+            .collect::<Map<_, _>>();
+        let mut response = json!({
+            "type":"response","id":"req-1","ok":false,
+            "error":{"code":"command_not_allowed","message":"not allowed","details":details}
+        });
+        assert!(bound_response_default(&mut response).is_some());
+        assert!(serialized_size(&response) <= RESPONSE_SOFT_LIMIT_BYTES);
+        let details = &response["error"]["details"];
+        assert!(details.get("truncated").is_some() || details.get("omitted").is_some());
+    }
+
+    #[test]
+    fn error_code_is_cut_even_when_response_needs_no_other_bounding() {
+        let mut response = json!({
+            "type":"response","id":"req-1","ok":false,"result":null,
+            "error":{"code":"c".repeat(500),"message":"bad","details":{"x":1}}
+        });
+        assert!(bound_response_default(&mut response).is_none());
+        assert_eq!(
+            response["error"]["code"]
+                .as_str()
+                .map(str::chars)
+                .map(Iterator::count),
+            Some(MAX_ERROR_CODE_LENGTH)
         );
     }
 }

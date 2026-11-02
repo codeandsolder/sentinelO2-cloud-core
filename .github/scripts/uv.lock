@@ -141,12 +141,12 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "sentinelx-cloud-protocol", git = "https://github.com/pensados/sentinelx-cloud-protocol.git?rev=00169f8fddbab11082f7ff0f24ef5c7e321c9a47" }]
+requires-dist = [{ name = "sentinelx-cloud-protocol", git = "https://github.com/pensados/sentinelx-cloud-protocol.git?rev=0894b18e7793d8289b9f36421b2766664edcefde" }]
 
 [[package]]
 name = "sentinelx-cloud-protocol"
-version = "1.13.2"
-source = { git = "https://github.com/pensados/sentinelx-cloud-protocol.git?rev=00169f8fddbab11082f7ff0f24ef5c7e321c9a47#00169f8fddbab11082f7ff0f24ef5c7e321c9a47" }
+version = "1.13.5"
+source = { git = "https://github.com/pensados/sentinelx-cloud-protocol.git?rev=0894b18e7793d8289b9f36421b2766664edcefde#0894b18e7793d8289b9f36421b2766664edcefde" }
 dependencies = [
     { name = "pydantic" },
 ]
