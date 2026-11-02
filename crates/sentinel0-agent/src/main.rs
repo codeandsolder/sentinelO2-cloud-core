@@ -53,39 +53,12 @@ fn run_internal_commit_new(paths: &[PathBuf]) -> std::io::Result<()> {
             "internal commit requires SOURCE and TARGET",
         ));
     };
-    let source_parent = source.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "internal commit source has no parent directory",
-        )
-    })?;
     let target_parent = target.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "internal commit target has no parent directory",
         )
     })?;
-    if source_parent != target_parent {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "internal commit source must be adjacent to its target",
-        ));
-    }
-    let target_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let source_name = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    let expected_prefix = format!(".{target_name}.sentinel0-");
-    if !source_name.starts_with(&expected_prefix) || !source_name.ends_with(".tmp") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "internal commit source is not a SentinelO² adjacent edit temp",
-        ));
-    }
     if !std::fs::symlink_metadata(source)?.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -358,8 +331,8 @@ mod tests {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
         let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
         let target = dir.path().join("target");
-        let source = dir.path().join(".target.sentinel0-first.tmp");
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -380,7 +353,7 @@ mod tests {
             expected_mode
         );
 
-        let second = dir.path().join(".target.sentinel0-second.tmp");
+        let second = dir.path().join("second");
         std::fs::write(&second, b"replacement").expect("second source");
         let error = run_internal_commit_new(&[second.clone(), target.clone()])
             .expect_err("existing target must win");
