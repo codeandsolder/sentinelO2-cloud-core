@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,59 +21,29 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  lockfile:
-    name: Lockfile consistency
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - name: Install current stable Rust
-        run: rustup toolchain install 1.99.1 --profile minimal
-      - name: Verify lockfile
-        run: cargo +1.99.1 metadata --locked --format-version 1 >/dev/null
-
-  maintenance-scripts:
-    name: Maintenance scripts
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - name: Unit tests
-        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
-      - name: Build-cache wrapper regression
-        run: ops/build-cache/test.sh
-
-  rust:
-    if: github.event_name == 'pull_request'
-    name: Rust 1.99.1
-    runs-on: ubuntu-26.04
-    env:
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - name: Install current stable Rust
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
-      - uses: Swatinem/rust-cache@v2.9.3
-        with:
-          key: stable-1.99.1
-      - name: Format
-        run: cargo +1.99.1 fmt --all -- --check
-      - name: Clippy
-        run: cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - name: Tests
-        run: cargo +1.99.1 test --locked --workspace --all-targets
-
-
   rust-shared-cache:
-    name: Rust 1.99.1 (shared sccache)
-    if: github.event_name != 'pull_request'
+    name: Rust 1.99.1 Linux, maintenance and tests
     permissions:
       contents: read
-      id-token: write
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@b2414c5358d1061e9b442656298506e98c9d13e7 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
     with:
+      runner: ubuntu-26.04
       command: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends ripgrep
+        cargo +1.99.1 metadata --locked --format-version 1 >/dev/null
+        python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+        # The synthetic wrapper regression must control its scratch target and
+        # mock native compiler launcher and toolchain detection. Keep RUSTC_WRAPPER and the real job's
+        # mandatory sccache intact for the subsequent Rust builds.
+        maint_log="$RUNNER_TEMP/sentinelx-build-cache-regression.log"
+        if ! env -u CARGO_TARGET_DIR -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER -u RUSTUP_TOOLCHAIN bash -x ops/build-cache/test.sh >"$maint_log" 2>&1; then
+          echo "Synthetic Cargo wrapper regression failed; last commands:" >&2
+          tail -120 "$maint_log" >&2
+          exit 1
+        fi
+        tail -1 "$maint_log"
+        rm -f "$maint_log"
         cargo +1.99.1 fmt --all -- --check
         cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo +1.99.1 test --locked --workspace --all-targets
@@ -89,42 +59,50 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install nightly
         run: rustup toolchain install nightly --profile minimal
-      - uses: taiki-e/install-action@v2.89.0
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
         with:
-          key: fuzz-nightly
+          rust-toolchain: nightly
       - name: Protocol JSON
         run: cargo fuzz run protocol_json --target x86_64-unknown-linux-gnu -- -runs=10000
       - name: Binary transfer frame
         run: cargo fuzz run binary_frame --target x86_64-unknown-linux-gnu -- -runs=10000
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
 
   release:
     name: Release binary
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lockfile, maintenance-scripts, rust-shared-cache]
+    needs: [rust-shared-cache]
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install current stable Rust
         run: rustup toolchain install 1.99.1 --profile minimal
-      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
         with:
-          key: release-1.99.1
+          rust-toolchain: "1.99.1"
       - name: Build
         run: cargo +1.99.1 build --locked --release --bin sentinelx-core
       - name: Smoke
         run: ./target/release/sentinelx-core --help >/dev/null
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
       - name: Checksum
         run: (cd target/release && sha256sum sentinelx-core > sentinelx-core.sha256)
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.2
         with:
           name: sentinelx-core-linux-x86_64
           path: |
