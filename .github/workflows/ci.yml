@@ -34,10 +34,10 @@ jobs:
         cargo +1.99.1 metadata --locked --format-version 1 >/dev/null
         python3 -m unittest discover -s .github/scripts -p 'test_*.py'
         # The synthetic wrapper regression must control its scratch target and
-        # mock native compiler launcher. Keep RUSTC_WRAPPER and the real job's
+        # mock native compiler launcher and toolchain detection. Keep RUSTC_WRAPPER and the real job's
         # mandatory sccache intact for the subsequent Rust builds.
         maint_log="$RUNNER_TEMP/sentinelx-build-cache-regression.log"
-        if ! env -u CARGO_TARGET_DIR -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER bash -x ops/build-cache/test.sh >"$maint_log" 2>&1; then
+        if ! env -u CARGO_TARGET_DIR -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER -u RUSTUP_TOOLCHAIN bash -x ops/build-cache/test.sh >"$maint_log" 2>&1; then
           echo "Synthetic Cargo wrapper regression failed; last commands:" >&2
           tail -120 "$maint_log" >&2
           exit 1
