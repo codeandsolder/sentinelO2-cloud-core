@@ -33,9 +33,10 @@ jobs:
         sudo apt-get install -y --no-install-recommends ripgrep
         cargo +1.99.1 metadata --locked --format-version 1 >/dev/null
         python3 -m unittest discover -s .github/scripts -p 'test_*.py'
-        # Scratch-lifetime wrapper regression needs to own CARGO_TARGET_DIR.
-        # It uses a fake Cargo binary, but retains canonical RUSTC_WRAPPER.
-        env -u CARGO_TARGET_DIR bash ops/build-cache/test.sh
+        # The synthetic wrapper regression must control its scratch target and
+        # mock native compiler launcher. Keep RUSTC_WRAPPER and the real job's
+        # mandatory sccache intact for the subsequent Rust builds.
+        env -u CARGO_TARGET_DIR -u CMAKE_C_COMPILER_LAUNCHER           -u CMAKE_CXX_COMPILER_LAUNCHER bash ops/build-cache/test.sh
         cargo +1.99.1 fmt --all -- --check
         cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo +1.99.1 test --locked --workspace --all-targets
