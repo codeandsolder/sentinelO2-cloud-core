@@ -36,7 +36,14 @@ jobs:
         # The synthetic wrapper regression must control its scratch target and
         # mock native compiler launcher. Keep RUSTC_WRAPPER and the real job's
         # mandatory sccache intact for the subsequent Rust builds.
-        env -u CARGO_TARGET_DIR -u CMAKE_C_COMPILER_LAUNCHER           -u CMAKE_CXX_COMPILER_LAUNCHER bash ops/build-cache/test.sh
+        maint_log="$RUNNER_TEMP/sentinelx-build-cache-regression.log"
+        if ! env -u CARGO_TARGET_DIR -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER bash -x ops/build-cache/test.sh >"$maint_log" 2>&1; then
+          echo "Synthetic Cargo wrapper regression failed; last commands:" >&2
+          tail -120 "$maint_log" >&2
+          exit 1
+        fi
+        tail -1 "$maint_log"
+        rm -f "$maint_log"
         cargo +1.99.1 fmt --all -- --check
         cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo +1.99.1 test --locked --workspace --all-targets
