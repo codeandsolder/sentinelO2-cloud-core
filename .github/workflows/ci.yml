@@ -29,9 +29,13 @@ jobs:
     with:
       runner: ubuntu-26.04
       command: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends ripgrep
         cargo +1.99.1 metadata --locked --format-version 1 >/dev/null
         python3 -m unittest discover -s .github/scripts -p 'test_*.py'
-        bash ops/build-cache/test.sh
+        # Scratch-lifetime wrapper regression needs to own CARGO_TARGET_DIR.
+        # It uses a fake Cargo binary, but retains canonical RUSTC_WRAPPER.
+        env -u CARGO_TARGET_DIR bash ops/build-cache/test.sh
         cargo +1.99.1 fmt --all -- --check
         cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo +1.99.1 test --locked --workspace --all-targets
