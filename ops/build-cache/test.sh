@@ -677,6 +677,9 @@ bssl_path="$(
 [[ -f "$bssl_path/lib/libssl.a" ]]
 [[ -f "$bssl_path/include/openssl/x509v3.h" ]]
 [[ -f "$bssl_path/MANIFEST.txt" ]]
+# Patched headers affect bindgen ABI, not just native archive contents.
+rg -q '  include/openssl/x509v3.h$' "$bssl_path/SHA256SUMS"
+rg -q '  MANIFEST.txt$' "$bssl_path/SHA256SUMS"
 [[ -f "$bssl_path/SHA256SUMS" ]]
 
 bssl_warm="$(
@@ -708,6 +711,25 @@ bssl_view_again="$(
     "$BSSL_PREBUILT" boring-sys "$bssl_project" default
 )"
 [[ "$bssl_view_again" == "$bssl_view" ]]
+# Altered view headers must be rejected, not accepted as a warm hit.
+printf '\ncorrupt\n' >>"$bssl_view/include/openssl/x509v3.h"
+if BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+   BORING_BSSL_VIEW_ROOT="$bssl_target" \
+   SCCACHE_CANONICAL_TARGET_ROOT="$bssl_target" \
+   "$BSSL_PREBUILT" boring-sys "$bssl_project" default >/dev/null 2>&1; then
+    echo "corrupt native view was incorrectly accepted" >&2
+    exit 1
+fi
+cp "$bssl_path/include/openssl/x509v3.h" "$bssl_view/include/openssl/x509v3.h"
+(cd "$bssl_view" && sha256sum -c --status SHA256SUMS)
+
+if BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+   BORING_BSSL_VIEW_ROOT="$bssl_target" \
+   SCCACHE_CANONICAL_TARGET_ROOT='' \
+   "$BSSL_PREBUILT" boring-sys "$bssl_project" default >/dev/null 2>&1; then
+    echo "native view without canonical root was incorrectly accepted" >&2
+    exit 1
+fi
 if BORING_BSSL_CACHE_ROOT="$bssl_cache" \
    BORING_BSSL_VIEW_ROOT="$tmp/wrong-target" \
    SCCACHE_CANONICAL_TARGET_ROOT="$bssl_target" \
@@ -762,5 +784,14 @@ if "$BSSL_PREBUILT" unknown-native-crate "$btls_project" default "$bssl_seed" >/
     echo "unsupported native package incorrectly accepted" >&2
     exit 1
 fi
+printf '\ncorrupt\n' >>"$btls_path/include/openssl/x509v3.h"
+error_log="$tmp/corrupt-package-error.txt"
+if BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+   SENTINELX_BORINGSSL_BUILD_ROOT="$bssl_forbidden_build/child" \
+   "$BSSL_PREBUILT" btls-sys "$btls_project" default >/dev/null 2>"$error_log"; then
+    echo "corrupt native package was incorrectly accepted" >&2
+    exit 1
+fi
+rg -q 'failed integrity check' "$error_log"
 
 printf 'ok: Cargo scratch target + detached pruning + artifact mirror + warm registry source + boring-sys/btls-sys prebuilt\n'

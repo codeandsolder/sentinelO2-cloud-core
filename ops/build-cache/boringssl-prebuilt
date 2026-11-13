@@ -104,6 +104,7 @@ CMAKE_ID="$(tool_id "$CMAKE_PATH")"
 
 key_material="$(
     printf '%s\n' \
+        "package-format=2" \
         "native-crate=$NATIVE_CRATE" \
         "$NATIVE_CRATE-version=$VERSION" \
         "$NATIVE_CRATE-checksum=$CHECKSUM" \
@@ -134,11 +135,16 @@ dest="$CACHE_ROOT/$NATIVE_CRATE-$VERSION-$FEATURE_KEY-$TARGET-$key"
 lock="$CACHE_ROOT/.$NATIVE_CRATE-$key.lock"
 
 complete() {
-    [[ -f "$dest/lib/libcrypto.a" ]] &&
+    [[ -d "$dest" && ! -L "$dest" ]] &&
+        [[ -f "$dest/lib/libcrypto.a" ]] &&
         [[ -f "$dest/lib/libssl.a" ]] &&
         [[ -f "$dest/include/openssl/x509v3.h" ]] &&
         [[ -f "$dest/MANIFEST.txt" ]] &&
-        [[ -f "$dest/SHA256SUMS" ]]
+        [[ -f "$dest/SHA256SUMS" ]] &&
+        rg -q '  include/openssl/x509v3.h$' "$dest/SHA256SUMS" &&
+        rg -q '^cache-key='"$key"'$' "$dest/MANIFEST.txt" &&
+        [[ -z "$(find "$dest/lib" "$dest/include" -type l -print -quit)" ]] &&
+        (cd "$dest" && sha256sum -c --status SHA256SUMS)
 }
 
 # Expose native archives under the actual canonical Cargo target root.
@@ -155,9 +161,9 @@ publish_path() {
         echo "boringssl-prebuilt: BORING_BSSL_VIEW_ROOT must be absolute" >&2
         return 2
     }
-    if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" ]] &&
-        [[ "$(realpath -m "$root")" != "$(realpath -m "$SCCACHE_CANONICAL_TARGET_ROOT")" ]]; then
-        echo "boringssl-prebuilt: view root does not match canonical target root" >&2
+    if [[ -z "${SCCACHE_CANONICAL_TARGET_ROOT:-}" ]] ||
+       [[ "$(realpath -m "$root")" != "$(realpath -m "$SCCACHE_CANONICAL_TARGET_ROOT")" ]]; then
+        echo "boringssl-prebuilt: canonical target root must be set and match the view root" >&2
         return 2
     fi
 
@@ -167,17 +173,21 @@ publish_path() {
     exec 8>"$view_root/.$key.lock"
     flock -x 8
     if [[ -e "$view_dir" || -L "$view_dir" ]]; then
-        [[ -d "$view_dir" && ! -L "$view_dir" && -f "$view_dir/SHA256SUMS" ]] &&
-            (cd "$view_dir" && sha256sum -c --status SHA256SUMS) || {
+        if [[ ! -d "$view_dir" || -L "$view_dir" || ! -f "$view_dir/SHA256SUMS" ]] ||
+           [[ -n "$(find "$view_dir" -type l -print -quit)" ]] ||
+           ! cmp -s "$dest/SHA256SUMS" "$view_dir/SHA256SUMS" ||
+           ! (cd "$view_dir" && sha256sum -c --status SHA256SUMS); then
             echo "boringssl-prebuilt: corrupt or incomplete view: $view_dir" >&2
             return 1
-        }
+        fi
         printf '%s\n' "$view_dir"
         return 0
     fi
 
     stage_view="$(mktemp -d "$view_root/.stage-$key-XXXXXX")"
     if ! cp -a --reflink=auto "$dest/." "$stage_view/" ||
+       [[ -n "$(find "$stage_view" -type l -print -quit)" ]] ||
+       ! cmp -s "$dest/SHA256SUMS" "$stage_view/SHA256SUMS" ||
        ! (cd "$stage_view" && sha256sum -c --status SHA256SUMS); then
         rm -rf -- "$stage_view"
         echo "boringssl-prebuilt: failed to materialize canonical view" >&2
@@ -197,6 +207,10 @@ flock -x 9
 if complete; then
     publish_path
     exit 0
+fi
+if [[ -e "$dest" || -L "$dest" ]]; then
+    echo "boringssl-prebuilt: existing native package failed integrity check: $dest" >&2
+    exit 1
 fi
 
 stage="$(mktemp -d "$CACHE_ROOT/.stage-$key-XXXXXX")"
@@ -303,11 +317,13 @@ seed-out=$SEED_OUT
 EOF
 (
     cd "$stage"
-    sha256sum lib/libcrypto.a lib/libssl.a >SHA256SUMS
-    [[ ! -f lib/bcm.o ]] || sha256sum lib/bcm.o >>SHA256SUMS
+    # Patched headers affect bindgen ABI. Validate them and the key manifest
+    # alongside the native archives, not merely the two static libraries.
+    find lib include -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS
+    sha256sum MANIFEST.txt >>SHA256SUMS
+    sha256sum -c --status SHA256SUMS
 )
-rm -rf -- "$dest"
-mv "$stage" "$dest"
+mv -T "$stage" "$dest"
 stage=""
 trap - EXIT INT TERM HUP
 [[ -z "$work" ]] || rm -rf -- "$work"

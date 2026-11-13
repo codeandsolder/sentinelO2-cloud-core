@@ -62,3 +62,12 @@ is invalid: the package is outside the declared sandbox roots.
 Validation: run `ops/build-cache/test.sh` (seeded package identity, warm lookup,
 crate/feature separation), then perform an actual `btls-sys` build and link using
 a correctly rooted package view before enabling the helper in a fleet wrapper.
+
+## Strict package integrity
+
+The content key includes the native package format. Each static archive, patched
+header and manifest is verified on warm lookup, and a matching view is verified
+against the package checksum manifest. An existing invalid native package or
+view fails closed instead of being overwritten or reused. The canonical view
+requires an explicit and matching SCCACHE_CANONICAL_TARGET_ROOT; it cannot be
+made by guessing a root outside the validated Rust compiler inputs.
