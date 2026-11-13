@@ -108,3 +108,14 @@ Only enable this automatic provider when the matching Cargo fork supports the
 protocol and the provider/helper are installed together. The site wrappers
 must set CARGO_NATIVE_PREBUILT_PROVIDER and the exact allowlist
 CARGO_NATIVE_PREBUILT_PACKAGES=boring-sys,btls-sys.
+
+## Automatic-provider end-to-end acceptance
+
+Set `CARGO_UNDER_TEST` to the candidate Cargo binary and run
+`ops/build-cache/test-auto-btls-crossworkspace`. This verifies the actual
+per-build-unit provider hook against real linked BoringSSL SHA-256 in two
+independent Cargo workspaces. It declares distinct canonical target roots but
+**does not set BORING_BSSL_PATH**: the candidate Cargo selects the helper
+with the resolved unit's features. One native package should be built and
+reused across two workspaces, and the entire isolated test tree under
+`~/build` is removed automatically. Existing sccache/Garage is not replaced.

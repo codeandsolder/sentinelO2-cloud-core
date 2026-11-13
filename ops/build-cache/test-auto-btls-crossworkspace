@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${CARGO_UNDER_TEST:?set CARGO_UNDER_TEST to the new Cargo candidate}"
+test -x "$CARGO_UNDER_TEST"
+here=$(cd "$(dirname "$0")" && pwd)
+mkdir -p "$HOME/build"
+root=$(mktemp -d "$HOME/build/boringssl-auto-crossworkspace-XXXXXXXX")
+trap 'rm -rf -- "$root"' EXIT
+export BORING_BSSL_CACHE_ROOT="$root/native-packages"
+export SENTINELX_BORINGSSL_BUILD_ROOT="$root/native-work"
+export SENTINELX_CARGO_WRAPPER_PATH="${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/bin/cargo}"
+export SENTINELX_RUST_TOOLCHAIN="${SENTINELX_RUST_TOOLCHAIN:-1.99.0}"
+export CARGO_NATIVE_PREBUILT_PROVIDER="$here/boringssl-build-provider"
+export CARGO_NATIVE_PREBUILT_PACKAGES=boring-sys,btls-sys
+export CARGO_NATIVE_PREBUILT_PROVIDER_REVISION=boringssl-auto-v1
+export CARGO_BUILD_EPHEMERAL_INTERMEDIATES=true
+export CARGO_INCREMENTAL=0
+export RUSTUP_TOOLCHAIN="$SENTINELX_RUST_TOOLCHAIN"
+
+for workspace in a b; do
+    project="$root/workspace-$workspace"
+    mkdir -p "$project/src" "$project/target"
+    cat >"$project/Cargo.toml" <<'CARGO'
+[package]
+name = "btls-native-auto-reuse"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+btls-sys = "=0.5.6"
+CARGO
+    cat >"$project/src/main.rs" <<'RUST'
+fn main() {
+    btls_sys::init();
+    let mut digest = [0_u8; 32];
+    let result = unsafe { btls_sys::SHA256(b"abc".as_ptr(), 3, digest.as_mut_ptr()) };
+    assert!(!result.is_null());
+    assert_eq!(&digest[..4], &[0xba, 0x78, 0x16, 0xbf]);
+    println!("auto-BoringSSL-SHA256=ok");
+}
+RUST
+done
+(
+    cd "$root/workspace-a"
+    /usr/local/bin/cargo +1.99.0 generate-lockfile --quiet
+)
+cp "$root/workspace-a/Cargo.lock" "$root/workspace-b/Cargo.lock"
+
+snapshot() {
+    SCCACHE_SERVER_UDS="${SCCACHE_SERVER_UDS:-/run/sccache-jan/sccache.sock}" \
+        SCCACHE_NO_AUTO_START_SERVER=1 \
+        /usr/local/libexec/sccache-bin/sccache --show-stats --stats-format json |
+        jq -c '{cpp_hit:(.stats.cache_hits.adv_counts["c++ [gcc]"]//0),cpp_miss:(.stats.cache_misses.adv_counts["c++ [gcc]"]//0),rust_hit:(.stats.cache_hits.adv_counts.rust//0),rust_miss:(.stats.cache_misses.adv_counts.rust//0)}'
+}
+echo "TESTING_CARGO=$("$CARGO_UNDER_TEST" --version)"
+echo "SCCACHE_STATE=$(systemctl is-active sccache-local.service)"
+for workspace in a b; do
+    project="$root/workspace-$workspace"
+    export CARGO_TARGET_DIR="$project/target"
+    export SCCACHE_CANONICAL_TARGET_ROOT="$CARGO_TARGET_DIR"
+    echo "=====WORKSPACE_$workspace BEFORE====="
+    snapshot
+    "$CARGO_UNDER_TEST" run --locked --manifest-path "$project/Cargo.toml" -j 12 --quiet
+    echo "=====WORKSPACE_$workspace AFTER====="
+    snapshot
+    test -f "$project/target/boringssl-prebuilt"/*/lib/libcrypto.a
+done
+count=$(find "$BORING_BSSL_CACHE_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'btls-sys-*' | wc -l)
+[[ "$count" -eq 1 ]] || { echo "expected one native package, found $count" >&2; exit 1; }
+echo 'PASS: BoringSSL native auto-provider linked SHA256 in two independent workspaces; single native package'
