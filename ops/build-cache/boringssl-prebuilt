@@ -2,35 +2,40 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <project-dir> [feature-key] [seed-boring-sys-out-dir]" >&2
+    echo "usage: $0 <boring-sys|btls-sys> <project-dir> [feature-key] [seed-out-dir]" >&2
     exit 2
 }
 
-PROJECT=${1:-}
-FEATURE_KEY=${2:-default}
-SEED_OUT=${3:-}
+NATIVE_CRATE=${1:-}
+PROJECT=${2:-}
+FEATURE_KEY=${3:-default}
+SEED_OUT=${4:-}
 
+case "$NATIVE_CRATE" in
+    boring-sys|btls-sys) ;;
+    *) usage ;;
+esac
 [[ -n "$PROJECT" && -f "$PROJECT/Cargo.lock" ]] || usage
 [[ "$FEATURE_KEY" =~ ^[A-Za-z0-9_,.+-]+$ ]] || {
-    echo "boring-sys-prebuilt: unsupported feature key: $FEATURE_KEY" >&2
+    echo "boringssl-prebuilt: unsupported feature key: $FEATURE_KEY" >&2
     exit 2
 }
 
-CACHE_ROOT=${BORING_BSSL_CACHE_ROOT:-${SENTINELX_BORING_SYS_CACHE_ROOT:-/srv/scratch/toolchains/boring-sys-prebuilt}}
-BUILD_ROOT=${SENTINELX_BORING_SYS_BUILD_ROOT:-/srv/scratch/toolchains/boring-sys-build}
+CACHE_ROOT=${BORING_BSSL_CACHE_ROOT:-${SENTINELX_BORINGSSL_CACHE_ROOT:-/srv/scratch/toolchains/boringssl-prebuilt}}
+BUILD_ROOT=${SENTINELX_BORINGSSL_BUILD_ROOT:-/srv/scratch/toolchains/boringssl-build}
 CARGO_WRAPPER=${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/libexec/sentinelx-bin/cargo}
 RUST_TOOLCHAIN=${SENTINELX_RUST_TOOLCHAIN:-1.99.1}
 mkdir -p "$CACHE_ROOT"
 
 lock_entry="$(
-    awk '
+    awk -v wanted="$NATIVE_CRATE" '
         function unquote(s) {
             sub(/^"/, "", s)
             sub(/"$/, "", s)
             return s
         }
         function finish_package() {
-            if (name == "boring-sys") {
+            if (name == wanted) {
                 count++
                 found_version = version
                 found_checksum = checksum
@@ -52,17 +57,29 @@ lock_entry="$(
         }
     ' "$PROJECT/Cargo.lock"
 )" || {
-    echo "boring-sys-prebuilt: expected exactly one checksummed boring-sys package in $PROJECT/Cargo.lock" >&2
+    echo "boringssl-prebuilt: expected exactly one checksummed $NATIVE_CRATE package in $PROJECT/Cargo.lock" >&2
     exit 2
 }
 read -r VERSION CHECKSUM <<<"$lock_entry"
 
 TARGET=${BORING_BSSL_TARGET:-x86_64-unknown-linux-gnu}
 TARGET_US=${TARGET//-/_}
-CC_BIN=${CC_x86_64_unknown_linux_gnu:-${HOST_CC:-${CC:-/usr/bin/cc}}}
-CXX_BIN=${CXX_x86_64_unknown_linux_gnu:-${HOST_CXX:-${CXX:-/usr/bin/c++}}}
+CC_TARGET_VAR=CC_$TARGET_US
+CXX_TARGET_VAR=CXX_$TARGET_US
+CC_BIN=${!CC_TARGET_VAR:-${HOST_CC:-${CC:-/usr/bin/cc}}}
+CXX_BIN=${!CXX_TARGET_VAR:-${HOST_CXX:-${CXX:-/usr/bin/c++}}}
 CC_PATH="$(command -v "$CC_BIN")"
 CXX_PATH="$(command -v "$CXX_BIN")"
+
+# These exact site wrappers only route the real compiler through the managed
+# sccache client. CMake uses an explicit sccache launcher below, so normalize
+# their identity to avoid needless duplicate native packages.
+case "$CC_PATH" in
+    /usr/local/libexec/sccache-strict-wrappers/cc) CC_PATH=/usr/bin/cc ;;
+esac
+case "$CXX_PATH" in
+    /usr/local/libexec/sccache-strict-wrappers/c++) CXX_PATH=/usr/bin/c++ ;;
+esac
 AS_PATH="$(command -v "${AS:-as}")"
 AR_PATH="$(command -v "${AR:-ar}")"
 CMAKE_PATH="$(command -v "${CMAKE:-cmake}")"
@@ -70,7 +87,9 @@ CMAKE_PATH="$(command -v "${CMAKE:-cmake}")"
 tool_id() {
     local p
     p="$(readlink -f "$1")"
-    printf '%s@%s' "$p" "$(stat -Lc '%d:%i:%s:%Y' "$p")"
+    # Native compiler binaries can be overwritten in place without an mtime
+    # update. Hash contents, not inode/mtime, to keep the prebuilt ABI key real.
+    printf '%s@%s' "$p" "$(sha256sum "$p" | cut -d ' ' -f 1)"
 }
 
 env_value() {
@@ -85,8 +104,9 @@ CMAKE_ID="$(tool_id "$CMAKE_PATH")"
 
 key_material="$(
     printf '%s\n' \
-        "boring-sys-version=$VERSION" \
-        "boring-sys-checksum=$CHECKSUM" \
+        "native-crate=$NATIVE_CRATE" \
+        "$NATIVE_CRATE-version=$VERSION" \
+        "$NATIVE_CRATE-checksum=$CHECKSUM" \
         "features=$FEATURE_KEY" \
         "target=$TARGET" \
         "profile=release" \
@@ -110,8 +130,8 @@ key_material="$(
         "release-debug=${CARGO_PROFILE_RELEASE_DEBUG:-false}"
 )"
 key="$(printf '%s' "$key_material" | sha256sum | cut -c1-20)"
-dest="$CACHE_ROOT/boring-sys-$VERSION-$FEATURE_KEY-$TARGET-$key"
-lock="$CACHE_ROOT/.boring-sys-$key.lock"
+dest="$CACHE_ROOT/$NATIVE_CRATE-$VERSION-$FEATURE_KEY-$TARGET-$key"
+lock="$CACHE_ROOT/.$NATIVE_CRATE-$key.lock"
 
 complete() {
     [[ -f "$dest/lib/libcrypto.a" ]] &&
@@ -156,18 +176,18 @@ feature_enabled() {
 
 if [[ -n "$SEED_OUT" ]]; then
     [[ -f "$SEED_OUT/build/libcrypto.a" && -f "$SEED_OUT/build/libssl.a" ]] || {
-        echo "boring-sys-prebuilt: seed OUT_DIR is incomplete: $SEED_OUT" >&2
+        echo "boringssl-prebuilt: seed OUT_DIR is incomplete: $SEED_OUT" >&2
         exit 3
     }
     [[ -f "$SEED_OUT/boringssl/include/openssl/x509v3.h" ]] || {
-        echo "boring-sys-prebuilt: seed OUT_DIR lacks patched headers: $SEED_OUT" >&2
+        echo "boringssl-prebuilt: seed OUT_DIR lacks patched headers: $SEED_OUT" >&2
         exit 3
     }
     cp -a "$SEED_OUT/build/libcrypto.a" "$stage/lib/"
     cp -a "$SEED_OUT/build/libssl.a" "$stage/lib/"
     if feature_enabled fips; then
         [[ -f "$SEED_OUT/build/bcm.o" ]] || {
-            echo "boring-sys-prebuilt: FIPS seed is missing bcm.o" >&2
+            echo "boringssl-prebuilt: FIPS seed is missing bcm.o" >&2
             exit 3
         }
         cp -a "$SEED_OUT/build/bcm.o" "$stage/lib/"
@@ -197,7 +217,7 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-boring-sys = { version = "=$VERSION"$features_toml }
+$NATIVE_CRATE = { version = "=$VERSION"$features_toml }
 EOF
     printf '%s\n' '#![allow(dead_code)]' >"$work/project/src/lib.rs"
 
@@ -224,7 +244,7 @@ EOF
         # Use the site wrapper so cache generation gets the managed registry
         # source pool, package-cache policy, native sccache launcher and target
         # reclamation. A new crate version may fetch its archive once.
-        "$CARGO_WRAPPER" +"$RUST_TOOLCHAIN" build --release
+        "$CARGO_WRAPPER" +"$RUST_TOOLCHAIN" build --release --target "$TARGET"
     )
     cp -a "$work/install"/. "$stage"/
 fi
