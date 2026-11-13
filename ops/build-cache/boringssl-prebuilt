@@ -141,15 +141,61 @@ complete() {
         [[ -f "$dest/SHA256SUMS" ]]
 }
 
+# Expose native archives under the actual canonical Cargo target root.
+# Never create a symlink to a package outside its sandbox.
+publish_path() {
+    if [[ -z "${BORING_BSSL_VIEW_ROOT:-}" ]]; then
+        printf '%s\n' "$dest"
+        return 0
+    fi
+
+    local root view_root view_dir stage_view
+    root="$BORING_BSSL_VIEW_ROOT"
+    [[ "$root" == /* ]] || {
+        echo "boringssl-prebuilt: BORING_BSSL_VIEW_ROOT must be absolute" >&2
+        return 2
+    }
+    if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" ]] &&
+        [[ "$(realpath -m "$root")" != "$(realpath -m "$SCCACHE_CANONICAL_TARGET_ROOT")" ]]; then
+        echo "boringssl-prebuilt: view root does not match canonical target root" >&2
+        return 2
+    fi
+
+    view_root="$root/boringssl-prebuilt"
+    mkdir -p "$view_root"
+    view_dir="$view_root/$(basename "$dest")"
+    exec 8>"$view_root/.$key.lock"
+    flock -x 8
+    if [[ -e "$view_dir" || -L "$view_dir" ]]; then
+        [[ -d "$view_dir" && ! -L "$view_dir" && -f "$view_dir/SHA256SUMS" ]] &&
+            (cd "$view_dir" && sha256sum -c --status SHA256SUMS) || {
+            echo "boringssl-prebuilt: corrupt or incomplete view: $view_dir" >&2
+            return 1
+        }
+        printf '%s\n' "$view_dir"
+        return 0
+    fi
+
+    stage_view="$(mktemp -d "$view_root/.stage-$key-XXXXXX")"
+    if ! cp -a --reflink=auto "$dest/." "$stage_view/" ||
+       ! (cd "$stage_view" && sha256sum -c --status SHA256SUMS); then
+        rm -rf -- "$stage_view"
+        echo "boringssl-prebuilt: failed to materialize canonical view" >&2
+        return 1
+    fi
+    mv -T "$stage_view" "$view_dir"
+    printf '%s\n' "$view_dir"
+}
+
 if complete; then
-    printf '%s\n' "$dest"
+    publish_path
     exit 0
 fi
 
 exec 9>"$lock"
 flock -x 9
 if complete; then
-    printf '%s\n' "$dest"
+    publish_path
     exit 0
 fi
 
@@ -265,4 +311,4 @@ mv "$stage" "$dest"
 stage=""
 trap - EXIT INT TERM HUP
 [[ -z "$work" ]] || rm -rf -- "$work"
-printf '%s\n' "$dest"
+publish_path

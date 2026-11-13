@@ -45,9 +45,19 @@ canonical build or target root when canonical Rust hashing is enabled.
 Expose the immutable package as a per-target view under the actual
 `SCCACHE_CANONICAL_TARGET_ROOT`, preserving byte identity, rather than
 expanding the canonical root to `/srv/scratch` or disabling sccache.
-An existing usque BoringSSL helper already implements a keyed
-hardlink/reflink view. Merely exporting the path under `/srv/scratch` for
-canonical Rust dependency builds is not a valid fleet-wide integration.
+Set `BORING_BSSL_VIEW_ROOT` to the actual persistent Cargo target root,
+matching `SCCACHE_CANONICAL_TARGET_ROOT`. The helper will create a verified
+content-preserving, reflink-when-available view under
+`<target-root>/boringssl-prebuilt/<native-package-key>` and return that
+path instead of the native package location. It uses a separate view lock and
+refuses a mismatched declared target root, incomplete view, corrupt package,
+or symlinked view. Compiler inputs then live at stable canonical
+`/target/boringssl-prebuilt/<key>/...` paths across worktrees.
+
+Export the returned view as `BORING_BSSL_PATH` and set
+`BORING_BSSL_ASSUME_PATCHED=1` (or the FIPS-prefixed equivalents).
+Merely exporting the package from `/srv/scratch` for canonical Rust builds
+is invalid: the package is outside the declared sandbox roots.
 
 Validation: run `ops/build-cache/test.sh` (seeded package identity, warm lookup,
 crate/feature separation), then perform an actual `btls-sys` build and link using

@@ -687,6 +687,35 @@ bssl_warm="$(
 )"
 [[ "$bssl_warm" == "$bssl_path" ]]
 
+# A native package view lives inside the actual canonical target root.
+bssl_target="$tmp/bssl-target"
+mkdir -p "$bssl_target"
+bssl_view="$(
+    BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+    BORING_BSSL_VIEW_ROOT="$bssl_target" \
+    SCCACHE_CANONICAL_TARGET_ROOT="$bssl_target" \
+    "$BSSL_PREBUILT" boring-sys "$bssl_project" default
+)"
+[[ "$bssl_view" == "$bssl_target"/boringssl-prebuilt/* ]]
+[[ -f "$bssl_view/lib/libcrypto.a" ]]
+[[ -f "$bssl_view/include/openssl/x509v3.h" ]]
+(cd "$bssl_view" && sha256sum -c --status SHA256SUMS)
+[[ -z "$(find "$bssl_view" -type l -print -quit)" ]]
+bssl_view_again="$(
+    BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+    BORING_BSSL_VIEW_ROOT="$bssl_target" \
+    SCCACHE_CANONICAL_TARGET_ROOT="$bssl_target" \
+    "$BSSL_PREBUILT" boring-sys "$bssl_project" default
+)"
+[[ "$bssl_view_again" == "$bssl_view" ]]
+if BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+   BORING_BSSL_VIEW_ROOT="$tmp/wrong-target" \
+   SCCACHE_CANONICAL_TARGET_ROOT="$bssl_target" \
+   "$BSSL_PREBUILT" boring-sys "$bssl_project" default >/dev/null 2>&1; then
+    echo "canonical BoringSSL view incorrectly allowed outside target root" >&2
+    exit 1
+fi
+
 # Feature variants cannot alias the default native package.
 bssl_rpk="$(
     BORING_BSSL_CACHE_ROOT="$bssl_cache" \
