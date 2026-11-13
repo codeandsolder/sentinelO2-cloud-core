@@ -18,7 +18,7 @@ case "$CARGO_NATIVE_PREBUILT_PACKAGE" in
 esac
 
 # Never replace a same-named package from a foreign registry or git source.
-if [[ "$CARGO_NATIVE_PREBUILT_SOURCE" != 'registry+https://github.com/rust-lang/crates.io-index' ]]; then
+if [[ "${CARGO_NATIVE_PREBUILT_IS_CRATES_IO:-0}" != 1 ]]; then
     printf '{"env":{}}\n'
     exit 0
 fi

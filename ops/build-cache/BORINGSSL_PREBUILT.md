@@ -119,3 +119,9 @@ independent Cargo workspaces. It declares distinct canonical target roots but
 with the resolved unit's features. One native package should be built and
 reused across two workspaces, and the entire isolated test tree under
 `~/build` is removed automatically. Existing sccache/Garage is not replaced.
+
+The native protocol supplies CARGO_NATIVE_PREBUILT_IS_CRATES_IO=1 only when
+Cargo's own SourceId::is_crates_io() identifies the package. The provider
+also receives canonical SourceId::as_url(). Never compare human-readable
+SourceId::Display: for crates.io it says registry crates-io, not the canonical
+source URL, and would silently skip substitution on every native package.
