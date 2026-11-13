@@ -6,10 +6,12 @@ PRUNER="$HERE/cargo-target-prune"
 SOURCE_PRUNER="$HERE/cargo-source-prune"
 WRAPPER="$HERE/cargo"
 BSSL_PREBUILT="$HERE/boringssl-prebuilt"
+BSSL_PROVIDER="$HERE/boringssl-build-provider"
 
 # Keep all shipped shell helpers under the maintenance-scripts CI lane even
 # when a test below does not execute a root/systemd-only code path.
 bash -n "$HERE/test-real-btls-crossworkspace"
+bash -n "$BSSL_PROVIDER"
 bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$BSSL_PREBUILT"     "$HERE/sccache-release-update"     "$HERE/sccache-dist-client-preflight"     "$HERE/sccache-router"     "$HERE/sccache-client"     "$HERE/install-sccache-autoupdate"
 
 # The updater runs as root while the shared compiler daemon runs as the service
@@ -781,6 +783,64 @@ btls_mlkem="$(
     "$BSSL_PREBUILT" btls-sys "$btls_project" mlkem "$bssl_seed"
 )"
 [[ "$btls_mlkem" != "$btls_path" ]]
+
+# Exact-version lookup must not confuse two Cargo.lock entries with same name.
+btls_multi="$tmp/btls-multiversion"
+mkdir -p "$btls_multi"
+cp "$btls_project/Cargo.lock" "$btls_multi/Cargo.lock"
+cat >>"$btls_multi/Cargo.lock" <<'EOF'
+
+[[package]]
+name = "btls-sys"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+EOF
+if BORING_BSSL_CACHE_ROOT="$bssl_cache" "$BSSL_PREBUILT" btls-sys "$btls_multi" default >/dev/null 2>&1; then
+    echo "ambiguous native package versions were incorrectly accepted" >&2
+    exit 1
+fi
+selected="$(
+    BORING_BSSL_PACKAGE_VERSION=0.5.6 BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+    "$BSSL_PREBUILT" btls-sys "$btls_multi" default
+)"
+[[ "$selected" == "$btls_path" ]]
+
+# Cargo knows this build-unit source, version, resolved feature list and
+# canonical target root; the provider must honor each of them.
+provider_root="$tmp/btls-provider-target"
+mkdir -p "$provider_root"
+provider_reply="$(
+    env CARGO_NATIVE_PREBUILT_PROVIDER_ACTIVE=1 \
+        CARGO_NATIVE_PREBUILT_PACKAGE=btls-sys \
+        CARGO_NATIVE_PREBUILT_VERSION=0.5.6 \
+        CARGO_NATIVE_PREBUILT_SOURCE=registry+https://github.com/rust-lang/crates.io-index \
+        CARGO_NATIVE_PREBUILT_TARGET=x86_64-unknown-linux-gnu \
+        CARGO_NATIVE_PREBUILT_WORKSPACE="$btls_project" \
+        CARGO_NATIVE_PREBUILT_CANONICAL_ROOT="$provider_root" \
+        CARGO_NATIVE_PREBUILT_FEATURES= \
+        BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+        SENTINELX_BORINGSSL_BUILD_ROOT="$bssl_forbidden_build/child" \
+        "$BSSL_PROVIDER"
+)"
+provider_view="$(jq -er '.env.BORING_BSSL_PATH' <<<"$provider_reply")"
+[[ -f "$provider_view/lib/libcrypto.a" && "$provider_view" == "$provider_root"/boringssl-prebuilt/* ]]
+[[ "$(jq -r '.env.BORING_BSSL_ASSUME_PATCHED' <<<"$provider_reply")" == 1 ]]
+mlkem_reply="$(
+    env CARGO_NATIVE_PREBUILT_PROVIDER_ACTIVE=1 \
+        CARGO_NATIVE_PREBUILT_PACKAGE=btls-sys \
+        CARGO_NATIVE_PREBUILT_VERSION=0.5.6 \
+        CARGO_NATIVE_PREBUILT_SOURCE=registry+https://github.com/rust-lang/crates.io-index \
+        CARGO_NATIVE_PREBUILT_TARGET=x86_64-unknown-linux-gnu \
+        CARGO_NATIVE_PREBUILT_WORKSPACE="$btls_project" \
+        CARGO_NATIVE_PREBUILT_CANONICAL_ROOT="$provider_root" \
+        CARGO_NATIVE_PREBUILT_FEATURES=mlkem \
+        BORING_BSSL_CACHE_ROOT="$bssl_cache" \
+        SENTINELX_BORINGSSL_BUILD_ROOT="$bssl_forbidden_build/child" \
+        "$BSSL_PROVIDER"
+)"
+mlkem_view="$(jq -er '.env.BORING_BSSL_PATH' <<<"$mlkem_reply")"
+[[ "$mlkem_view" != "$provider_view" && -f "$mlkem_view/lib/libcrypto.a" ]]
 if "$BSSL_PREBUILT" unknown-native-crate "$btls_project" default "$bssl_seed" >/dev/null 2>&1; then
     echo "unsupported native package incorrectly accepted" >&2
     exit 1

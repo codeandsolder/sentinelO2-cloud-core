@@ -88,3 +88,23 @@ Shared packages are only selected explicitly here. Automatic selection in
 normal Cargo builds is **not installed**; it requires inferring the actual
 unified native package features and target from each build, rather than
 guessing the default variant.
+
+## Automatic native build-script provider
+
+The sibling boringssl-build-provider implements the generic Cargo
+native-prebuilt provider protocol. Cargo passes each actual resolved build
+unit's package name, exact version, source, sorted feature set, target, Cargo
+profile, workspace and canonical target root. The provider chooses one native
+package with the matching version and feature set, returns a JSON environment
+map for that build script only, and skips any user-specified native overrides
+or packages not from crates.io. The nested native package Cargo invocation
+uses CARGO_NATIVE_PREBUILT_PROVIDER_ACTIVE=1 to prevent recursive providers
+while continuing to use managed sccache. Neither a workspace-level features
+guess nor the lockfile alone can represent each resolved build unit.
+
+The native package itself is compiled with its declared native release profile
+(independent of a Rust consumer's dev/release profile), as recorded in the key.
+Only enable this automatic provider when the matching Cargo fork supports the
+protocol and the provider/helper are installed together. The site wrappers
+must set CARGO_NATIVE_PREBUILT_PROVIDER and the exact allowlist
+CARGO_NATIVE_PREBUILT_PACKAGES=boring-sys,btls-sys.

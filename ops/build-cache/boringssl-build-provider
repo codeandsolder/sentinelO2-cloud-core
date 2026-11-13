@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Cargo supplies exact per-unit features/target. No Cargo.lock guesses.
+: "${CARGO_NATIVE_PREBUILT_PACKAGE:?}"
+: "${CARGO_NATIVE_PREBUILT_VERSION:?}"
+: "${CARGO_NATIVE_PREBUILT_SOURCE:?}"
+: "${CARGO_NATIVE_PREBUILT_TARGET:?}"
+: "${CARGO_NATIVE_PREBUILT_WORKSPACE:?}"
+: "${CARGO_NATIVE_PREBUILT_CANONICAL_ROOT:?}"
+[[ "${CARGO_NATIVE_PREBUILT_PROVIDER_ACTIVE:-}" == 1 ]] || {
+    echo "boringssl-build-provider: provider protocol not activated" >&2
+    exit 2
+}
+case "$CARGO_NATIVE_PREBUILT_PACKAGE" in
+    boring-sys|btls-sys) ;;
+    *) echo "boringssl-build-provider: unexpected native crate name" >&2; exit 2 ;;
+esac
+
+# Never replace a same-named package from a foreign registry or git source.
+if [[ "$CARGO_NATIVE_PREBUILT_SOURCE" != 'registry+https://github.com/rust-lang/crates.io-index' ]]; then
+    printf '{"env":{}}\n'
+    exit 0
+fi
+# Respect explicit native overrides.
+if [[ -n "${BORING_BSSL_PATH:-}${BORING_BSSL_FIPS_PATH:-}${BORING_BSSL_SOURCE_PATH:-}${BORING_BSSL_FIPS_SOURCE_PATH:-}" ]]; then
+    printf '{"env":{}}\n'
+    exit 0
+fi
+canonical_root="$CARGO_NATIVE_PREBUILT_CANONICAL_ROOT"
+[[ "$canonical_root" == /* ]] || {
+    echo "boringssl-build-provider: canonical target root must be absolute" >&2
+    exit 2
+}
+[[ -f "$CARGO_NATIVE_PREBUILT_WORKSPACE/Cargo.lock" ]] || {
+    echo "boringssl-build-provider: Cargo.lock not found for selected workspace" >&2
+    exit 2
+}
+features="${CARGO_NATIVE_PREBUILT_FEATURES:-default}"
+[[ "$features" =~ ^[a-zA-Z0-9_,.+-]+$ ]] || {
+    echo "boringssl-build-provider: invalid native feature list" >&2
+    exit 2
+}
+is_fips=0
+IFS=',' read -ra parts <<<"$features"
+for feature in "${parts[@]}"; do
+    [[ "$feature" != fips ]] || is_fips=1
+done
+helper="${BORING_BSSL_PROVIDER_HELPER:-$(dirname "$(realpath -e "$0")")/boringssl-prebuilt}"
+[[ -x "$helper" ]] || {
+    echo "boringssl-build-provider: native package helper unavailable at $helper" >&2
+    exit 2
+}
+
+# Native packages are build assets. Compiler cache remains managed Garage.
+export BORING_BSSL_PACKAGE_VERSION="$CARGO_NATIVE_PREBUILT_VERSION"
+export BORING_BSSL_TARGET="$CARGO_NATIVE_PREBUILT_TARGET"
+export BORING_BSSL_VIEW_ROOT="$canonical_root"
+export SCCACHE_CANONICAL_TARGET_ROOT="$canonical_root"
+export SENTINELX_CARGO_WRAPPER_PATH="${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/bin/cargo}"
+export SENTINELX_RUST_TOOLCHAIN="${SENTINELX_RUST_TOOLCHAIN:-${RUSTUP_TOOLCHAIN:-1.99.0}}"
+
+package="$("$helper" "$CARGO_NATIVE_PREBUILT_PACKAGE" "$CARGO_NATIVE_PREBUILT_WORKSPACE" "$features")"
+root="$(realpath -m "$canonical_root")"
+view="$(realpath -e "$package")"
+case "$view" in
+    "$root"/boringssl-prebuilt/*) ;;
+    *) echo "boringssl-build-provider: native package view outside canonical root: $view" >&2; exit 2 ;;
+esac
+test -f "$view/lib/libcrypto.a"
+test -f "$view/lib/libssl.a"
+test -f "$view/include/openssl/x509v3.h"
+
+if ((is_fips)); then
+    jq -cn --arg path "$view" \
+        '{env:{BORING_BSSL_FIPS_PATH:$path,BORING_BSSL_FIPS_ASSUME_PATCHED:"1"}}'
+else
+    jq -cn --arg path "$view" \
+        '{env:{BORING_BSSL_PATH:$path,BORING_BSSL_ASSUME_PATCHED:"1"}}'
+fi

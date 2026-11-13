@@ -28,14 +28,14 @@ RUST_TOOLCHAIN=${SENTINELX_RUST_TOOLCHAIN:-1.99.1}
 mkdir -p "$CACHE_ROOT"
 
 lock_entry="$(
-    awk -v wanted="$NATIVE_CRATE" '
+    awk -v wanted="$NATIVE_CRATE" -v wanted_version="${BORING_BSSL_PACKAGE_VERSION:-}" '
         function unquote(s) {
             sub(/^"/, "", s)
             sub(/"$/, "", s)
             return s
         }
         function finish_package() {
-            if (name == wanted) {
+            if (name == wanted && (wanted_version == "" || version == wanted_version) && source == "registry+https://github.com/rust-lang/crates.io-index") {
                 count++
                 found_version = version
                 found_checksum = checksum
@@ -44,11 +44,12 @@ lock_entry="$(
         /^\[\[package\]\]$/ {
             if (in_package) finish_package()
             in_package = 1
-            name = version = checksum = ""
+            name = version = checksum = source = ""
             next
         }
         in_package && $1 == "name" && $2 == "=" { name = unquote($3) }
         in_package && $1 == "version" && $2 == "=" { version = unquote($3) }
+        in_package && $1 == "source" && $2 == "=" { source = unquote($3) }
         in_package && $1 == "checksum" && $2 == "=" { checksum = unquote($3) }
         END {
             if (in_package) finish_package()
@@ -57,7 +58,7 @@ lock_entry="$(
         }
     ' "$PROJECT/Cargo.lock"
 )" || {
-    echo "boringssl-prebuilt: expected exactly one checksummed $NATIVE_CRATE package in $PROJECT/Cargo.lock" >&2
+    echo "boringssl-prebuilt: expected exactly one matching crates.io $NATIVE_CRATE package in $PROJECT/Cargo.lock" >&2
     exit 2
 }
 read -r VERSION CHECKSUM <<<"$lock_entry"
@@ -104,7 +105,7 @@ CMAKE_ID="$(tool_id "$CMAKE_PATH")"
 
 key_material="$(
     printf '%s\n' \
-        "package-format=2" \
+        "package-format=3" \
         "native-crate=$NATIVE_CRATE" \
         "$NATIVE_CRATE-version=$VERSION" \
         "$NATIVE_CRATE-checksum=$CHECKSUM" \
