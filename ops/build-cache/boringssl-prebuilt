@@ -302,6 +302,12 @@ EOF
 
     (
         cd "$work/project"
+        # The provider may be called inside a consumer Cargo build. Never
+        # reuse the caller's persistent target artifacts or its canonical
+        # Rust source root for this nested, independently keyed native build.
+        export CARGO_TARGET_DIR="$work/target"
+        export SCCACHE_CANONICAL_TARGET_ROOT="$CARGO_TARGET_DIR"
+        unset SCCACHE_CANONICAL_TARGET_ROOT_ORIGIN
         # Use the site wrapper so cache generation gets the managed registry
         # source pool, package-cache policy, native sccache launcher and target
         # reclamation. A new crate version may fetch its archive once.
