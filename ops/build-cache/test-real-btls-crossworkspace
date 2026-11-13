@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Real native-crate acceptance: one independently built BoringSSL package,
+# two unrelated Cargo workspaces, two separate canonical views and native
+# SHA-256 calls. All test assets are scoped and removed at exit.
+here=$(cd "$(dirname "$0")" && pwd)
+helper="$here/boringssl-prebuilt"
+mkdir -p "$HOME/build"
+root=$(mktemp -d "$HOME/build/boringssl-real-crossworkspace-XXXXXXXX")
+trap 'rm -rf -- "$root"' EXIT
+
+export BORING_BSSL_CACHE_ROOT="$root/native-packages"
+export SENTINELX_BORINGSSL_BUILD_ROOT="$root/native-work"
+export SENTINELX_CARGO_WRAPPER_PATH
+SENTINELX_CARGO_WRAPPER_PATH=$(command -v cargo)
+export SENTINELX_RUST_TOOLCHAIN=1.99.0
+export CARGO_BUILD_EPHEMERAL_INTERMEDIATES=true
+export CARGO_INCREMENTAL=0
+
+for workspace in a b; do
+    project="$root/workspace-$workspace"
+    mkdir -p "$project/src"
+    cat >"$project/Cargo.toml" <<'CARGO'
+[package]
+name = "btls-native-reuse-crossworkspace"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+btls-sys = "=0.5.6"
+CARGO
+    cat >"$project/src/main.rs" <<'RUST'
+fn main() {
+    btls_sys::init();
+    let mut digest = [0_u8; 32];
+    // Exercise native symbols from the shared static archive, not just bindgen.
+    let result = unsafe { btls_sys::SHA256(b"abc".as_ptr(), 3, digest.as_mut_ptr()) };
+    assert!(!result.is_null());
+    assert_eq!(&digest[..4], &[0xba, 0x78, 0x16, 0xbf]);
+    println!("linked-BoringSSL-SHA256=ok");
+}
+RUST
+done
+(
+    cd "$root/workspace-a"
+    cargo +1.99.0 generate-lockfile --quiet
+)
+cp "$root/workspace-a/Cargo.lock" "$root/workspace-b/Cargo.lock"
+
+for workspace in a b; do
+    project="$root/workspace-$workspace"
+    export CARGO_TARGET_DIR="$project/target"
+    export SCCACHE_CANONICAL_TARGET_ROOT="$CARGO_TARGET_DIR"
+    export BORING_BSSL_VIEW_ROOT="$CARGO_TARGET_DIR"
+    export BORING_BSSL_PATH
+    BORING_BSSL_PATH=$("$helper" btls-sys "$project" default)
+    export BORING_BSSL_ASSUME_PATCHED=1
+
+    test -f "$BORING_BSSL_PATH/lib/libcrypto.a"
+    test -f "$BORING_BSSL_PATH/lib/libssl.a"
+    test -f "$BORING_BSSL_PATH/include/openssl/x509v3.h"
+    (
+        cd "$BORING_BSSL_PATH"
+        sha256sum -c --status SHA256SUMS
+    )
+    cargo +1.99.0 run --locked --manifest-path "$project/Cargo.toml" --quiet
+    printf 'crossworkspace %s linked against native package %s\n' "$workspace" "$(basename "$BORING_BSSL_PATH")"
+done
+echo 'ok: keyed BoringSSL package linked and ran in two independent canonical-root Cargo workspaces'
