@@ -71,3 +71,20 @@ against the package checksum manifest. An existing invalid native package or
 view fails closed instead of being overwritten or reused. The canonical view
 requires an explicit and matching SCCACHE_CANONICAL_TARGET_ROOT; it cannot be
 made by guessing a root outside the validated Rust compiler inputs.
+
+## Real native-link acceptance
+
+Run `ops/build-cache/test-real-btls-crossworkspace` on a Linux x86-64
+build host with Rust 1.99, CMake, a native C/C++ toolchain and Cargo. It builds
+one authentic `btls-sys=0.5.6` native package, creates two unrelated
+Cargo workspaces with separate canonical-root package views, compiles and
+runs the same executable against the actual BoringSSL SHA-256 symbol in each,
+and removes all temporary build artifacts from an isolated `~/build`
+subdirectory. This deliberately exercises the full native package and linker,
+not just seeded files; the first cold native build is relatively expensive.
+It does not use or modify the fleet sccache storage configuration.
+
+Shared packages are only selected explicitly here. Automatic selection in
+normal Cargo builds is **not installed**; it requires inferring the actual
+unified native package features and target from each build, rather than
+guessing the default variant.

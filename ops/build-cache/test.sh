@@ -9,6 +9,7 @@ BSSL_PREBUILT="$HERE/boringssl-prebuilt"
 
 # Keep all shipped shell helpers under the maintenance-scripts CI lane even
 # when a test below does not execute a root/systemd-only code path.
+bash -n "$HERE/test-real-btls-crossworkspace"
 bash -n     "$WRAPPER"     "$PRUNER"     "$SOURCE_PRUNER"     "$BSSL_PREBUILT"     "$HERE/sccache-release-update"     "$HERE/sccache-dist-client-preflight"     "$HERE/sccache-router"     "$HERE/sccache-client"     "$HERE/install-sccache-autoupdate"
 
 # The updater runs as root while the shared compiler daemon runs as the service
