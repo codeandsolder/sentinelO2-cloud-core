@@ -53,6 +53,8 @@ helper="${BORING_BSSL_PROVIDER_HELPER:-$(dirname "$(realpath -e "$0")")/boringss
 }
 
 # Native packages are build assets. Compiler cache remains managed Garage.
+# Production native packages are authoritative in Garage, not a local cache.
+export BORING_BSSL_STORE_BACKEND="${BORING_BSSL_STORE_BACKEND:-garage}"
 export BORING_BSSL_PACKAGE_VERSION="$CARGO_NATIVE_PREBUILT_VERSION"
 export BORING_BSSL_TARGET="$CARGO_NATIVE_PREBUILT_TARGET"
 export BORING_BSSL_VIEW_ROOT="$canonical_root"

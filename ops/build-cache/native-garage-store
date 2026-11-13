@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Direct Garage S3 transport for content-keyed native package archives.
+usage() { echo "usage: $0 <get|put|delete> <20-hex-content-key> [directory]" >&2; exit 2; }
+action=${1:-}
+key=${2:-}
+dir=${3:-}
+[[ "$key" =~ ^[a-f0-9]{20}$ ]] || usage
+case "$action" in get|put) [[ -n "$dir" && -d "$dir" && ! -L "$dir" ]] || usage ;; delete) ;; *) usage ;; esac
+
+env_file="${BORING_BSSL_GARAGE_ENV:-/etc/sccache/native-prebuilt-garage.env}"
+[[ -f "$env_file" && -r "$env_file" ]] || {
+    echo "native-garage-store: unreadable credential configuration $env_file" >&2
+    exit 2
+}
+set -a
+# shellcheck disable=SC1090
+source "$env_file"
+set +a
+: "${AWS_ACCESS_KEY_ID:?}"
+: "${AWS_SECRET_ACCESS_KEY:?}"
+: "${AWS_REGION:?}"
+: "${SCCACHE_ENDPOINT:?}"
+: "${SCCACHE_BUCKET:?}"
+
+endpoint="${SCCACHE_ENDPOINT%/}"
+# Managed sccache exports host:port, not a complete URL.
+if [[ "$endpoint" != http://* && "$endpoint" != https://* ]]; then
+    [[ "$endpoint" =~ ^[a-zA-Z0-9.-]+(:[0-9]+)?$ ]] || {
+        echo "native-garage-store: invalid S3 endpoint" >&2
+        exit 2
+    }
+    if [[ "${SCCACHE_S3_USE_SSL:-false}" == true || "${SCCACHE_S3_USE_SSL:-}" == 1 ]]; then
+        endpoint="https://$endpoint"
+    else
+        endpoint="http://$endpoint"
+    fi
+fi
+prefix="${BORING_BSSL_GARAGE_PREFIX:-native-boringssl/v1}"
+[[ "$prefix" =~ ^[a-zA-Z0-9/_-]+$ ]] || {
+    echo "native-garage-store: invalid prefix" >&2
+    exit 2
+}
+url="$endpoint/$SCCACHE_BUCKET/$prefix/$key.tar.zst"
+# Anonymous stdin curl configuration keeps secrets out of process arguments.
+curl_signed() {
+    printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" |
+        curl --config - --aws-sigv4 "aws:amz:${AWS_REGION}:s3" \
+            --connect-timeout 5 --max-time 180 --silent --show-error "$@"
+}
+
+case "$action" in
+    put)
+        archive=$(mktemp "${TMPDIR:-/tmp}/native-boringssl-upload-XXXXXXXX.tar.zst")
+        trap 'rm -f -- "$archive"' EXIT
+        [[ -f "$dir/MANIFEST.txt" && -f "$dir/SHA256SUMS" ]] || {
+            echo "native-garage-store: native package missing manifest" >&2
+            exit 2
+        }
+        (cd "$dir" && sha256sum --status -c SHA256SUMS)
+        tar -C "$dir" -cf - lib include MANIFEST.txt SHA256SUMS |
+            zstd -1 -q -f -o "$archive"
+        curl_signed --fail-with-body --upload-file "$archive" \
+            --header 'Content-Type: application/zstd' "$url" >/dev/null
+        ;;
+    get)
+        archive=$(mktemp "${TMPDIR:-/tmp}/native-boringssl-download-XXXXXXXX.tar.zst")
+        trap 'rm -f -- "$archive"' EXIT
+        rc=0
+        code="$(curl_signed --output "$archive" --write-out '%{http_code}' "$url")" || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            echo "native-garage-store: GET failed transport error $rc" >&2
+            exit 1
+        fi
+        case "$code" in
+            200) ;;
+            404) exit 3 ;;
+            *) echo "native-garage-store: GET returned HTTP $code" >&2; exit 1 ;;
+        esac
+        # Reject archive member links and traversal before extraction.
+        if ! tar --zstd -tvf "$archive" | awk '
+            { type=substr($1,1,1); if (type!="-" && type!="d") exit 1 }
+        '; then
+            echo "native-garage-store: archive contains unsupported filesystem types" >&2
+            exit 1
+        fi
+        if ! tar --zstd -tf "$archive" | awk '
+            /^\// { exit 1 }
+            /(^|\/)\.\.($|\/)/ { exit 1 }
+            !/^(lib\/|include\/|MANIFEST\.txt$|SHA256SUMS$)/ { exit 1 }
+        '; then
+            echo "native-garage-store: unsafe package paths" >&2
+            exit 1
+        fi
+        tar --zstd -xf "$archive" -C "$dir" --no-same-owner --no-same-permissions
+        ;;
+    delete)
+        curl_signed --fail-with-body --request DELETE "$url" >/dev/null
+        ;;
+esac

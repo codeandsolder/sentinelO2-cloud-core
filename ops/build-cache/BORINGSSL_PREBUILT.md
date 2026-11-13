@@ -125,3 +125,39 @@ Cargo's own SourceId::is_crates_io() identifies the package. The provider
 also receives canonical SourceId::as_url(). Never compare human-readable
 SourceId::Display: for crates.io it says registry crates-io, not the canonical
 source URL, and would silently skip substitution on every native package.
+
+## Production Garage artifact storage
+
+The automatic native provider defaults to the Garage backend (rather than
+persisting native package archives under a local /srv/scratch path). The
+native-garage-store transport uses authenticated S3 SigV4 with Garage and
+requires an independently scoped credential file in
+/etc/sccache/native-prebuilt-garage.env, owned root:jan, mode 0640.
+The file declares AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION,
+SCCACHE_BUCKET, SCCACHE_ENDPOINT, and SCCACHE_S3_USE_SSL; no secret is
+committed to Git. The transport accepts both managed sccache hostname
+endpoints and explicit http(s) URLs, and never puts credentials into command
+arguments.
+
+Garage stores content-keyed zstd tar archives (native-boringssl/v1/KEY.tar.zst).
+On a miss, native code is built once via existing Garage-backed sccache,
+checksummed and uploaded atomically; warm builds download and revalidate all
+static libraries, patched headers and the manifest before use. Only ordinary
+Cargo target views survive as local build artifacts. Per-invocation native
+staging under TMPDIR is removed at exit; same-user concurrent invocations use
+runtime-only flock locks under /run/user/UID.
+
+The dedicated Garage bucket native-boringssl was provisioned with a 1 GiB,
+2000-object hard limit and a native-boringssl-builder-20261113 key that has
+only read/write permission to that bucket. It has no bucket administration
+permission. The currently active Garage node resides on Asus and Acer's
+local endpoint forwards there over Tailscale.
+
+For a real end-to-end Garage acceptance, run:
+BORING_BSSL_STORE_BACKEND=garage CARGO_UNDER_TEST=/path/to/tested/cargo \
+    ./ops/build-cache/test-auto-btls-crossworkspace
+
+The script builds and executes two independent native-linked Cargo consumers
+and verifies that their shared package can be fetched from Garage. It leaves
+the uploaded native package as intentional cached state in Garage; all test
+build directories and local transaction files are removed.

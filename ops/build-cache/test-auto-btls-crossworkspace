@@ -6,6 +6,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$HOME/build"
 root=$(mktemp -d "$HOME/build/boringssl-auto-crossworkspace-XXXXXXXX")
 trap 'rm -rf -- "$root"' EXIT
+export BORING_BSSL_STORE_BACKEND="${BORING_BSSL_STORE_BACKEND:-local}"
 export BORING_BSSL_CACHE_ROOT="$root/native-packages"
 export SENTINELX_BORINGSSL_BUILD_ROOT="$root/native-work"
 export SENTINELX_CARGO_WRAPPER_PATH="${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/bin/cargo}"
@@ -65,6 +66,21 @@ for workspace in a b; do
     snapshot
     test -f "$project/target/boringssl-prebuilt"/*/lib/libcrypto.a
 done
-count=$(find "$BORING_BSSL_CACHE_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'btls-sys-*' | wc -l)
-[[ "$count" -eq 1 ]] || { echo "expected one native package, found $count" >&2; exit 1; }
-echo 'PASS: BoringSSL native auto-provider linked SHA256 in two independent workspaces; single native package'
+package_a=$(find "$root/workspace-a/target/boringssl-prebuilt" -mindepth 1 -maxdepth 1 -type d -name 'btls-sys-*' -printf '%f\n')
+package_b=$(find "$root/workspace-b/target/boringssl-prebuilt" -mindepth 1 -maxdepth 1 -type d -name 'btls-sys-*' -printf '%f\n')
+[[ -n "$package_a" && "$package_a" == "$package_b" ]] || {
+    echo "different native packages were selected across matching workspaces" >&2; exit 1;
+}
+if [[ "$BORING_BSSL_STORE_BACKEND" == garage ]]; then
+    [[ ! -e "$BORING_BSSL_CACHE_ROOT" ]] || {
+        echo "unexpected persistent local native artifact cache in Garage mode" >&2; exit 1;
+    }
+    key="${package_a##*-}"
+    mkdir -p "$root/garage-roundtrip"
+    "$here/native-garage-store" get "$key" "$root/garage-roundtrip"
+    (cd "$root/garage-roundtrip"; sha256sum --status -c SHA256SUMS)
+else
+    count=$(find "$BORING_BSSL_CACHE_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'btls-sys-*' | wc -l)
+    [[ "$count" -eq 1 ]] || { echo "expected one native package, found $count" >&2; exit 1; }
+fi
+echo 'PASS: BoringSSL automatic native provider linked two workspaces with one native package'

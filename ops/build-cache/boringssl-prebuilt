@@ -23,6 +23,27 @@ esac
 
 CACHE_ROOT=${BORING_BSSL_CACHE_ROOT:-${SENTINELX_BORINGSSL_CACHE_ROOT:-/srv/scratch/toolchains/boringssl-prebuilt}}
 BUILD_ROOT=${SENTINELX_BORINGSSL_BUILD_ROOT:-/srv/scratch/toolchains/boringssl-build}
+STORE_ROOT=""
+GARAGE_STORE=""
+case "${BORING_BSSL_STORE_BACKEND:-local}" in
+    local) ;;
+    garage)
+        # Native packages live in Garage; these are transaction files only.
+        STORE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/boringssl-garage-XXXXXXXX")"
+        CACHE_ROOT="$STORE_ROOT/package"
+        BUILD_ROOT="$STORE_ROOT/build"
+        GARAGE_STORE="$(dirname "$(realpath -e "$0")")/native-garage-store"
+        [[ -x "$GARAGE_STORE" ]] || {
+            echo "boringssl-prebuilt: Garage S3 transport unavailable" >&2
+            exit 2
+        }
+        trap 'rm -rf -- "$STORE_ROOT"' EXIT
+        ;;
+    *)
+        echo "boringssl-prebuilt: unknown native package storage backend" >&2
+        exit 2
+        ;;
+esac
 CARGO_WRAPPER=${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/libexec/sentinelx-bin/cargo}
 RUST_TOOLCHAIN=${SENTINELX_RUST_TOOLCHAIN:-1.99.1}
 mkdir -p "$CACHE_ROOT"
@@ -134,6 +155,18 @@ key_material="$(
 key="$(printf '%s' "$key_material" | sha256sum | cut -c1-20)"
 dest="$CACHE_ROOT/$NATIVE_CRATE-$VERSION-$FEATURE_KEY-$TARGET-$key"
 lock="$CACHE_ROOT/.$NATIVE_CRATE-$key.lock"
+if [[ -n "$GARAGE_STORE" ]]; then
+    # The package staging root is unique per provider process. Coordinate
+    # same-host cold misses using a runtime-only flock file instead of a
+    # second persistent compiler/artifact cache.
+    lock_parent="/run/user/$(id -u)"
+    [[ -d "$lock_parent" && -w "$lock_parent" ]] || {
+        echo "boringssl-prebuilt: writable per-user runtime directory required for Garage locks" >&2
+        exit 2
+    }
+    mkdir -p "$lock_parent/boringssl-native-locks"
+    lock="$lock_parent/boringssl-native-locks/$key.lock"
+fi
 
 complete() {
     [[ -d "$dest" && ! -L "$dest" ]] &&
@@ -214,12 +247,42 @@ if [[ -e "$dest" || -L "$dest" ]]; then
     exit 1
 fi
 
+# S3 GET is tried before native compilation. 404 is the only permitted cache
+# miss; transport faults or corrupt artifacts cannot be treated as misses.
+if [[ -n "$GARAGE_STORE" ]]; then
+    remote_stage="$(mktemp -d "$CACHE_ROOT/.remote-$key-XXXXXX")"
+    get_rc=0
+    "$GARAGE_STORE" get "$key" "$remote_stage" || get_rc=$?
+    case "$get_rc" in
+        0)
+            original_dest="$dest"
+            dest="$remote_stage"
+            if ! complete; then
+                echo "boringssl-prebuilt: Garage object failed package integrity verification" >&2
+                exit 1
+            fi
+            dest="$original_dest"
+            mv -T "$remote_stage" "$dest"
+            publish_path
+            exit 0
+            ;;
+        3)
+            rm -rf -- "$remote_stage"
+            ;;
+        *)
+            echo "boringssl-prebuilt: Garage S3 GET failed (status $get_rc)" >&2
+            exit 1
+            ;;
+    esac
+fi
+
 stage="$(mktemp -d "$CACHE_ROOT/.stage-$key-XXXXXX")"
 work=""
 cleanup() {
     rc=$?
     [[ -z "$work" ]] || rm -rf -- "$work"
     rm -rf -- "$stage"
+    [[ -z "$STORE_ROOT" ]] || rm -rf -- "$STORE_ROOT"
     exit "$rc"
 }
 trap cleanup EXIT INT TERM HUP
@@ -332,6 +395,17 @@ EOF
 )
 mv -T "$stage" "$dest"
 stage=""
-trap - EXIT INT TERM HUP
+# Upload only after full native headers+libraries verification. Garage PUT
+# publishes the archive atomically under its content-derived identity.
+if [[ -n "$GARAGE_STORE" ]]; then
+    "$GARAGE_STORE" put "$key" "$dest"
+fi
 [[ -z "$work" ]] || rm -rf -- "$work"
+work=""
+trap - INT TERM HUP
+if [[ -n "$STORE_ROOT" ]]; then
+    trap 'rm -rf -- "$STORE_ROOT"' EXIT
+else
+    trap - EXIT
+fi
 publish_path
