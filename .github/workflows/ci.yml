@@ -25,7 +25,7 @@ jobs:
     name: Rust 1.99.1 Linux, maintenance and tests
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@835efeff3a1e617d8ecd40ed70b402a298d2481f # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@47a06568cde470da42ae67a93c8e63966cce1fce # main
     with:
       runner: ubuntu-26.04
       command: |
@@ -66,7 +66,7 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@835efeff3a1e617d8ecd40ed70b402a298d2481f # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@47a06568cde470da42ae67a93c8e63966cce1fce # main
         with:
           rust-toolchain: nightly
       - name: Protocol JSON
@@ -75,7 +75,7 @@ jobs:
         run: cargo fuzz run binary_frame --target x86_64-unknown-linux-gnu -- -runs=10000
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@835efeff3a1e617d8ecd40ed70b402a298d2481f # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@47a06568cde470da42ae67a93c8e63966cce1fce # main
 
   release:
     name: Release binary
@@ -90,7 +90,7 @@ jobs:
       - name: Install current stable Rust
         run: rustup toolchain install 1.99.1 --profile minimal
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@835efeff3a1e617d8ecd40ed70b402a298d2481f # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@47a06568cde470da42ae67a93c8e63966cce1fce # main
         with:
           rust-toolchain: "1.99.1"
       - name: Build
@@ -99,7 +99,7 @@ jobs:
         run: ./target/release/sentinelx-core --help >/dev/null
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@835efeff3a1e617d8ecd40ed70b402a298d2481f # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@47a06568cde470da42ae67a93c8e63966cce1fce # main
       - name: Checksum
         run: (cd target/release && sha256sum sentinelx-core > sentinelx-core.sha256)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
