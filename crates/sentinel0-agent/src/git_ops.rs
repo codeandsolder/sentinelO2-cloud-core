@@ -1,4 +1,5 @@
 use crate::{
+    git_common::{git_argv, git_env},
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
     process_output::CapturedOutput,
@@ -19,28 +20,6 @@ const MAX_PATCH: usize = 5 * 1024 * 1024;
 const MAX_DIFF_PATCH: usize = 128 * 1024;
 const MAX_GIT_STDOUT: usize = 32 * 1024 * 1024;
 const MAX_GIT_STDERR: usize = 1024 * 1024;
-
-fn git_argv(policy: &Policy, root: &Path, arguments: &[String]) -> Vec<String> {
-    let mut command = vec![
-        policy.tooling.command("git").display().to_string(),
-        "-C".into(),
-        root.display().to_string(),
-        "-c".into(),
-        "core.fsmonitor=false".into(),
-    ];
-    command.extend(arguments.iter().cloned());
-    command
-}
-
-fn git_env() -> Map<String, Value> {
-    Map::from_iter([
-        ("GIT_TERMINAL_PROMPT".into(), Value::String("0".into())),
-        ("GIT_OPTIONAL_LOCKS".into(), Value::String("0".into())),
-        ("GIT_PAGER".into(), Value::String("cat".into())),
-        ("GIT_CONFIG_NOSYSTEM".into(), Value::String("1".into())),
-        ("LC_ALL".into(), Value::String("C".into())),
-    ])
-}
 
 fn git_process_failure(failure: ProcessFailure) -> HandlerError {
     match failure {
@@ -69,7 +48,7 @@ async fn run_git_capture(
     stdout_limit: usize,
     limit: Duration,
 ) -> Result<CapturedOutput, HandlerError> {
-    let command = git_argv(policy, root, arguments);
+    let command = git_argv(policy, root, arguments.iter().map(String::as_str));
     let env = git_env();
     let outcome = run_argv_with_limits(
         policy,

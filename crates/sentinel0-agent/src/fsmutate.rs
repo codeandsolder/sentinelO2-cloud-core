@@ -15,7 +15,20 @@ use std::{
 };
 
 fn resolve_rw(policy: &Policy, raw: &str, label: &str) -> Result<PathBuf, HandlerError> {
-    policy.resolve_path(raw, true).ok_or_else(|| {
+    resolve_checked_rw(policy, raw, label, Policy::resolve_path)
+}
+
+fn resolve_leaf_rw(policy: &Policy, raw: &str, label: &str) -> Result<PathBuf, HandlerError> {
+    resolve_checked_rw(policy, raw, label, Policy::resolve_path_no_follow_leaf)
+}
+
+fn resolve_checked_rw(
+    policy: &Policy,
+    raw: &str,
+    label: &str,
+    resolve: impl FnOnce(&Policy, &str, bool) -> Option<PathBuf>,
+) -> Result<PathBuf, HandlerError> {
+    resolve(policy, raw, true).ok_or_else(|| {
         HandlerError::with_details(
             "path_not_allowed",
             format!("{label} {raw:?} is outside the file_ops rw allowlist"),
@@ -32,28 +45,6 @@ fn resolve_rw(policy: &Policy, raw: &str, label: &str) -> Result<PathBuf, Handle
             )]),
         )
     })
-}
-
-fn resolve_leaf_rw(policy: &Policy, raw: &str, label: &str) -> Result<PathBuf, HandlerError> {
-    policy
-        .resolve_path_no_follow_leaf(raw, true)
-        .ok_or_else(|| {
-            HandlerError::with_details(
-                "path_not_allowed",
-                format!("{label} {raw:?} is outside the file_ops rw allowlist"),
-                Map::from_iter([(
-                    "writable_paths".into(),
-                    Value::Array(
-                        policy
-                            .file_ops_paths
-                            .iter()
-                            .filter(|entry| entry.access == crate::policy::FileAccess::ReadWrite)
-                            .map(|entry| Value::String(entry.path.display().to_string()))
-                            .collect(),
-                    ),
-                )]),
-            )
-        })
 }
 
 fn entry_metadata(path: &Path) -> io::Result<fs::Metadata> {

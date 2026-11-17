@@ -104,43 +104,39 @@ enum PathPart {
     Index(usize),
 }
 
-fn largest_string_path(root: &Value) -> Option<(Vec<PathPart>, usize)> {
-    fn visit(node: &Value, path: &mut Vec<PathPart>, best: &mut Option<(Vec<PathPart>, usize)>) {
+/// Walk JSON children once with a category-specific candidate selector.
+/// Root itself is excluded, matching both bounding strategies' semantics.
+fn largest_matching_path(
+    root: &Value,
+    candidate_size: impl Fn(&Value) -> Option<usize>,
+) -> Option<(Vec<PathPart>, usize)> {
+    fn visit(
+        node: &Value,
+        path: &mut Vec<PathPart>,
+        best: &mut Option<(Vec<PathPart>, usize)>,
+        candidate_size: &impl Fn(&Value) -> Option<usize>,
+    ) {
+        let mut inspect_child = |part: PathPart, value: &Value| {
+            path.push(part);
+            if let Some(size) = candidate_size(value)
+                && best.as_ref().is_none_or(|(_, best_size)| size > *best_size)
+            {
+                *best = Some((path.clone(), size));
+            }
+            if matches!(value, Value::Object(_) | Value::Array(_)) {
+                visit(value, path, best, candidate_size);
+            }
+            path.pop();
+        };
         match node {
             Value::Object(map) => {
                 for (key, value) in map {
-                    path.push(PathPart::Key(key.clone()));
-                    match value {
-                        Value::String(text) => {
-                            let size = text.len();
-                            if size >= MIN_TRUNCATABLE
-                                && best.as_ref().is_none_or(|(_, best_size)| size > *best_size)
-                            {
-                                *best = Some((path.clone(), size));
-                            }
-                        }
-                        Value::Object(_) | Value::Array(_) => visit(value, path, best),
-                        _ => {}
-                    }
-                    path.pop();
+                    inspect_child(PathPart::Key(key.clone()), value);
                 }
             }
             Value::Array(items) => {
                 for (index, value) in items.iter().enumerate() {
-                    path.push(PathPart::Index(index));
-                    match value {
-                        Value::String(text) => {
-                            let size = text.len();
-                            if size >= MIN_TRUNCATABLE
-                                && best.as_ref().is_none_or(|(_, best_size)| size > *best_size)
-                            {
-                                *best = Some((path.clone(), size));
-                            }
-                        }
-                        Value::Object(_) | Value::Array(_) => visit(value, path, best),
-                        _ => {}
-                    }
-                    path.pop();
+                    inspect_child(PathPart::Index(index), value);
                 }
             }
             _ => {}
@@ -148,54 +144,23 @@ fn largest_string_path(root: &Value) -> Option<(Vec<PathPart>, usize)> {
     }
 
     let mut best = None;
-    visit(root, &mut Vec::new(), &mut best);
+    visit(root, &mut Vec::new(), &mut best, &candidate_size);
     best
 }
 
-fn largest_container_path(root: &Value) -> Option<(Vec<PathPart>, usize)> {
-    fn visit(node: &Value, path: &mut Vec<PathPart>, best: &mut Option<(Vec<PathPart>, usize)>) {
-        match node {
-            Value::Object(map) => {
-                for (key, value) in map {
-                    path.push(PathPart::Key(key.clone()));
-                    if matches!(value, Value::Object(map) if map.len() >= 2)
-                        || matches!(value, Value::Array(items) if items.len() >= 2)
-                    {
-                        let size = serialized_size(value);
-                        if best.as_ref().is_none_or(|(_, best_size)| size > *best_size) {
-                            *best = Some((path.clone(), size));
-                        }
-                    }
-                    if matches!(value, Value::Object(_) | Value::Array(_)) {
-                        visit(value, path, best);
-                    }
-                    path.pop();
-                }
-            }
-            Value::Array(items) => {
-                for (index, value) in items.iter().enumerate() {
-                    path.push(PathPart::Index(index));
-                    if matches!(value, Value::Object(map) if map.len() >= 2)
-                        || matches!(value, Value::Array(items) if items.len() >= 2)
-                    {
-                        let size = serialized_size(value);
-                        if best.as_ref().is_none_or(|(_, best_size)| size > *best_size) {
-                            *best = Some((path.clone(), size));
-                        }
-                    }
-                    if matches!(value, Value::Object(_) | Value::Array(_)) {
-                        visit(value, path, best);
-                    }
-                    path.pop();
-                }
-            }
-            _ => {}
-        }
-    }
+fn largest_string_path(root: &Value) -> Option<(Vec<PathPart>, usize)> {
+    largest_matching_path(root, |value| match value {
+        Value::String(text) if text.len() >= MIN_TRUNCATABLE => Some(text.len()),
+        _ => None,
+    })
+}
 
-    let mut best = None;
-    visit(root, &mut Vec::new(), &mut best);
-    best
+fn largest_container_path(root: &Value) -> Option<(Vec<PathPart>, usize)> {
+    largest_matching_path(root, |value| match value {
+        Value::Object(map) if map.len() >= 2 => Some(serialized_size(value)),
+        Value::Array(items) if items.len() >= 2 => Some(serialized_size(value)),
+        _ => None,
+    })
 }
 
 fn value_at<'a>(mut value: &'a Value, path: &[PathPart]) -> Option<&'a Value> {
@@ -764,6 +729,31 @@ mod tests {
                 .is_some_and(|entries| entries.iter().any(|entry| entry["path"] == "/services"))
         );
         assert!(serialized_size(&response) <= 24_576);
+    }
+
+    #[test]
+    fn largest_candidate_paths_preserve_nested_selection_and_first_tie() {
+        let nested = json!({
+            "one": ["short", {"note": "z".repeat(320)}],
+            "two": {"first": "a".repeat(320), "second": "b".repeat(315)}
+        });
+        assert_eq!(
+            largest_string_path(&nested),
+            Some((
+                vec![
+                    PathPart::Key("one".into()),
+                    PathPart::Index(1),
+                    PathPart::Key("note".into())
+                ],
+                320
+            ))
+        );
+        assert_eq!(
+            largest_container_path(&nested).map(|(path, _)| path),
+            Some(vec![PathPart::Key("two".into())])
+        );
+        assert_eq!(largest_string_path(&json!({"small": ["tiny"]})), None);
+        assert_eq!(largest_container_path(&json!({"small": ["tiny"]})), None);
     }
 
     #[test]
