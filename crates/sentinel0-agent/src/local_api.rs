@@ -1389,9 +1389,19 @@ async fn call_stdio_jsonrpc(
     action: &Action,
     params: &Map<String, Value>,
 ) -> Result<Value, HandlerError> {
-    if let Some((code, message)) =
-        stdio_binary_problem(Path::new(&endpoint.path), endpoint.run_as.is_some())
-    {
+    // Canonicalization, metadata lookups and Unix user/group resolution may
+    // block (including NSS lookups). Keep them off Tokio's worker threads.
+    let binary_path = PathBuf::from(&endpoint.path);
+    let run_as = endpoint.run_as.is_some();
+    let problem = tokio::task::spawn_blocking(move || stdio_binary_problem(&binary_path, run_as))
+        .await
+        .map_err(|error| {
+            HandlerError::new(
+                "internal_error",
+                format!("binary inspection failed: {error}"),
+            )
+        })?;
+    if let Some((code, message)) = problem {
         return Err(HandlerError::new(code, message));
     }
     let argv = stdio_argv(policy, endpoint);
