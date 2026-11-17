@@ -132,6 +132,37 @@ fn append_note(result: &mut BTreeMap<String, Value>, note: &str) {
     result.insert("note".into(), Value::String(combined));
 }
 
+/// Attach incomplete-scan context without conflating unreadable entries
+/// with the independent result-count and time truncation limits.
+fn append_partial_access(
+    result: &mut BTreeMap<String, Value>,
+    unreadable_dirs: &[String],
+    unreadable_dir_count: u64,
+    uninspectable: u64,
+    item_word: &str,
+    absence: &str,
+) {
+    if unreadable_dir_count == 0 && uninspectable == 0 {
+        return;
+    }
+    result.insert("partial".into(), Value::Bool(true));
+    if !unreadable_dirs.is_empty() {
+        result.insert(
+            "unreadable_dirs".into(),
+            Value::Array(unreadable_dirs.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    append_note(
+        result,
+        &partial_note(
+            usize::try_from(unreadable_dir_count).unwrap_or(usize::MAX),
+            uninspectable,
+            item_word,
+            absence,
+        ),
+    );
+}
+
 fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
     match error {
         ignore::Error::WithPath { path, .. } => Some(path),
@@ -637,30 +668,14 @@ fn finish_list_result(
             Value::String("max_entries".into()),
         );
     }
-    if gaps.unreadable_dir_count != 0 || gaps.uninspectable != 0 {
-        result.insert("partial".into(), Value::Bool(true));
-        if !gaps.unreadable_dirs.is_empty() {
-            result.insert(
-                "unreadable_dirs".into(),
-                Value::Array(
-                    gaps.unreadable_dirs
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        append_note(
-            &mut result,
-            &partial_note(
-                usize::try_from(gaps.unreadable_dir_count).unwrap_or(usize::MAX),
-                gaps.uninspectable,
-                "entry shown as type unknown",
-                "A directory or entry missing from this listing may still exist.",
-            ),
-        );
-    }
+    append_partial_access(
+        &mut result,
+        &gaps.unreadable_dirs,
+        gaps.unreadable_dir_count,
+        gaps.uninspectable,
+        "entry shown as type unknown",
+        "A directory or entry missing from this listing may still exist.",
+    );
     result
 }
 
@@ -1097,31 +1112,14 @@ fn finish_search_result(
             Value::String("max_results".into()),
         );
     }
-    if state.unreadable_dir_count != 0 || state.unreadable_files != 0 {
-        result.insert("partial".into(), Value::Bool(true));
-        if !state.unreadable_dirs.is_empty() {
-            result.insert(
-                "unreadable_dirs".into(),
-                Value::Array(
-                    state
-                        .unreadable_dirs
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        append_note(
-            &mut result,
-            &partial_note(
-                usize::try_from(state.unreadable_dir_count).unwrap_or(usize::MAX),
-                state.unreadable_files,
-                "file",
-                "Matches there, if any, are not included: no match is not proof of absence.",
-            ),
-        );
-    }
+    append_partial_access(
+        &mut result,
+        &state.unreadable_dirs,
+        state.unreadable_dir_count,
+        state.unreadable_files,
+        "file",
+        "Matches there, if any, are not included: no match is not proof of absence.",
+    );
     result
 }
 

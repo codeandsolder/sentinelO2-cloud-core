@@ -285,25 +285,32 @@ impl CoreDispatcher {
         ops
     }
 
-    fn capabilities_summary(&self, ops: Vec<String>) -> BTreeMap<String, Value> {
-        let location_count = self.policy.locations.len()
-            + usize::from(!self.policy.locations.contains_key("config"));
+    fn capability_host(&self) -> Value {
+        json!({
+            "hostname": host::hostname(),
+            "label": self.policy.hostname_label,
+            "kernel": host::kernel(),
+            "arch": std::env::consts::ARCH,
+        })
+    }
+
+    fn capability_base(&self, ops: Vec<String>) -> BTreeMap<String, Value> {
         BTreeMap::from([
             ("agent".into(), Value::String("sentinelx-cloud-core".into())),
             ("version".into(), Value::String(self.agent_version.clone())),
-            (
-                "host".into(),
-                json!({
-                    "hostname": host::hostname(),
-                    "label": self.policy.hostname_label,
-                    "kernel": host::kernel(),
-                    "arch": std::env::consts::ARCH,
-                }),
-            ),
+            ("host".into(), self.capability_host()),
             (
                 "ops_supported".into(),
                 Value::Array(ops.into_iter().map(Value::String).collect()),
             ),
+        ])
+    }
+
+    fn capabilities_summary(&self, ops: Vec<String>) -> BTreeMap<String, Value> {
+        let location_count = self.policy.locations.len()
+            + usize::from(!self.policy.locations.contains_key("config"));
+        let mut result = self.capability_base(ops);
+        result.extend([
             (
                 "limits".into(),
                 json!({
@@ -369,7 +376,8 @@ impl CoreDispatcher {
                     },
                 }),
             ),
-        ])
+        ]);
+        result
     }
 
     fn capability_services(&self) -> Map<String, Value> {
@@ -481,22 +489,8 @@ impl CoreDispatcher {
         let playbooks = self.capability_playbooks()?;
         let locations = self.capability_locations()?;
 
-        Ok(BTreeMap::from([
-            ("agent".into(), Value::String("sentinelx-cloud-core".into())),
-            ("version".into(), Value::String(self.agent_version.clone())),
-            (
-                "host".into(),
-                json!({
-                    "hostname": host::hostname(),
-                    "label": self.policy.hostname_label,
-                    "kernel": host::kernel(),
-                    "arch": std::env::consts::ARCH,
-                }),
-            ),
-            (
-                "ops_supported".into(),
-                Value::Array(ops.into_iter().map(Value::String).collect()),
-            ),
+        let mut result = self.capability_base(ops);
+        result.extend([
             (
                 "allowed_commands".into(),
                 Value::Array(
@@ -570,7 +564,8 @@ impl CoreDispatcher {
                 "config_path".into(),
                 Value::String(self.config_path.display().to_string()),
             ),
-        ]))
+        ]);
+        Ok(result)
     }
 
     fn capabilities_result(&self, payload: &Map<String, Value>) -> HandlerResult {
@@ -1464,6 +1459,14 @@ mod tests {
     #[tokio::test]
     async fn capabilities_are_derived_from_real_dispatch_surface() -> TestResult {
         let dispatcher = CoreDispatcher::new(Policy::default(), "/tmp/config".into(), "test");
+        let shared = dispatcher.capability_base(dispatcher.capability_ops());
+        let summary = dispatcher.capabilities_summary(dispatcher.capability_ops());
+        let full = dispatcher.capabilities_full(dispatcher.capability_ops())?;
+        for key in ["agent", "version", "host", "ops_supported"] {
+            assert_eq!(summary.get(key), shared.get(key));
+            assert_eq!(full.get(key), shared.get(key));
+        }
+
         let Message::Response {
             result: Some(result),
             ..
