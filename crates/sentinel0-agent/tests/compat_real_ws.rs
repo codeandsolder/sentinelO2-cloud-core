@@ -1,7 +1,7 @@
 mod common;
 
 use chrono::{TimeZone, Utc};
-use common::{TestResult, TestValue as _};
+use common::{AssertHeaders, TestResult, TestValue as _};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{
     Agent, AgentConfig, AgentError, AuthToken, DispatchResponse, Dispatcher, ReconnectPolicy,
@@ -18,24 +18,9 @@ use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
     accept_hdr_async,
-    tungstenite::{
-        Message as WsMessage,
-        handshake::server::{Callback, ErrorResponse, Request, Response},
-    },
+    tungstenite::{Message as WsMessage, handshake::server::Request},
 };
 use tokio_util::sync::CancellationToken;
-
-struct AssertHeaders<F>(F);
-
-impl<F> Callback for AssertHeaders<F>
-where
-    F: FnOnce(&Request),
-{
-    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
-        (self.0)(request);
-        Ok(response)
-    }
-}
 
 fn host() -> HostInfo {
     HostInfo {

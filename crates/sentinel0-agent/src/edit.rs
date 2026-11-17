@@ -452,6 +452,34 @@ fn killer_for_argv(policy: &Policy, argv: &[String]) -> Result<ProcessGroupKill,
     }
 }
 
+/// Combine retained stdout/stderr text for command failure diagnostics.
+fn process_error_tail(captured: &crate::process_output::CapturedOutput) -> String {
+    [
+        captured.stdout.rendered_trimmed_lossy(),
+        captured.stderr.rendered_trimmed_lossy(),
+    ]
+    .into_iter()
+    .filter(|text| !text.is_empty())
+    .collect::<Vec<_>>()
+    .join(" / ")
+}
+
+/// Preserve cleanup and still-running metadata for every bounded subprocess
+/// timeout, whether validating, installing, or atomically committing a file.
+fn process_timeout_details(
+    captured: &crate::process_output::TimedOutOutput,
+    cleanup_error: Option<String>,
+) -> Map<String, Value> {
+    let mut details = Map::new();
+    if captured.left_running {
+        details.insert("left_running".into(), Value::Bool(true));
+    }
+    if let Some(cleanup_error) = cleanup_error {
+        details.insert("cleanup_error".into(), Value::String(cleanup_error));
+    }
+    details
+}
+
 async fn execute_validator(policy: &Policy, argv: &[String]) -> Result<(), HandlerError> {
     let outcome = process_runner::run_argv_with_limits(
         policy,
@@ -482,14 +510,7 @@ async fn execute_validator(policy: &Policy, argv: &[String]) -> Result<(), Handl
     match outcome {
         ProcessOutcome::Completed { captured, .. } if captured.status.success() => Ok(()),
         ProcessOutcome::Completed { captured, .. } => {
-            let tail = [
-                captured.stdout.rendered_trimmed_lossy(),
-                captured.stderr.rendered_trimmed_lossy(),
-            ]
-            .into_iter()
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" / ");
+            let tail = process_error_tail(&captured);
             Err(HandlerError::new(
                 "validation_failed",
                 if tail.is_empty() {
@@ -504,13 +525,7 @@ async fn execute_validator(policy: &Policy, argv: &[String]) -> Result<(), Handl
             cleanup_error,
             ..
         } => {
-            let mut details = Map::new();
-            if captured.left_running {
-                details.insert("left_running".into(), Value::Bool(true));
-            }
-            if let Some(cleanup_error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(cleanup_error));
-            }
+            let details = process_timeout_details(&captured, cleanup_error);
             Err(HandlerError::with_details(
                 "validation_timeout",
                 format!("validator exceeded {} seconds", VALIDATOR_TIMEOUT.as_secs()),
@@ -917,14 +932,7 @@ async fn run_sudo_edit_step(
     match outcome {
         ProcessOutcome::Completed { captured, .. } if captured.status.success() => Ok(()),
         ProcessOutcome::Completed { captured, .. } => {
-            let tail = [
-                captured.stdout.rendered_trimmed_lossy(),
-                captured.stderr.rendered_trimmed_lossy(),
-            ]
-            .into_iter()
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" / ");
+            let tail = process_error_tail(&captured);
             Err(HandlerError::new(
                 "write_failed",
                 if tail.is_empty() {
@@ -939,13 +947,7 @@ async fn run_sudo_edit_step(
             cleanup_error,
             ..
         } => {
-            let mut details = Map::new();
-            if captured.left_running {
-                details.insert("left_running".into(), Value::Bool(true));
-            }
-            if let Some(cleanup_error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(cleanup_error));
-            }
+            let details = process_timeout_details(&captured, cleanup_error);
             Err(HandlerError::with_details(
                 "write_failed",
                 format!(
@@ -1042,13 +1044,7 @@ async fn run_sudo_commit_new(
             cleanup_error,
             ..
         } => {
-            let mut details = Map::new();
-            if captured.left_running {
-                details.insert("left_running".into(), Value::Bool(true));
-            }
-            if let Some(cleanup_error) = cleanup_error {
-                details.insert("cleanup_error".into(), Value::String(cleanup_error));
-            }
+            let details = process_timeout_details(&captured, cleanup_error);
             Err(HandlerError::with_details(
                 "write_failed",
                 "sudo atomic create timed out",
