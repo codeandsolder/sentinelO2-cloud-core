@@ -1,4 +1,5 @@
 use crate::{
+    git_common::{git_argv, git_env},
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
     process_runner::{
@@ -46,21 +47,8 @@ async fn run_git(
     root: &Path,
     arguments: &[&str],
 ) -> Result<(i32, Vec<u8>, Vec<u8>), HandlerError> {
-    let mut command = vec![
-        policy.tooling.command("git").display().to_string(),
-        "-C".into(),
-        root.display().to_string(),
-        "-c".into(),
-        "core.fsmonitor=false".into(),
-    ];
-    command.extend(arguments.iter().map(|argument| (*argument).to_owned()));
-    let env = Map::from_iter([
-        ("GIT_TERMINAL_PROMPT".into(), Value::String("0".into())),
-        ("GIT_OPTIONAL_LOCKS".into(), Value::String("0".into())),
-        ("GIT_PAGER".into(), Value::String("cat".into())),
-        ("GIT_CONFIG_NOSYSTEM".into(), Value::String("1".into())),
-        ("LC_ALL".into(), Value::String("C".into())),
-    ]);
+    let command = git_argv(policy, root, arguments.iter().copied());
+    let env = git_env();
     let outcome = run_argv_with_limits(
         policy,
         &command,
