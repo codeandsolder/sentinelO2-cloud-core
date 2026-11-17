@@ -905,6 +905,49 @@ impl CoreDispatcher {
         )
     }
 
+    /// Report parsed allowlist failures consistently while retaining the
+    /// strict and chain parsers' distinct authorization semantics and wording.
+    fn validate_allowed_segments(&self, command: &str, mode: ExecMode) -> Result<(), HandlerError> {
+        let (parsed, segment_prefix, structure_prefix) = match mode {
+            ExecMode::Strict => (
+                segment::unauthorised_segment(&self.policy, command),
+                "strict exec segment",
+                "strict command structure",
+            ),
+            ExecMode::Allowlist => (
+                segment::unauthorised_chain(&self.policy, command),
+                "command segment",
+                "command structure",
+            ),
+            ExecMode::Unrestricted => return Ok(()),
+        };
+        match parsed {
+            Ok(None) => Ok(()),
+            Ok(Some(offending)) => {
+                let suggestion = self.allow_command_guidance(&offending);
+                Err(HandlerError::with_details(
+                    "command_not_allowed",
+                    format!(
+                        "{segment_prefix} {offending:?} is not covered by allowed_commands. {suggestion}"
+                    ),
+                    Map::from_iter([
+                        ("command".into(), Value::String(command.into())),
+                        ("offending_segment".into(), Value::String(offending)),
+                        ("suggestion".into(), Value::String(suggestion)),
+                    ]),
+                ))
+            }
+            Err(segment::UnparseableCommand(reason)) => Err(HandlerError::with_details(
+                "command_not_allowed",
+                format!("{structure_prefix} cannot be checked safely: {reason}"),
+                Map::from_iter([
+                    ("command".into(), Value::String(command.into())),
+                    ("reason".into(), Value::String(reason)),
+                ]),
+            )),
+        }
+    }
+
     fn validate_exec_policy(&self, command: &str) -> Result<(), HandlerError> {
         if self.policy.exec_mode != ExecMode::Unrestricted
             && self.policy.allowed_commands.is_empty()
@@ -947,61 +990,9 @@ impl CoreDispatcher {
                         ]),
                     ));
                 }
-                match segment::unauthorised_segment(&self.policy, command) {
-                    Ok(None) => {}
-                    Ok(Some(offending)) => {
-                        let suggestion = self.allow_command_guidance(&offending);
-                        return Err(HandlerError::with_details(
-                            "command_not_allowed",
-                            format!(
-                                "strict exec segment {offending:?} is not covered by allowed_commands. {suggestion}"
-                            ),
-                            Map::from_iter([
-                                ("command".into(), Value::String(command.into())),
-                                ("offending_segment".into(), Value::String(offending)),
-                                ("suggestion".into(), Value::String(suggestion)),
-                            ]),
-                        ));
-                    }
-                    Err(segment::UnparseableCommand(reason)) => {
-                        return Err(HandlerError::with_details(
-                            "command_not_allowed",
-                            format!("strict command structure cannot be checked safely: {reason}"),
-                            Map::from_iter([
-                                ("command".into(), Value::String(command.into())),
-                                ("reason".into(), Value::String(reason)),
-                            ]),
-                        ));
-                    }
-                }
+                self.validate_allowed_segments(command, ExecMode::Strict)?;
             }
-            ExecMode::Allowlist => match segment::unauthorised_chain(&self.policy, command) {
-                Ok(None) => {}
-                Ok(Some(offending)) => {
-                    let suggestion = self.allow_command_guidance(&offending);
-                    return Err(HandlerError::with_details(
-                        "command_not_allowed",
-                        format!(
-                            "command segment {offending:?} is not covered by allowed_commands. {suggestion}"
-                        ),
-                        Map::from_iter([
-                            ("command".into(), Value::String(command.into())),
-                            ("offending_segment".into(), Value::String(offending)),
-                            ("suggestion".into(), Value::String(suggestion)),
-                        ]),
-                    ));
-                }
-                Err(segment::UnparseableCommand(reason)) => {
-                    return Err(HandlerError::with_details(
-                        "command_not_allowed",
-                        format!("command structure cannot be checked safely: {reason}"),
-                        Map::from_iter([
-                            ("command".into(), Value::String(command.into())),
-                            ("reason".into(), Value::String(reason)),
-                        ]),
-                    ));
-                }
-            },
+            ExecMode::Allowlist => self.validate_allowed_segments(command, ExecMode::Allowlist)?,
         }
 
         Ok(())
@@ -1375,6 +1366,47 @@ mod tests {
         assert_eq!(error.code, "command_not_allowed");
         assert!(error.message.contains("cannot be checked safely"));
         assert_eq!(error.details["command"], "echo '");
+        Ok(())
+    }
+
+    #[test]
+    fn strict_and_allowlist_diagnostics_preserve_distinct_wording_and_details() -> TestResult {
+        for (mode, rejected_prefix, structure_prefix) in [
+            (
+                ExecMode::Strict,
+                "strict exec segment",
+                "strict command structure",
+            ),
+            (ExecMode::Allowlist, "command segment", "command structure"),
+        ] {
+            let dispatcher = CoreDispatcher::new(
+                Policy {
+                    exec_mode: mode,
+                    allowed_commands: vec!["echo".into()],
+                    ..Policy::default()
+                },
+                "/tmp/config".into(),
+                "test",
+            );
+            assert!(dispatcher.validate_exec_policy("echo ok").is_ok());
+            let rejected = dispatcher
+                .validate_exec_policy("echo ok; id")
+                .test_error()?;
+            assert_eq!(rejected.code, "command_not_allowed");
+            assert!(rejected.message.starts_with(rejected_prefix));
+            assert_eq!(rejected.details["command"], "echo ok; id");
+            assert_eq!(rejected.details["offending_segment"], "id");
+            assert!(
+                rejected.details["suggestion"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("id"))
+            );
+            let malformed = dispatcher.validate_exec_policy("echo '").test_error()?;
+            assert_eq!(malformed.code, "command_not_allowed");
+            assert!(malformed.message.starts_with(structure_prefix));
+            assert_eq!(malformed.details["command"], "echo '");
+            assert!(malformed.details["reason"].is_string());
+        }
         Ok(())
     }
 

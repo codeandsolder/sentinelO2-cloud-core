@@ -687,6 +687,17 @@ async fn ls_remote(policy: &Policy, payload: &Map<String, Value>) -> HandlerResu
     ]))
 }
 
+/// Common versioned result envelope for Git mutations. Operation-specific
+/// output and location fields are appended by the corresponding handler.
+fn git_mutation_result(operation: &'static str, root: &Path) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("ok".into(), Value::Bool(true)),
+        ("version".into(), Value::from(1)),
+        ("operation".into(), Value::String(operation.into())),
+        ("root".into(), Value::String(root.display().to_string())),
+    ])
+}
+
 async fn fetch(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     let path = require_str(payload, "path")?;
     let root = git_root(policy, path, false).await?;
@@ -714,14 +725,12 @@ async fn fetch(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     if rc != 0 {
         return Err(HandlerError::new("remote_failed", scrub(&err, &root)));
     }
-    Ok(BTreeMap::from([
-        ("ok".into(), Value::Bool(true)),
-        ("version".into(), Value::from(1)),
-        ("operation".into(), Value::String("fetch".into())),
-        ("root".into(), Value::String(root.display().to_string())),
+    let mut result = git_mutation_result("fetch", &root);
+    result.extend([
         ("remote".into(), Value::String(remote.into())),
         ("output".into(), Value::String(scrub(&err, &root))),
-    ]))
+    ]);
+    Ok(result)
 }
 
 fn directory_nonempty_or_unreadable(path: &Path) -> bool {
@@ -777,13 +786,9 @@ async fn clone_repo(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
         }
         return Err(HandlerError::new("remote_failed", message));
     }
-    Ok(BTreeMap::from([
-        ("ok".into(), Value::Bool(true)),
-        ("version".into(), Value::from(1)),
-        ("operation".into(), Value::String("clone".into())),
-        ("root".into(), Value::String(target.display().to_string())),
-        ("url".into(), Value::String(url.into())),
-    ]))
+    let mut result = git_mutation_result("clone", &target);
+    result.insert("url".into(), Value::String(url.into()));
+    Ok(result)
 }
 
 async fn push(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
@@ -827,16 +832,14 @@ async fn push(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
         }
         return Err(HandlerError::new("remote_failed", output));
     }
-    Ok(BTreeMap::from([
-        ("ok".into(), Value::Bool(true)),
-        ("version".into(), Value::from(1)),
-        ("operation".into(), Value::String("push".into())),
-        ("root".into(), Value::String(root.display().to_string())),
+    let mut result = git_mutation_result("push", &root);
+    result.extend([
         ("remote".into(), Value::String(remote.into())),
         ("branch".into(), Value::String(branch.into())),
         ("forced".into(), Value::Bool(force)),
         ("output".into(), Value::String(output)),
-    ]))
+    ]);
+    Ok(result)
 }
 
 /// # Errors
@@ -864,6 +867,20 @@ mod tests {
     use crate::policy::{FileAccess, FileOpsPath};
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
+
+    #[test]
+    fn mutation_result_base_has_stable_contract() {
+        let result = git_mutation_result("fetch", Path::new("/repo"));
+        assert_eq!(
+            result,
+            BTreeMap::from([
+                ("ok".into(), Value::Bool(true)),
+                ("version".into(), Value::from(1)),
+                ("operation".into(), Value::String("fetch".into())),
+                ("root".into(), Value::String("/repo".into())),
+            ])
+        );
+    }
 
     fn policy(root: &Path, write: bool) -> Policy {
         Policy {
