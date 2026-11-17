@@ -231,21 +231,22 @@ fn record_omission(omitted: &mut Vec<Omission>, path: &[PathPart], total: usize,
     }
 }
 
-fn shrink_largest(
-    response: &mut Value,
-    root_key: &str,
+/// The same field-shrinking algorithm serves a complete JSON value and a
+/// response envelope's nested result/error. The envelope's serialized size is
+/// always the selected value's size plus a fixed number of other bytes, so
+/// accounting for those bytes lets us avoid walking the whole envelope on
+/// every shrink pass.
+fn shrink_fields(
+    root: &mut Value,
     budget: usize,
+    envelope_overhead: usize,
     mut omitted: Option<&mut Vec<Omission>>,
 ) -> bool {
     for _ in 0..MAX_PASSES {
-        let current = serialized_size(response);
+        let current = serialized_size(root).saturating_add(envelope_overhead);
         if current <= budget {
             return true;
         }
-
-        let Some(root) = response.get(root_key) else {
-            return false;
-        };
         let string_ref = largest_string_path(root);
         let container_ref = largest_container_path(root);
         if string_ref.is_none() && container_ref.is_none() {
@@ -257,9 +258,6 @@ fn shrink_largest(
                 .as_ref()
                 .is_none_or(|(_, string_size)| container_size > *string_size)
         {
-            let Some(root) = response.get(root_key) else {
-                return false;
-            };
             let Some(target) = value_at(root, &path) else {
                 return false;
             };
@@ -275,10 +273,7 @@ fn shrink_largest(
                     * SHRINK_SLACK,
             );
             let keep = proportional.max(1).min(n_items - 1);
-            let Some(target) = response
-                .get_mut(root_key)
-                .and_then(|root| value_at_mut(root, &path))
-            else {
+            let Some(target) = value_at_mut(root, &path) else {
                 return false;
             };
             if !trim_container(target, keep) {
@@ -300,15 +295,29 @@ fn shrink_largest(
             .max(MIN_TRUNCATABLE)
             .min(raw_len.saturating_sub(1));
 
-        let Some(Value::String(text)) = response
-            .get_mut(root_key)
-            .and_then(|root| value_at_mut(root, &path))
-        else {
+        let Some(Value::String(text)) = value_at_mut(root, &path) else {
             return false;
         };
         *text = truncate_text(text, keep);
     }
-    serialized_size(response) <= budget
+    serialized_size(root).saturating_add(envelope_overhead) <= budget
+}
+
+fn shrink_largest(
+    response: &mut Value,
+    root_key: &str,
+    budget: usize,
+    omitted: Option<&mut Vec<Omission>>,
+) -> bool {
+    let envelope_bytes = serialized_size(response);
+    if envelope_bytes <= budget {
+        return true;
+    }
+    let Some(root) = response.get_mut(root_key) else {
+        return false;
+    };
+    let overhead = envelope_bytes.saturating_sub(serialized_size(root));
+    shrink_fields(root, budget, overhead, omitted)
 }
 
 fn json_pointer(path: &[PathPart]) -> String {
@@ -368,59 +377,7 @@ fn insert_meta(response: &mut Value, meta: &Value) {
 }
 
 fn shrink_value(root: &mut Value, budget: usize) -> bool {
-    for _ in 0..MAX_PASSES {
-        let current = serialized_size(root);
-        if current <= budget {
-            return true;
-        }
-        let string_ref = largest_string_path(root);
-        let container_ref = largest_container_path(root);
-        if string_ref.is_none() && container_ref.is_none() {
-            return false;
-        }
-        if let Some((path, container_size)) = container_ref
-            && string_ref
-                .as_ref()
-                .is_none_or(|(_, string_size)| container_size > *string_size)
-        {
-            let Some(target) = value_at(root, &path) else {
-                return false;
-            };
-            let Some(n_items) = container_len(target) else {
-                return false;
-            };
-            if n_items < 2 {
-                return false;
-            }
-            let proportional = nonnegative_f64_to_usize(
-                usize_to_f64(n_items)
-                    * (usize_to_f64(budget) / usize_to_f64(current))
-                    * SHRINK_SLACK,
-            );
-            let keep = proportional.max(1).min(n_items - 1);
-            let Some(target) = value_at_mut(root, &path) else {
-                return false;
-            };
-            if !trim_container(target, keep) {
-                return false;
-            }
-            continue;
-        }
-        let Some((path, raw_len)) = string_ref else {
-            return false;
-        };
-        let proportional = nonnegative_f64_to_usize(
-            usize_to_f64(raw_len) * (usize_to_f64(budget) / usize_to_f64(current)) * SHRINK_SLACK,
-        );
-        let keep = proportional
-            .max(MIN_TRUNCATABLE)
-            .min(raw_len.saturating_sub(1));
-        let Some(Value::String(text)) = value_at_mut(root, &path) else {
-            return false;
-        };
-        *text = truncate_text(text, keep);
-    }
-    serialized_size(root) <= budget
+    shrink_fields(root, budget, 0, None)
 }
 
 fn cut_error_code(response: &mut Value) {
@@ -754,6 +711,39 @@ mod tests {
         );
         assert_eq!(largest_string_path(&json!({"small": ["tiny"]})), None);
         assert_eq!(largest_container_path(&json!({"small": ["tiny"]})), None);
+    }
+
+    #[test]
+    fn envelope_shrinking_matches_value_shrinking_with_exact_size_overhead() {
+        let cases = [
+            json!({"entries": (0..400).map(|n| json!({"n": n})).collect::<Vec<_>>()}),
+            json!({"long": "ü".repeat(4_000), "short": "a".repeat(100)}),
+            json!({"nested": {"items": (0..400).map(|i| json!(i)).collect::<Vec<_>>()}}),
+            json!({"empty": [], "small": 1}),
+        ];
+        for original in cases {
+            for budget in [256, 1_024, 4_096, 12_000] {
+                let mut standalone = original.clone();
+                let mut response = json!({
+                    "type": "response", "id": "fixture", "ok": true,
+                    "result": original, "extra": {"small": true}
+                });
+                let overhead =
+                    serialized_size(&response).saturating_sub(serialized_size(&response["result"]));
+                let standalone_ok =
+                    shrink_fields(&mut standalone, budget + overhead, overhead, None);
+                let mut omitted = Vec::new();
+                let envelope_ok = shrink_largest(
+                    &mut response,
+                    "result",
+                    budget + overhead,
+                    Some(&mut omitted),
+                );
+                assert_eq!(envelope_ok, standalone_ok);
+                assert_eq!(response["result"], standalone);
+                assert_eq!(envelope_ok, serialized_size(&response) <= budget + overhead);
+            }
+        }
     }
 
     #[test]
