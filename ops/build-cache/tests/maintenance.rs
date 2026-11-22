@@ -262,7 +262,7 @@ impl OfflineFixture {
             .output()?;
         assert_eq!(
             output.status.code(),
-            Some(if expected { 0 } else { 1 }),
+            Some(i32::from(!expected)),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );

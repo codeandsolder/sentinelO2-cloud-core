@@ -132,7 +132,11 @@ fn assert_no_symlinks(path: &Path) -> TestResult {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let kind = entry.file_type()?;
-        assert!(!kind.is_symlink(), "unexpected symlink: {:?}", entry.path());
+        assert!(
+            !kind.is_symlink(),
+            "unexpected symlink: {}",
+            entry.path().display()
+        );
         if kind.is_dir() {
             assert_no_symlinks(&entry.path())?;
         }
