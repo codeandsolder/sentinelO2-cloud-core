@@ -5,10 +5,8 @@ from unittest.mock import MagicMock, patch
 from queue_rust_release import queue_release
 
 REPOSITORY = "example/agent"
-MANIFEST = {
-    "date": "2026-11-12",
-    "pkg": {"rust": {"version": "1.100.0 (abc 2026-11-12)"}},
-}
+VERSION = "1.100.0"
+RELEASE_DATE = "2026-11-12"
 
 
 class RustReleaseQueueTests(unittest.TestCase):
@@ -21,7 +19,7 @@ class RustReleaseQueueTests(unittest.TestCase):
             ),
             subprocess.CompletedProcess([], 0),
         ]
-        queue_release(REPOSITORY, MANIFEST)
+        queue_release(REPOSITORY, VERSION, RELEASE_DATE)
         self.assertEqual(run.call_count, 3)
         label, search, create = [call.args[0] for call in run.call_args_list]
         self.assertEqual(
@@ -58,7 +56,7 @@ class RustReleaseQueueTests(unittest.TestCase):
                 stdout='[[{"number":41,"body":null},{"number":43,"body":"<!-- rust-stable-1.100.0 -->","pull_request":{}}],[{"number":42,"body":"<!-- rust-stable-1.100.0 -->"}]]',
             ),
         ]
-        queue_release(REPOSITORY, MANIFEST)
+        queue_release(REPOSITORY, VERSION, RELEASE_DATE)
         self.assertEqual(run.call_count, 2)
 
     @patch("queue_rust_release.subprocess.run")
@@ -66,7 +64,7 @@ class RustReleaseQueueTests(unittest.TestCase):
         self, run: MagicMock
     ) -> None:
         with self.assertRaises(ValueError):
-            queue_release(REPOSITORY, {"pkg": {"rust": {"version": "nightly"}}})
+            queue_release(REPOSITORY, "nightly", RELEASE_DATE)
         run.assert_not_called()
 
     @patch("queue_rust_release.subprocess.run")
@@ -78,7 +76,7 @@ class RustReleaseQueueTests(unittest.TestCase):
             subprocess.CalledProcessError(1, ["gh", "api"]),
         ]
         with self.assertRaises(subprocess.CalledProcessError):
-            queue_release(REPOSITORY, MANIFEST)
+            queue_release(REPOSITORY, VERSION, RELEASE_DATE)
         self.assertEqual(run.call_count, 2)
 
 

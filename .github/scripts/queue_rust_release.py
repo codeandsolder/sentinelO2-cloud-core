@@ -12,11 +12,10 @@ STABLE_MANIFEST = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 LABEL = "automation:rust-release"
 
 
-def queue_release(repository: str, manifest: dict) -> None:
-    version = manifest["pkg"]["rust"]["version"].split()[0]
+def queue_release(repository: str, version: str, release_date: str) -> None:
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError(f"invalid stable Rust version: {version!r}")
-    print(f"Current stable Rust: {version} (release date {manifest['date']})")
+    print(f"Current stable Rust: {version} (release date {release_date})")
     marker = f"rust-stable-{version}"
 
     subprocess.run(
@@ -107,7 +106,8 @@ def main() -> None:
     args = parser.parse_args()
     with urlopen(STABLE_MANIFEST, timeout=30) as response:
         manifest = tomllib.load(response)
-    queue_release(args.repository, manifest)
+    version = manifest["pkg"]["rust"]["version"].split()[0]
+    queue_release(args.repository, version, manifest["date"])
 
 
 if __name__ == "__main__":
