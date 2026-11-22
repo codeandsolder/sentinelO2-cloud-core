@@ -129,7 +129,7 @@ impl AuditLog {
 }
 
 impl RetentionState {
-    fn should_check(&mut self) -> bool {
+    const fn should_check(&mut self) -> bool {
         if !self.checked_once {
             self.checked_once = true;
             self.writes_since_check = 0;
@@ -288,18 +288,6 @@ impl AuditLog {
         }
         let path = self.path();
         let attempt = (|| -> Result<(), Box<dyn std::error::Error>> {
-            // Rust dispatches operations concurrently and records them from
-            // spawn_blocking workers. The Python implementation's append-then-
-            // trim sequence was effectively serialized by its event-loop call
-            // site; without a lock a trim rename can race a concurrent append to
-            // the old inode and silently lose a row.
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
             let mut entry = json!({
                 "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
                 "op": op,
@@ -320,12 +308,26 @@ impl AuditLog {
                 }
             }
             let line = bounded_entry_line(entry)?;
+            // Rust dispatches operations concurrently and records them from
+            // spawn_blocking workers. The Python implementation's append-then-
+            // trim sequence was effectively serialized by its event-loop call
+            // site; without a lock a trim rename can race a concurrent append to
+            // the old inode and silently lose a row.
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             let mut file = OpenOptions::new().create(true).append(true).open(path)?;
             file.write_all(&line)?;
             file.write_all(b"\n")?;
+            drop(file);
             if state.should_check() {
                 maybe_trim(path)?;
             }
+            drop(state);
             Ok(())
         })();
         if let Err(error) = attempt {
