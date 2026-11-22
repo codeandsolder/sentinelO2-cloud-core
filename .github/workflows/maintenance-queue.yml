@@ -16,17 +16,7 @@ concurrency:
 
 jobs:
   rust-release-queue:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-
-      - name: Detect current stable Rust and queue a full review
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/queue_rust_release.py "$GITHUB_REPOSITORY"
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-release-review.yml@532137869abfb0e0b3d6c8f80346e9240ef9cf51 # main
 
   upstream-parity-queue:
     runs-on: ubuntu-26.04
