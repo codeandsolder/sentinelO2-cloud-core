@@ -1,6 +1,6 @@
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from queue_rust_release import queue_release
 
@@ -10,7 +10,7 @@ MANIFEST = {"date": "2026-11-12", "pkg": {"rust": {"version": "1.100.0 (abc 2026
 
 class RustReleaseQueueTests(unittest.TestCase):
     @patch("queue_rust_release.subprocess.run")
-    def test_new_release_creates_immutable_review(self, run):
+    def test_new_release_creates_immutable_review(self, run: MagicMock) -> None:
         run.side_effect = [
             subprocess.CompletedProcess([], 0),
             subprocess.CompletedProcess([], 0, stdout='[[{"number":41,"body":"<!-- rust-stable-1.99.1 -->"}]]'),
@@ -37,7 +37,7 @@ class RustReleaseQueueTests(unittest.TestCase):
         self.assertNotIn("${", body)
 
     @patch("queue_rust_release.subprocess.run")
-    def test_existing_release_never_creates_or_edits_issue(self, run):
+    def test_existing_release_never_creates_or_edits_issue(self, run: MagicMock) -> None:
         run.side_effect = [
             subprocess.CompletedProcess([], 0),
             subprocess.CompletedProcess([], 0, stdout='[[{"number":41,"body":null},{"number":43,"body":"<!-- rust-stable-1.100.0 -->","pull_request":{}}],[{"number":42,"body":"<!-- rust-stable-1.100.0 -->"}]]'),
@@ -46,13 +46,13 @@ class RustReleaseQueueTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
 
     @patch("queue_rust_release.subprocess.run")
-    def test_invalid_version_is_rejected_before_side_effects(self, run):
+    def test_invalid_version_is_rejected_before_side_effects(self, run: MagicMock) -> None:
         with self.assertRaises(ValueError):
             queue_release(REPOSITORY, {"pkg": {"rust": {"version": "nightly"}}})
         run.assert_not_called()
 
     @patch("queue_rust_release.subprocess.run")
-    def test_inventory_failure_propagates_without_creating_issue(self, run):
+    def test_inventory_failure_propagates_without_creating_issue(self, run: MagicMock) -> None:
         run.side_effect = [
             subprocess.CompletedProcess([], 0),
             subprocess.CalledProcessError(1, ["gh", "api"]),
