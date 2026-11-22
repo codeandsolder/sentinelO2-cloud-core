@@ -7,6 +7,9 @@ updater are owned by
 Cargo's ephemeral intermediates and shared offline resolution are implemented
 by [cargo-ephemeral](https://github.com/codeandsolder/cargo-ephemeral).
 Do not reinstall the obsolete SentinelO2 Cargo scratch wrapper or updater.
+The old scheduler-to-laptop credential synchronization service was retired: the
+active scheduler on Asus has no synchronization drop-in, and no Linux fleet node
+has the synchronization timer or service installed.
 
 The remaining service/timer files are provisioning templates, not an
 alternative implementation of the updater. Install the updater from its

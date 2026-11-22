@@ -3,8 +3,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for script in boringssl-prebuilt sccache-dist-client-preflight \
-    install-sccache-client-token-sync sccache-client-token-receive \
-    sccache-client-token-sync test-real-btls-crossworkspace; do
+    test-real-btls-crossworkspace; do
     bash -n "$HERE/$script"
 done
 printf 'ok: maintenance script syntax\n'
