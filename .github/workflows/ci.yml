@@ -83,7 +83,8 @@ jobs:
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
         with:
-          - name: Build
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
+      - name: Build
         run: cargo build --locked --release --bin sentinelx-core
       - name: Smoke
         run: ./target/release/sentinelx-core --help >/dev/null
