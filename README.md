@@ -43,3 +43,7 @@ This keeps routine upstream ports mechanical and leaves a clean release history.
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact matched surface,
 intentional deviations, and remaining differential/packaging work. Runtime tool resolution and executable overrides are documented in
 [docs/tooling.md](docs/tooling.md).
+
+### Local audit configuration
+
+Set `agent.audit_path` in the agent YAML config to an absolute JSONL path. The default is `/var/lib/sentinelx/audit.jsonl`. The audit writer and reader share this configured path and retention state for the lifetime of the dispatcher.

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Keep all shipped shell helpers under the maintenance-scripts CI lane even
+# when a test below does not execute a root/systemd-only code path.
+for script in cargo cargo-target-prune cargo-source-prune boringssl-prebuilt \
+    sccache-release-update sccache-dist-client-preflight sccache-router sccache-client \
+    install-sccache-autoupdate install-sccache-client-token-sync sccache-client-token-receive \
+    sccache-client-token-sync test-real-btls-crossworkspace; do
+    bash -n "$HERE/$script"
+done
+
+# The updater runs as root while the shared compiler daemon runs as the service
+# user. Its post-swap smoke directory must therefore be handed to the daemon,
+# and rollback must remove it if the smoke compile fails.
+rg -F 'smoke_user="$(systemctl show -p User --value "$LOCAL_SERVICE")"' "$HERE/sccache-release-update" >/dev/null
+rg -F 'smoke_group="$(systemctl show -p Group --value "$LOCAL_SERVICE")"' "$HERE/sccache-release-update" >/dev/null
+rg -F 'chown "$smoke_user:$smoke_group" "$smoke"' "$HERE/sccache-release-update" >/dev/null
+rg -F '[[ -z "$smoke" ]] || rm -rf -- "$smoke"' "$HERE/sccache-release-update" >/dev/null
+rg -F -- '--continue-at -' "$HERE/sccache-release-update" >/dev/null
+rg -F '/api/v1/scheduler/status' "$HERE/sccache-release-update" >/dev/null
+rg -F 'systemctl is-active --quiet "$LOCAL_SERVICE"' "$HERE/sccache-release-update" >/dev/null
+rg -F '"$SCHEDULER_URL/api/v1/scheduler/status"' "$HERE/sccache-release-update" >/dev/null
+rg -F 'scheduler_ready && break' "$HERE/sccache-release-update" >/dev/null
+rg -F 'SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE' "$HERE/sccache-release-update" >/dev/null
+rg -F 'dist_update_required=0' "$HERE/sccache-release-update" >/dev/null
+rg -F 'if (( dist_was_active && dist_update_required )); then' "$HERE/sccache-release-update" >/dev/null
+rg -F 'if (( dist_update_required )); then' "$HERE/sccache-release-update" >/dev/null
+rg -F 'ROOT_LOCAL_SERVICE="${SCCACHE_AUTOUPDATE_ROOT_LOCAL_SERVICE:-sccache-local-root.service}"' "$HERE/sccache-release-update" >/dev/null
+rg -F 'systemctl start "$ROOT_LOCAL_SERVICE"' "$HERE/sccache-release-update" >/dev/null
+rg -F 'tcp_ready 127.0.0.1 "$ROOT_CLIENT_PORT"' "$HERE/sccache-release-update" >/dev/null
+rg -F 'LIVE="${SCCACHE_AUTOUPDATE_LIVE:-/usr/local/libexec/sccache-bin/sccache}"' "$HERE/sccache-release-update" >/dev/null
+rg -F 'env -u SCCACHE_SERVER_PORT SCCACHE_SERVER_UDS="$CLIENT_UDS" SCCACHE_START_SERVER=0 "$LIVE" "$@"' "$HERE/sccache-release-update" >/dev/null
+rg -F 'export SCCACHE_START_SERVER="${SCCACHE_START_SERVER:-0}"' "$HERE/sccache-router" >/dev/null
+rg -F 'exec /usr/local/libexec/sccache-bin/sccache "$@"' "$HERE/sccache-router" >/dev/null
+rg -F 'exec /usr/local/libexec/sccache-bin/sccache "${args[@]}"' "$HERE/sccache-client" >/dev/null
+rg -F 'export SCCACHE_NO_AUTO_START_SERVER=1' "$HERE/sccache-client" >/dev/null
+rg -F 'if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${OUT_DIR:-}" ]]; then' "$HERE/sccache-client" >/dev/null
+if rg -n '^export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1$|/home/jan/projects/\*|SCCACHE_CANONICAL_BUILD_ROOT=' "$HERE/sccache-client" >/dev/null; then
+    echo "sccache client must not unconditionally enable canonical Rust or guess site-specific roots" >&2
+    exit 1
+fi
+if rg -n '(^|[[:space:]])nc -z' "$HERE/sccache-release-update" >/dev/null; then
+    echo "sccache updater must not require netcat" >&2
+    exit 1
+fi
+
+# Rollback must restore the scheduler before the local daemon so a reverted
+# client does not enter reconnect backoff against a scheduler that is still down.
+awk '
+    /^rollback\(\) \{/ { in_rollback = 1; next }
+    in_rollback && /^}/ { exit }
+    in_rollback && /systemctl start .*ACTIVE_DIST_SERVICES/ && !dist_start { dist_start = NR }
+    in_rollback && /scheduler_ready && break/ && !scheduler_ready { scheduler_ready = NR }
+    in_rollback && /systemctl start "\$LOCAL_SERVICE"/ && !local_start { local_start = NR }
+    END {
+        if (!(dist_start && scheduler_ready && local_start &&
+              dist_start < scheduler_ready && scheduler_ready < local_start)) exit 1
+    }
+' "$HERE/sccache-release-update"
+
+printf "ok: maintenance shell contracts\n"

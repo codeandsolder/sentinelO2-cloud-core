@@ -59,7 +59,7 @@ Export the returned view as `BORING_BSSL_PATH` and set
 Merely exporting the package from `/srv/scratch` for canonical Rust builds
 is invalid: the package is outside the declared sandbox roots.
 
-Validation: run `ops/build-cache/test.sh` (seeded package identity, warm lookup,
+Validation: run `cargo test --locked -p sentinel0-build-cache-tests --test native_packages` (seeded package identity, warm lookup,
 crate/feature separation), then perform an actual `btls-sys` build and link using
 a correctly rooted package view before enabling the helper in a fleet wrapper.
 

@@ -7,7 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
 };
 
 pub const MAX_LINES: usize = 5000;
@@ -107,39 +107,41 @@ struct RetentionState {
     writes_since_check: usize,
 }
 
-fn retention_state() -> &'static Mutex<RetentionState> {
-    static STATE: OnceLock<Mutex<RetentionState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(RetentionState::default()))
+#[derive(Debug)]
+pub struct AuditLog {
+    path: PathBuf,
+    state: Mutex<RetentionState>,
 }
 
-fn audit_io_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-#[must_use]
-pub fn audit_path() -> PathBuf {
-    std::env::var_os("SENTINELX_AUDIT_PATH").map_or_else(
-        || PathBuf::from("/var/lib/sentinelx/audit.jsonl"),
-        PathBuf::from,
-    )
-}
-
-fn should_check_retention() -> bool {
-    let mut state = retention_state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !state.checked_once {
-        state.checked_once = true;
-        state.writes_since_check = 0;
-        return true;
+impl AuditLog {
+    #[must_use]
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            state: Mutex::new(RetentionState::default()),
+        }
     }
-    state.writes_since_check += 1;
-    if state.writes_since_check >= RETENTION_CHECK_EVERY {
-        state.writes_since_check = 0;
-        true
-    } else {
-        false
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl RetentionState {
+    fn should_check(&mut self) -> bool {
+        if !self.checked_once {
+            self.checked_once = true;
+            self.writes_since_check = 0;
+            return true;
+        }
+        self.writes_since_check += 1;
+        if self.writes_since_check >= RETENTION_CHECK_EVERY {
+            self.writes_since_check = 0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -271,61 +273,64 @@ pub(crate) struct RecordMeta<'a> {
     pub result_returncode: Option<i64>,
 }
 
-pub(crate) fn record(op: &str, payload: &Map<String, Value>, meta: RecordMeta<'_>) {
-    let RecordMeta {
-        opaque_ref,
-        dispatch_ok,
-        error,
-        duration_ms,
-        result_ok,
-        result_returncode,
-    } = meta;
-    if matches!(op, "read_audit" | "ping") {
-        return;
-    }
-    let path = audit_path();
-    let attempt = (|| -> Result<(), Box<dyn std::error::Error>> {
-        // Rust dispatches operations concurrently and records them from
-        // spawn_blocking workers. The Python implementation's append-then-
-        // trim sequence was effectively serialized by its event-loop call
-        // site; without a lock a trim rename can race a concurrent append to
-        // the old inode and silently lose a row.
-        let _io_guard = audit_io_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+impl AuditLog {
+    pub(crate) fn record(&self, op: &str, payload: &Map<String, Value>, meta: RecordMeta<'_>) {
+        let RecordMeta {
+            opaque_ref,
+            dispatch_ok,
+            error,
+            duration_ms,
+            result_ok,
+            result_returncode,
+        } = meta;
+        if matches!(op, "read_audit" | "ping") {
+            return;
         }
-        let mut entry = json!({
-            "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            "op": op,
-            "payload": payload,
-            "ok": dispatch_ok,
-            "error": error,
-            "duration_ms": duration_ms,
-        });
-        if let Some(map) = entry.as_object_mut() {
-            if let Some(opaque_ref) = opaque_ref {
-                map.insert("opaque_ref".into(), Value::String(opaque_ref.to_owned()));
+        let path = self.path();
+        let attempt = (|| -> Result<(), Box<dyn std::error::Error>> {
+            // Rust dispatches operations concurrently and records them from
+            // spawn_blocking workers. The Python implementation's append-then-
+            // trim sequence was effectively serialized by its event-loop call
+            // site; without a lock a trim rename can race a concurrent append to
+            // the old inode and silently lose a row.
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
             }
-            if let Some(value) = result_ok {
-                map.insert("result_ok".into(), Value::Bool(value));
+            let mut entry = json!({
+                "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "op": op,
+                "payload": payload,
+                "ok": dispatch_ok,
+                "error": error,
+                "duration_ms": duration_ms,
+            });
+            if let Some(map) = entry.as_object_mut() {
+                if let Some(opaque_ref) = opaque_ref {
+                    map.insert("opaque_ref".into(), Value::String(opaque_ref.to_owned()));
+                }
+                if let Some(value) = result_ok {
+                    map.insert("result_ok".into(), Value::Bool(value));
+                }
+                if let Some(value) = result_returncode {
+                    map.insert("result_returncode".into(), Value::from(value));
+                }
             }
-            if let Some(value) = result_returncode {
-                map.insert("result_returncode".into(), Value::from(value));
+            let line = bounded_entry_line(entry)?;
+            let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+            file.write_all(&line)?;
+            file.write_all(b"\n")?;
+            if state.should_check() {
+                maybe_trim(path)?;
             }
+            Ok(())
+        })();
+        if let Err(error) = attempt {
+            tracing::warn!(%error, "local audit write failed");
         }
-        let line = bounded_entry_line(entry)?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        file.write_all(&line)?;
-        file.write_all(b"\n")?;
-        if should_check_retention() {
-            maybe_trim(&path)?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = attempt {
-        tracing::warn!(%error, "local audit write failed");
     }
 }
 
@@ -389,12 +394,15 @@ fn read_recent_from(path: &Path, limit: usize) -> Vec<Value> {
     rows
 }
 
-#[must_use]
-pub fn read_recent(limit: usize) -> Vec<Value> {
-    let _io_guard = audit_io_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read_recent_from(&audit_path(), limit)
+impl AuditLog {
+    #[must_use]
+    pub fn read_recent(&self, limit: usize) -> Vec<Value> {
+        let _io_guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read_recent_from(self.path(), limit)
+    }
 }
 
 #[cfg(test)]

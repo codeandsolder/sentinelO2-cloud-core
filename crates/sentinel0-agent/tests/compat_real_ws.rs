@@ -1188,6 +1188,7 @@ async fn binary_transfer_roundtrip_preserves_wire_order_and_stages_inbound_chunk
 
     let policy = Policy {
         upload_base: upload_base.clone(),
+        audit_path: dir.path().join("audit.jsonl"),
         file_ops_paths: vec![FileOpsPath {
             path: dir.path().to_owned(),
             access: FileAccess::ReadWrite,

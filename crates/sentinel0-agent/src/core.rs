@@ -127,12 +127,15 @@ pub struct CoreDispatcher {
     policy: Arc<Policy>,
     config_path: PathBuf,
     agent_version: String,
+    audit: Arc<crate::local_audit::AuditLog>,
 }
 
 impl CoreDispatcher {
     pub fn new(policy: Policy, config_path: PathBuf, agent_version: impl Into<String>) -> Self {
+        let audit = Arc::new(crate::local_audit::AuditLog::new(policy.audit_path.clone()));
         Self {
             policy: Arc::new(policy),
+            audit,
             config_path,
             agent_version: agent_version.into(),
         }
@@ -1117,7 +1120,8 @@ impl CoreDispatcher {
             .unwrap_or(200)
             .clamp(1, max_lines);
         let limit = usize::try_from(requested_limit).unwrap_or(crate::local_audit::MAX_LINES);
-        let entries = tokio::task::spawn_blocking(move || crate::local_audit::read_recent(limit))
+        let audit = Arc::clone(&self.audit);
+        let entries = tokio::task::spawn_blocking(move || audit.read_recent(limit))
             .await
             .map_err(|error| {
                 HandlerError::new("internal_error", format!("audit reader failed: {error}"))
@@ -1130,7 +1134,7 @@ impl CoreDispatcher {
             ("entries".into(), Value::Array(entries)),
             (
                 "source".into(),
-                Value::String(crate::local_audit::audit_path().display().to_string()),
+                Value::String(self.audit.path().display().to_string()),
             ),
             (
                 "max_retained".into(),
@@ -1306,8 +1310,9 @@ impl CoreDispatcher {
         let (dispatch_ok, error, result_ok, result_returncode) = Self::audit_fields(&message);
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let op_name = op.as_str().to_owned();
+        let audit = Arc::clone(&self.audit);
         let audit_task = tokio::task::spawn_blocking(move || {
-            crate::local_audit::record(
+            audit.record(
                 &op_name,
                 &audit_payload,
                 crate::local_audit::RecordMeta {
@@ -1490,7 +1495,15 @@ mod tests {
 
     #[tokio::test]
     async fn capabilities_are_derived_from_real_dispatch_surface() -> TestResult {
-        let dispatcher = CoreDispatcher::new(Policy::default(), "/tmp/config".into(), "test");
+        let dir = tempdir().test_value()?;
+        let dispatcher = CoreDispatcher::new(
+            Policy {
+                audit_path: dir.path().join("audit.jsonl"),
+                ..Policy::default()
+            },
+            dir.path().join("config.yaml"),
+            "test",
+        );
         let shared = dispatcher.capability_base(dispatcher.capability_ops());
         let summary = dispatcher.capabilities_summary(dispatcher.capability_ops());
         let full = dispatcher.capabilities_full(dispatcher.capability_ops())?;
@@ -1532,6 +1545,44 @@ mod tests {
         );
         assert!(capabilities.iter().any(|name| name == "local_api"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_audit_is_shared_by_dispatcher_clones() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let path = dir.path().join("logs/audit.jsonl");
+        let dispatcher = CoreDispatcher::new(
+            Policy {
+                audit_path: path.clone(),
+                ..Policy::default()
+            },
+            dir.path().join("config.yaml"),
+            "test",
+        );
+        let copy = dispatcher.clone();
+        let Message::Response { ok: true, .. } = copy
+            .dispatch("write", Op::Capabilities, Map::new())
+            .await
+            .message
+        else {
+            return Err(std::io::Error::other("capabilities failed").into());
+        };
+        let Message::Response {
+            ok: true,
+            result: Some(result),
+            ..
+        } = dispatcher
+            .dispatch("read", Op::ReadAudit, Map::new())
+            .await
+            .message
+        else {
+            return Err(std::io::Error::other("read audit failed").into());
+        };
+        assert_eq!(result["source"], path.display().to_string());
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["entries"][0]["op"], "capabilities");
+        assert!(path.is_file());
         Ok(())
     }
 
@@ -1831,7 +1882,9 @@ mod tests {
 
     #[tokio::test]
     async fn exec_b64_command_is_checked_after_decoding() -> TestResult {
+        let dir = tempdir().test_value()?;
         let policy = Policy {
+            audit_path: dir.path().join("audit.jsonl"),
             allowed_commands: vec!["printf".into()],
             exec_enforce_allowlist: true,
             ..Policy::default()
@@ -1895,6 +1948,7 @@ mod tests {
         let file = dir.path().join("hello.txt");
         std::fs::write(&file, "hello").test_value()?;
         let policy = Policy {
+            audit_path: dir.path().join("audit.jsonl"),
             allowed_commands: vec!["printf".into()],
             file_ops_paths: vec![FileOpsPath {
                 path: dir.path().to_owned(),
