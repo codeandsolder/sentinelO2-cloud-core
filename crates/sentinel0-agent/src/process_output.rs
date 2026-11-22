@@ -73,17 +73,17 @@ impl CapturedStream {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned count reports the total number of bytes observed"]
     pub const fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
 
-    #[must_use]
+    #[must_use = "the result indicates whether the captured stream exceeds its limit"]
     pub const fn truncated(&self) -> bool {
         self.total_bytes > self.limit as u64
     }
 
-    #[must_use]
+    #[must_use = "the returned bytes contain the rendered captured output"]
     pub fn rendered(&self) -> Vec<u8> {
         let retained = self.head.len() + self.tail_bytes;
         let mut out = Vec::with_capacity(retained + 96);
@@ -100,7 +100,7 @@ impl CapturedStream {
         out
     }
 
-    #[must_use]
+    #[must_use = "the returned string contains the trimmed rendered output"]
     pub fn rendered_trimmed_lossy(&self) -> String {
         String::from_utf8_lossy(&self.rendered()).trim().to_owned()
     }
@@ -198,7 +198,7 @@ impl TimedOutCapture {
         let _ = (&mut self.stderr_task).await;
     }
 
-    #[must_use]
+    #[must_use = "the returned record describes the timed-out process output and state"]
     fn output(&self, left_running: bool, capture_error: Option<String>) -> TimedOutOutput {
         TimedOutOutput {
             stdout: snapshot(&self.stdout),
@@ -232,7 +232,7 @@ impl Drop for TimedOutCapture {
     }
 }
 
-#[must_use]
+#[must_use = "the returned string combines both captured output streams"]
 pub(crate) fn merge_streams(stdout: &CapturedStream, stderr: &CapturedStream) -> String {
     let stdout = stdout.rendered_trimmed_lossy();
     let stderr = stderr.rendered_trimmed_lossy();
@@ -245,7 +245,7 @@ pub(crate) fn merge_streams(stdout: &CapturedStream, stderr: &CapturedStream) ->
     }
 }
 
-#[must_use]
+#[must_use = "the returned string contains the combined process output"]
 pub(crate) fn merged_output(captured: &CapturedOutput) -> String {
     let output = merge_streams(&captured.stdout, &captured.stderr);
     if output.is_empty() {
@@ -255,7 +255,7 @@ pub(crate) fn merged_output(captured: &CapturedOutput) -> String {
     }
 }
 
-#[must_use]
+#[must_use = "the returned string describes output captured before the timeout"]
 pub(crate) fn timeout_output(captured: &TimedOutOutput) -> String {
     let partial = merge_streams(&captured.stdout, &captured.stderr);
     let mut output = if partial.is_empty() {
@@ -270,7 +270,7 @@ pub(crate) fn timeout_output(captured: &TimedOutOutput) -> String {
     output
 }
 
-#[must_use]
+#[must_use = "the returned value communicates the captured process outcome"]
 pub(crate) fn process_result(
     output: String,
     duration: f64,
@@ -311,7 +311,7 @@ pub(crate) fn add_timeout_metadata(
     }
 }
 
-#[must_use]
+#[must_use = "the returned value combines cleanup failures for reporting"]
 pub(crate) fn combine_cleanup_errors(
     first: Option<String>,
     second: Option<String>,

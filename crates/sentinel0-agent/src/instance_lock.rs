@@ -59,7 +59,7 @@ fn lock_path_for_state(state_dir: &Path, host_id: &str) -> PathBuf {
     state_dir.join(format!("agent-{}.lock", safe_host_id(host_id)))
 }
 
-#[must_use]
+#[must_use = "the result identifies the instance lock location when it can be resolved"]
 pub fn lock_path(identity_path: &Path, host_id: &str) -> Option<PathBuf> {
     rotation::state_dir(identity_path).map(|state_dir| lock_path_for_state(&state_dir, host_id))
 }

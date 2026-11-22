@@ -14,7 +14,7 @@ fn writable_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[must_use]
+#[must_use = "the returned path identifies the fallback staging root"]
 pub fn fallback_root() -> PathBuf {
     std::env::temp_dir()
         .join("sentinelx-staging")

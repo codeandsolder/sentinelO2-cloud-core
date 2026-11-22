@@ -29,7 +29,7 @@ fn store_lock(dir: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
-#[must_use]
+#[must_use = "the returned path identifies the pending result storage directory"]
 pub fn pending_dir(upload_base: &Path) -> PathBuf {
     upload_base
         .parent()

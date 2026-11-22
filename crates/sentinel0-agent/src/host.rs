@@ -8,19 +8,19 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-#[must_use]
+#[must_use = "the returned hostname identifies the local machine"]
 pub fn hostname() -> String {
     read_trimmed("/proc/sys/kernel/hostname")
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "unknown".into())
 }
 
-#[must_use]
+#[must_use = "the result contains the kernel release when it can be determined"]
 pub fn kernel() -> Option<String> {
     read_trimmed("/proc/sys/kernel/osrelease")
 }
 
-#[must_use]
+#[must_use = "the result identifies the operating system distribution when available"]
 pub fn distro() -> Option<String> {
     let text = fs::read_to_string("/etc/os-release").ok()?;
     text.lines().find_map(|line| {
@@ -30,7 +30,7 @@ pub fn distro() -> Option<String> {
     })
 }
 
-#[must_use]
+#[must_use = "the result identifies the CPU model when available"]
 pub fn cpu_model() -> Option<String> {
     let text = fs::read_to_string("/proc/cpuinfo").ok()?;
     text.lines().find_map(|line| {
@@ -43,7 +43,7 @@ pub fn cpu_model() -> Option<String> {
     })
 }
 
-#[must_use]
+#[must_use = "the result reports the total memory capacity when available"]
 pub fn mem_total_bytes() -> Option<u64> {
     let text = fs::read_to_string("/proc/meminfo").ok()?;
     text.lines().find_map(|line| {
@@ -53,7 +53,7 @@ pub fn mem_total_bytes() -> Option<u64> {
     })
 }
 
-#[must_use]
+#[must_use = "the returned classification describes the machine environment"]
 pub fn machine_type() -> String {
     let osrelease = read_trimmed("/proc/sys/kernel/osrelease")
         .unwrap_or_default()
@@ -116,7 +116,7 @@ pub fn machine_type() -> String {
     "physical".into()
 }
 
-#[must_use]
+#[must_use = "the returned record describes the host for registration"]
 pub fn gather_host_info(
     host_id: String,
     config_summary: Option<sentinel0_proto::ConfigSummary>,
@@ -141,13 +141,13 @@ pub fn gather_host_info(
     }
 }
 
-#[must_use]
+#[must_use = "the result reports the elapsed host uptime when available"]
 pub fn uptime_seconds() -> Option<f64> {
     let text = fs::read_to_string("/proc/uptime").ok()?;
     text.split_whitespace().next()?.parse().ok()
 }
 
-#[must_use]
+#[must_use = "the result reports the host load averages when available"]
 pub fn loadavg() -> Option<[f64; 3]> {
     let text = fs::read_to_string("/proc/loadavg").ok()?;
     let mut fields = text.split_whitespace();

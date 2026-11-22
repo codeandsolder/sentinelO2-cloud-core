@@ -23,7 +23,7 @@ pub enum ExecMode {
 }
 
 impl ExecMode {
-    #[must_use]
+    #[must_use = "the returned string is the protocol spelling for the selected value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Allowlist => "allowlist",
@@ -750,7 +750,7 @@ impl Policy {
         Ok(policy)
     }
 
-    #[must_use]
+    #[must_use = "the result determines whether the command satisfies the configured policy"]
     pub fn is_command_allowed(&self, command: &str) -> bool {
         let command = command.trim();
         !command.is_empty()
@@ -768,14 +768,14 @@ impl Policy {
             })
     }
 
-    #[must_use]
+    #[must_use = "the result determines whether the requested service action is permitted"]
     pub fn service_action_allowed(&self, service: &str, action: &str) -> bool {
         self.services
             .get(service)
             .is_some_and(|spec| spec.actions.iter().any(|allowed| allowed == action))
     }
 
-    #[must_use]
+    #[must_use = "the result contains the resolved authorized path, if any"]
     pub fn resolve_path(&self, path: &str, need_write: bool) -> Option<PathBuf> {
         if path.is_empty() || self.file_ops_paths.is_empty() {
             return None;
@@ -799,7 +799,7 @@ impl Policy {
     /// entry. This is for operations that manipulate the entry itself
     /// (move/copy/delete), so a symlink under an allowed directory remains the
     /// symlink rather than turning into its possibly-outside target.
-    #[must_use]
+    #[must_use = "the result identifies an authorized path without following its final component"]
     pub fn resolve_path_no_follow_leaf(&self, path: &str, need_write: bool) -> Option<PathBuf> {
         if path.is_empty() || self.file_ops_paths.is_empty() {
             return None;
@@ -826,7 +826,7 @@ impl Policy {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned summary describes the effective policy configuration"]
     pub fn config_summary(&self) -> ConfigSummary {
         ConfigSummary {
             allowed_command_count: Some(self.allowed_commands.len() as u64),

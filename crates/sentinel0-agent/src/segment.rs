@@ -768,7 +768,7 @@ fn analyze(command: &str) -> Result<Analysis, UnparseableCommand> {
     Ok(analysis)
 }
 
-#[must_use]
+#[must_use = "the returned segments represent top-level command boundaries"]
 pub fn split_top_level(command: &str) -> Vec<String> {
     analyze(command).map_or_else(
         |_| vec![command.trim().to_owned()],
@@ -783,21 +783,21 @@ pub fn split_top_level(command: &str) -> Vec<String> {
     )
 }
 
-#[must_use]
+#[must_use = "the result identifies detected shell substitution syntax"]
 pub fn has_substitution(command: &str) -> Option<&'static str> {
     analyze(command)
         .ok()
         .and_then(|analysis| analysis.substitution)
 }
 
-#[must_use]
+#[must_use = "the result identifies a disallowed control character, if present"]
 pub fn control_character(command: &str) -> Option<char> {
     command
         .chars()
         .find(|ch| ((*ch as u32) < 32 && *ch != '\t') || *ch as u32 == 127)
 }
 
-#[must_use]
+#[must_use = "the result identifies redirection syntax that requires policy evaluation"]
 pub fn file_redirection(command: &str) -> Option<String> {
     analyze(command)
         .ok()
