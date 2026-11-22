@@ -1,12 +1,23 @@
-# Build-cache regression tests
+# Build-cache utilities
 
-Run the independent integration tests from the workspace root:
+SentinelO2 owns the native package helper and the remaining small service
+integration utilities. Machine-wide Cargo/sccache wrappers and the release
+updater are owned by
+[sccache-deduplicated](https://github.com/codeandsolder/sccache-deduplicated/tree/main/contrib/codeandsolder).
+Cargo's ephemeral intermediates and shared offline resolution are implemented
+by [cargo-ephemeral](https://github.com/codeandsolder/cargo-ephemeral).
+Do not reinstall the obsolete SentinelO2 Cargo scratch wrapper or updater.
 
-```sh
-cargo test --locked -p sentinel0-build-cache-tests
-bash ops/build-cache/check-shell-contracts
-```
+The remaining service/timer files are provisioning templates, not an
+alternative implementation of the updater. Install the updater from its
+authoritative repository.
 
-The Rust tests exercise the actual maintenance scripts against isolated temporary directories and deterministic subprocess fixtures. They cover pruning and lifetime locks, offline resolution readiness, Cargo wrapper lifecycle and artifact reclamation, and native package integrity and identity. Environment passed to child processes is the scripts' deployment interface, not the test configuration interface.
+Run the remaining native-package and preflight integration tests:
 
-The shell contract checker covers script syntax and existing source-level updater/routing invariants. It does not replace end-to-end privileged service tests. See [native package integration](BORINGSSL_PREBUILT.md) for the real cross-workspace native link test.
+    cargo test --locked -p sentinel0-build-cache-tests
+    bash ops/build-cache/check-shell-contracts
+
+The tests use isolated temporary directories. The preflight exercises the
+actual disposable distributed-client cache subtree; the native-package tests
+check integrity and canonical-view confinement. See
+[BoringSSL native package reuse](BORINGSSL_PREBUILT.md) for the real link test.

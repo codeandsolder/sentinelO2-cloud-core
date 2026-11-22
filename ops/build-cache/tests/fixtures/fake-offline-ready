@@ -1,4 +1,0 @@
-#!/bin/sh
-fixture="$(dirname "$0")"
-printf '%s' "$1" >"$fixture/ready-workspace"
-[ ! -f "$fixture/ready-miss" ]

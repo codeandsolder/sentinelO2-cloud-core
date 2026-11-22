@@ -5,7 +5,7 @@ compiler-keyed native BoringSSL package for a Cargo workspace.
 
 ```bash
 # Both crates ship their own BoringSSL sources and patches.
-package=$(ops/build-cache/boringssl-prebuilt btls-sys /path/to/workspace default)
+package=$(ops/build-cache/boringssl-prebuilt btls-sys /path/to/workspace)
 export BORING_BSSL_PATH="$package"
 export BORING_BSSL_ASSUME_PATCHED=1
 cargo build
@@ -13,7 +13,7 @@ cargo build
 
 For the FIPS crate feature, use `BORING_BSSL_FIPS_PATH` and
 `BORING_BSSL_FIPS_ASSUME_PATCHED`. Supply a comma-separated native crate feature
-set as the third argument (for example `mlkem` for `btls-sys`, or `rpk` for
+set using `--features` (for example `mlkem` for `btls-sys`, or `rpk` for
 `boring-sys`). Non-default feature sets disable Cargo's default features in
 the helper's standalone native package build. A feature set is an explicit
 input, **not** inferred from `Cargo.lock` (Cargo.lock doesn't record the resolved
@@ -28,15 +28,14 @@ configuration. Compiler identities use content digests, not timestamps.
 Concurrent creators coordinate via `flock`; creation uses a staging directory
 and atomic rename. An existing package is returned without another Cargo
 build. For first-time creation, the helper uses the site's managed Cargo and
-native sccache compiler launchers. `SEED_OUT` (fourth argument) is a trusted
+native sccache compiler launchers. `--seed <out-dir>` is a trusted
 already-built matching crate's Cargo build-script OUT_DIR; callers are
 responsible for provenance, feature and toolchain match.
 
 Default persistent packages are native build assets under
-`/srv/scratch/toolchains/boringssl-prebuilt`, configurable via
-`BORING_BSSL_CACHE_ROOT` or `SENTINELX_BORINGSSL_CACHE_ROOT`.
-Temporary first builds live under
-`SENTINELX_BORINGSSL_BUILD_ROOT` and are cleaned up. These are native library
+`/srv/scratch/toolchains/boringssl-prebuilt`, configurable via `--cache-root`.
+Temporary first builds live under `--build-root` and are cleaned up.
+The managed launcher defaults to `/usr/local/bin/cargo`; `--cargo`, `--toolchain`, and `--target` select explicit build inputs. These are native library
 artifacts; they are **not** an alternative sccache object cache. The latter
 remains Garage-backed.
 
@@ -45,7 +44,7 @@ canonical build or target root when canonical Rust hashing is enabled.
 Expose the immutable package as a per-target view under the actual
 `SCCACHE_CANONICAL_TARGET_ROOT`, preserving byte identity, rather than
 expanding the canonical root to `/srv/scratch` or disabling sccache.
-Set `BORING_BSSL_VIEW_ROOT` to the actual persistent Cargo target root,
+Pass `--view-root` with the actual persistent Cargo target root,
 matching `SCCACHE_CANONICAL_TARGET_ROOT`. The helper will create a verified
 content-preserving, reflink-when-available view under
 `<target-root>/boringssl-prebuilt/<native-package-key>` and return that
@@ -75,7 +74,7 @@ made by guessing a root outside the validated Rust compiler inputs.
 ## Real native-link acceptance
 
 Run `ops/build-cache/test-real-btls-crossworkspace` on a Linux x86-64
-build host with Rust 1.99, CMake, a native C/C++ toolchain and Cargo. It builds
+build host with Rust 1.100, CMake, a native C/C++ toolchain and Cargo. It builds
 one authentic `btls-sys=0.5.6` native package, creates two unrelated
 Cargo workspaces with separate canonical-root package views, compiles and
 runs the same executable against the actual BoringSSL SHA-256 symbol in each,

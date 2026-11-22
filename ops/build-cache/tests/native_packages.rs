@@ -72,18 +72,15 @@ impl NativeFixture {
         command
             .arg(name)
             .arg(self.temp.path().join(name))
-            .arg(features)
-            .env("BORING_BSSL_CACHE_ROOT", &self.cache)
-            .env(
-                "SENTINELX_BORINGSSL_BUILD_ROOT",
-                self.forbidden_build.join("child"),
-            )
-            .env(
-                "SENTINELX_CARGO_WRAPPER_PATH",
-                self.forbidden_build.join("cargo"),
-            );
+            .args(["--features", features])
+            .arg("--cache-root")
+            .arg(&self.cache)
+            .arg("--build-root")
+            .arg(self.forbidden_build.join("child"))
+            .arg("--cargo")
+            .arg(self.forbidden_build.join("cargo"));
         if seed {
-            command.arg(&self.seed);
+            command.arg("--seed").arg(&self.seed);
         }
         command
     }
@@ -163,7 +160,7 @@ fn native_package_identity_separates_crates_and_features_and_supports_warm_hits(
     let invalid = isolated(helper("boringssl-prebuilt"))
         .arg("unknown-native-crate")
         .arg(fixture.temp.path())
-        .arg("default")
+        .arg("--seed")
         .arg(&fixture.seed)
         .output()?;
     assert_eq!(invalid.status.code(), Some(2));
@@ -178,7 +175,8 @@ fn canonical_native_view_is_verified_and_confined_to_target_root() -> TestResult
     fs::create_dir(&target)?;
     let mut command = fixture.command(NativeCrate::Boring, "default", false);
     command
-        .env("BORING_BSSL_VIEW_ROOT", &target)
+        .arg("--view-root")
+        .arg(&target)
         .env("SCCACHE_CANONICAL_TARGET_ROOT", &target);
     let view = output_path(&mut command)?;
     assert_eq!(
@@ -198,10 +196,11 @@ fn canonical_native_view_is_verified_and_confined_to_target_root() -> TestResult
     assert_eq!(output_path(&mut command)?, view);
     command.env_remove("SCCACHE_CANONICAL_TARGET_ROOT");
     assert_eq!(command.output()?.status.code(), Some(2));
-    command.env("SCCACHE_CANONICAL_TARGET_ROOT", &target).env(
-        "BORING_BSSL_VIEW_ROOT",
-        fixture.temp.path().join("wrong-target"),
-    );
+    let mut command = fixture.command(NativeCrate::Boring, "default", false);
+    command
+        .env("SCCACHE_CANONICAL_TARGET_ROOT", &target)
+        .arg("--view-root")
+        .arg(fixture.temp.path().join("wrong-target"));
     assert_eq!(command.output()?.status.code(), Some(2));
     Ok(())
 }
@@ -216,5 +215,38 @@ fn corrupted_native_package_fails_closed() -> TestResult {
         .output()?;
     assert_eq!(result.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&result.stderr).contains("failed integrity check"));
+    Ok(())
+}
+
+#[test]
+fn cold_native_build_does_not_inherit_consumer_target_layout() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = NativeFixture::new()?;
+    let root = fixture.temp.path();
+    let cargo = root.join("mock-managed-cargo");
+    write(&cargo, include_str!("fixtures/native-cargo"))?;
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700))?;
+    let target = root.join("consumer-target");
+    let marker = target.join("keep");
+    write(&marker, "untouched")?;
+    let build_root = root.join("temporary-native-builds");
+
+    let mut command = fixture.command(NativeCrate::Boring, "default", false);
+    command
+        .arg("--cargo")
+        .arg(&cargo)
+        .arg("--build-root")
+        .arg(&build_root)
+        .arg("--view-root")
+        .arg(&target)
+        .env("CARGO_TARGET_DIR", &target)
+        .env("SCCACHE_CANONICAL_TARGET_ROOT", &target)
+        .env("SCCACHE_CANONICAL_TARGET_ROOT_ORIGIN", "test-consumer");
+    let view = output_path(&mut command)?;
+    assert_complete(&view)?;
+    assert_eq!(fs::read_to_string(marker)?, "untouched");
+    assert!(!target.join("removable").exists());
+    assert!(fs::read_dir(build_root)?.next().is_none());
     Ok(())
 }

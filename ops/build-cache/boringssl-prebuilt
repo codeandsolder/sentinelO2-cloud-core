@@ -2,14 +2,48 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <boring-sys|btls-sys> <project-dir> [feature-key] [seed-out-dir]" >&2
+    cat >&2 <<EOF
+usage: $0 <boring-sys|btls-sys> <project-dir> [options]
+  --features <key>      Native feature set (default: default)
+  --seed <out-dir>      Use existing build-script output
+  --cache-root <dir>    Persistent native packages
+  --build-root <dir>    Temporary native build workspace
+  --cargo <path>        Managed Cargo launcher
+  --toolchain <name>    Rust toolchain (default: 1.100.0)
+  --target <triple>     Native target (default: x86_64-unknown-linux-gnu)
+  --view-root <dir>     Materialize under the canonical target root
+EOF
     exit 2
 }
 
 NATIVE_CRATE=${1:-}
 PROJECT=${2:-}
-FEATURE_KEY=${3:-default}
-SEED_OUT=${4:-}
+(( $# >= 2 )) || usage
+shift 2
+FEATURE_KEY=default
+SEED_OUT=
+CACHE_ROOT=/srv/scratch/toolchains/boringssl-prebuilt
+BUILD_ROOT=/srv/scratch/toolchains/boringssl-build
+CARGO_WRAPPER=/usr/local/bin/cargo
+RUST_TOOLCHAIN=1.100.0
+TARGET=x86_64-unknown-linux-gnu
+VIEW_ROOT=
+
+while (( $# > 0 )); do
+    (( $# >= 2 )) && [[ -n "$2" ]] || usage
+    case "$1" in
+        --features) FEATURE_KEY=$2 ;;
+        --seed) SEED_OUT=$2 ;;
+        --cache-root) CACHE_ROOT=$2 ;;
+        --build-root) BUILD_ROOT=$2 ;;
+        --cargo) CARGO_WRAPPER=$2 ;;
+        --toolchain) RUST_TOOLCHAIN=$2 ;;
+        --target) TARGET=$2 ;;
+        --view-root) VIEW_ROOT=$2 ;;
+        *) usage ;;
+    esac
+    shift 2
+done
 
 case "$NATIVE_CRATE" in
     boring-sys|btls-sys) ;;
@@ -21,10 +55,15 @@ esac
     exit 2
 }
 
-CACHE_ROOT=${BORING_BSSL_CACHE_ROOT:-${SENTINELX_BORINGSSL_CACHE_ROOT:-/srv/scratch/toolchains/boringssl-prebuilt}}
-BUILD_ROOT=${SENTINELX_BORINGSSL_BUILD_ROOT:-/srv/scratch/toolchains/boringssl-build}
-CARGO_WRAPPER=${SENTINELX_CARGO_WRAPPER_PATH:-/usr/local/libexec/sentinelx-bin/cargo}
-RUST_TOOLCHAIN=${SENTINELX_RUST_TOOLCHAIN:-1.99.1}
+PROJECT=$(realpath -m -- "$PROJECT")
+CACHE_ROOT=$(realpath -m -- "$CACHE_ROOT")
+BUILD_ROOT=$(realpath -m -- "$BUILD_ROOT")
+if [[ -n "$SEED_OUT" ]]; then
+    SEED_OUT=$(realpath -m -- "$SEED_OUT")
+fi
+if [[ "$CARGO_WRAPPER" == */* ]]; then
+    CARGO_WRAPPER=$(realpath -ms -- "$CARGO_WRAPPER")
+fi
 mkdir -p "$CACHE_ROOT"
 
 lock_entry="$(
@@ -62,7 +101,7 @@ lock_entry="$(
 }
 read -r VERSION CHECKSUM <<<"$lock_entry"
 
-TARGET=${BORING_BSSL_TARGET:-x86_64-unknown-linux-gnu}
+[[ "$TARGET" =~ ^[A-Za-z0-9_]+(-[A-Za-z0-9_.]+)+$ ]] || usage
 TARGET_US=${TARGET//-/_}
 CC_TARGET_VAR=CC_$TARGET_US
 CXX_TARGET_VAR=CXX_$TARGET_US
@@ -150,15 +189,15 @@ complete() {
 # Expose native archives under the actual canonical Cargo target root.
 # Never create a symlink to a package outside its sandbox.
 publish_path() {
-    if [[ -z "${BORING_BSSL_VIEW_ROOT:-}" ]]; then
+    if [[ -z "$VIEW_ROOT" ]]; then
         printf '%s\n' "$dest"
         return 0
     fi
 
     local root view_root view_dir stage_view
-    root="$BORING_BSSL_VIEW_ROOT"
+    root="$VIEW_ROOT"
     [[ "$root" == /* ]] || {
-        echo "boringssl-prebuilt: BORING_BSSL_VIEW_ROOT must be absolute" >&2
+        echo "boringssl-prebuilt: --view-root must be absolute" >&2
         return 2
     }
     if [[ -z "${SCCACHE_CANONICAL_TARGET_ROOT:-}" ]] ||
@@ -301,10 +340,13 @@ EOF
 
     (
         cd "$work/project"
+        # This is a distinct workspace, not the consuming project's build.
+        # Let the managed launcher compute its own canonical target root.
+        unset CARGO_TARGET_DIR SCCACHE_CANONICAL_TARGET_ROOT SCCACHE_CANONICAL_TARGET_ROOT_ORIGIN
         # Use the site wrapper so cache generation gets the managed registry
         # source pool, package-cache policy, native sccache launcher and target
         # reclamation. A new crate version may fetch its archive once.
-        "$CARGO_WRAPPER" +"$RUST_TOOLCHAIN" build --release --target "$TARGET"
+        "$CARGO_WRAPPER" +"$RUST_TOOLCHAIN" build --release --target "$TARGET" --target-dir "$work/target"
     )
     cp -a "$work/install"/. "$stage"/
 fi
