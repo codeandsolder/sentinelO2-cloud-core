@@ -141,12 +141,12 @@ impl CoreDispatcher {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned reference supplies the active agent policy"]
     pub fn policy(&self) -> &Policy {
         &self.policy
     }
 
-    #[must_use]
+    #[must_use = "the returned list describes the operations available to the client"]
     pub fn capabilities(&self) -> Vec<String> {
         let mut capabilities = Op::ALL
             .iter()

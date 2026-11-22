@@ -37,7 +37,7 @@ impl Default for Tooling {
 }
 
 impl Tooling {
-    #[must_use]
+    #[must_use = "the returned path locates the selected tool executable"]
     pub fn command(&self, name: &str) -> PathBuf {
         self.executables
             .get(name)
@@ -74,7 +74,7 @@ impl Tooling {
         Ok(())
     }
 
-    #[must_use]
+    #[must_use = "the result identifies the resolved helper executable when available"]
     pub fn resolve(&self, name: &str) -> Option<PathBuf> {
         if let Some(configured) = self.executables.get(name) {
             return is_executable(configured).then(|| configured.clone());
@@ -85,7 +85,7 @@ impl Tooling {
             .find(|path| is_executable(path))
     }
 
-    #[must_use]
+    #[must_use = "the returned value describes the available tooling"]
     pub fn report(&self) -> Value {
         let names = [
             "bash",
@@ -116,7 +116,7 @@ impl Tooling {
         })
     }
 
-    #[must_use]
+    #[must_use = "the result identifies a direct Python invocation policy violation"]
     pub fn direct_python_violation(&self, command: &str) -> Option<&'static str> {
         if !self.forbid_direct_python {
             return None;

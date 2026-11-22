@@ -22,22 +22,20 @@ env:
 
 jobs:
   rust-shared-cache:
-    name: Rust 1.99.1 Linux, tests
+    name: Rust Linux tests
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@2376b14a6bc8263ab77013bd744248f49384b2fa # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
     with:
       runner: ubuntu-26.04
       command: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends ripgrep
-        cargo +1.99.1 metadata --locked --format-version 1 >/dev/null
+        cargo metadata --locked --format-version 1 >/dev/null
         python3 -m unittest discover -s .github/scripts -p 'test_*.py'
-        cargo +1.99.1 fmt --all -- --check
-        cargo +1.99.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
-        cargo +1.99.1 test --locked --workspace --all-targets
-      rust-toolchain: "1.99.1"
-      rust-components: "rustfmt clippy"
+        cargo fmt --all -- --check
+        cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        cargo test --locked --workspace --all-targets
       rustflags: "-C target-cpu=x86-64-v2"
 
   fuzz-smoke:
@@ -45,26 +43,27 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-26.04
     timeout-minutes: 20
-    env:
-      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install nightly
-        run: rustup toolchain install nightly --profile minimal
+      - name: Resolve the native quarantined compiler
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-fuzz
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
         with:
-          rust-toolchain: nightly
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Protocol JSON
         run: cargo fuzz run protocol_json --target x86_64-unknown-linux-gnu -- -runs=10000
       - name: Binary transfer frame
         run: cargo fuzz run binary_frame --target x86_64-unknown-linux-gnu -- -runs=10000
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
 
   release:
     name: Release binary
@@ -76,19 +75,22 @@ jobs:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install current stable Rust
-        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Resolve the native quarantined compiler
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
         with:
-          rust-toolchain: "1.99.1"
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Build
-        run: cargo +1.99.1 build --locked --release --bin sentinelx-core
+        run: cargo build --locked --release --bin sentinelx-core
       - name: Smoke
         run: ./target/release/sentinelx-core --help >/dev/null
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
       - name: Checksum
         run: (cd target/release && sha256sum sentinelx-core > sentinelx-core.sha256)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

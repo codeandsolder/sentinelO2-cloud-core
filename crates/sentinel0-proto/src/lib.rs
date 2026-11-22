@@ -137,7 +137,7 @@ impl Op {
         Self::LocalApi,
     ];
 
-    #[must_use]
+    #[must_use = "the returned string is the protocol spelling for the selected value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -345,7 +345,7 @@ pub enum BinaryFrameError {
     TooShort,
 }
 
-#[must_use]
+#[must_use = "the result determines whether the bytes represent a binary transfer frame"]
 pub const fn is_binary_transfer_frame(frame: &[u8]) -> bool {
     frame.len() >= BINARY_HEADER_BYTES
 }
@@ -375,7 +375,7 @@ pub fn decode_binary_frame(frame: &[u8]) -> Result<BinaryFrame<'_>, BinaryFrameE
     })
 }
 
-#[must_use]
+#[must_use = "the returned bytes are the encoded binary transfer frame"]
 pub fn encode_binary_frame(
     transfer_id: [u8; TRANSFER_ID_BYTES],
     chunk_index: u32,

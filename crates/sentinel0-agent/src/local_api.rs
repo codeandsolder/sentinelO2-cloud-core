@@ -50,7 +50,7 @@ fn relay_command(
     ])
 }
 
-#[must_use]
+#[must_use = "the returned exit status reports the relay outcome"]
 pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
     #[cfg(unix)]
     {
@@ -566,7 +566,7 @@ pub(crate) fn validate_config(
     Ok(())
 }
 
-#[must_use]
+#[must_use = "the result determines whether local API endpoints can be configured"]
 pub fn has_usable_endpoints(policy: &Policy) -> bool {
     match endpoints(policy) {
         Ok(endpoints) => !endpoints.is_empty(),

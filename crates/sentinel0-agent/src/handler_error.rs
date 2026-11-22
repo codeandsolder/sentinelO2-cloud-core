@@ -31,7 +31,7 @@ impl HandlerError {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned error carries the failure details into the protocol response"]
     pub fn response_error(self) -> ResponseError {
         ResponseError {
             code: self.code,

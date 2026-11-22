@@ -209,7 +209,7 @@ impl Default for ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
-    #[must_use]
+    #[must_use = "the returned duration determines the retry interval"]
     pub fn delay(&self, attempt: usize) -> Duration {
         let Some(&raw) = self
             .steps
@@ -231,7 +231,7 @@ pub struct DispatchResponse {
 }
 
 impl DispatchResponse {
-    #[must_use]
+    #[must_use = "the returned outbound item owns the message to send"]
     pub const fn message(message: Message) -> Self {
         Self {
             message,
@@ -239,7 +239,7 @@ impl DispatchResponse {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned outbound item owns both the message and binary frame"]
     pub const fn with_binary(message: Message, binary_frame: Vec<u8>) -> Self {
         Self {
             message,
@@ -401,7 +401,7 @@ impl<D: Dispatcher> Agent<D> {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned agent contains the requested rotation configuration"]
     pub fn with_credential_rotation(mut self, config: rotation::RotationConfig) -> Self {
         self.rotation = Some(config);
         self
@@ -1182,7 +1182,7 @@ fn unix_time_seconds() -> f64 {
 
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 
-#[must_use]
+#[must_use = "the result determines whether a server-requested retry interval is available"]
 pub fn parse_retry_after(reason: &str) -> Option<Duration> {
     for part in reason.replace(',', ";").split(';') {
         let Some((key, value)) = part.trim().split_once('=') else {

@@ -86,7 +86,7 @@ fn audit_value(key: Option<&str>, value: &Value) -> Value {
 /// Opaque token-like strings remain redacted, upload bodies and very large text
 /// fields are represented by bounded size/hash summaries, and ordinary paths,
 /// commands and prose stay readable.
-#[must_use]
+#[must_use = "the returned summary is the payload representation intended for audit logging"]
 pub fn summarize_payload(payload: &Map<String, Value>) -> Map<String, Value> {
     let secret_edit = payload.get("secret").and_then(Value::as_bool) == Some(true);
     payload
@@ -114,7 +114,7 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    #[must_use]
+    #[must_use = "the returned audit log holds the selected storage path and state"]
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
@@ -122,7 +122,7 @@ impl AuditLog {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned reference identifies the audit log storage location"]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -397,7 +397,7 @@ fn read_recent_from(path: &Path, limit: usize) -> Vec<Value> {
 }
 
 impl AuditLog {
-    #[must_use]
+    #[must_use = "the returned records contain the requested recent audit history"]
     pub fn read_recent(&self, limit: usize) -> Vec<Value> {
         let _io_guard = self
             .state
