@@ -2049,13 +2049,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sentinel0-build-cache-tests"
-version = "0.1.0"
-dependencies = [
- "tempfile",
-]
-
-[[package]]
 name = "sentinel0-proto"
 version = "0.1.0"
 dependencies = [
