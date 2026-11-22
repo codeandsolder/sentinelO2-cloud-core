@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$#" == 7 && "$1" == +1.100.0 && "$2" == build && "$3" == --release ]]
+[[ "$4" == --target && "$5" == x86_64-unknown-linux-gnu ]]
+[[ "$6" == --target-dir && "$7" == "${PWD%/project}/target" ]]
+[[ ! -v CARGO_TARGET_DIR && ! -v SCCACHE_CANONICAL_TARGET_ROOT && ! -v SCCACHE_CANONICAL_TARGET_ROOT_ORIGIN ]]
+mkdir -p "$BORING_BSSL_INSTALL_DIR/lib" "$BORING_BSSL_INSTALL_DIR/include/openssl" "$7"
+printf 'crypto' >"$BORING_BSSL_INSTALL_DIR/lib/libcrypto.a"
+printf 'ssl' >"$BORING_BSSL_INSTALL_DIR/lib/libssl.a"
+printf 'header' >"$BORING_BSSL_INSTALL_DIR/include/openssl/x509v3.h"
+printf 'temporary build artifact' >"$7/removable"

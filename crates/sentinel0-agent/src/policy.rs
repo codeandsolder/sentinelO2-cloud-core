@@ -71,6 +71,7 @@ pub struct Policy {
     pub exec_timeout_max: u64,
     pub exec_capture_max_bytes: usize,
     pub upload_base: PathBuf,
+    pub audit_path: PathBuf,
     pub trusted_fetch_hosts: Vec<String>,
     pub file_url_timeout_seconds: u64,
     pub file_ops_paths: Vec<FileOpsPath>,
@@ -81,6 +82,8 @@ pub struct Policy {
     pub locations: BTreeMap<String, LocationSpec>,
     pub tooling: Tooling,
 }
+
+const DEFAULT_AUDIT_PATH: &str = "/var/lib/sentinelx/audit.jsonl";
 
 impl Default for Policy {
     fn default() -> Self {
@@ -98,6 +101,7 @@ impl Default for Policy {
             exec_timeout_max: 600,
             exec_capture_max_bytes: 4 * 1024 * 1024,
             upload_base: PathBuf::from("/var/lib/sentinelx/uploads"),
+            audit_path: PathBuf::from(DEFAULT_AUDIT_PATH),
             trusted_fetch_hosts: Vec::new(),
             file_url_timeout_seconds: 15,
             file_ops_paths: Vec::new(),
@@ -205,6 +209,7 @@ impl Default for RawTooling {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawAgent {
+    audit_path: Option<PathBuf>,
     hostname_label: Option<String>,
     preferred_profile: Option<String>,
     #[serde(rename = "response_timestamp_interval_seconds")]
@@ -673,6 +678,7 @@ impl Policy {
             exec_mode,
         } = raw;
         let RawAgent {
+            audit_path,
             hostname_label,
             preferred_profile,
             _response_timestamp_interval_seconds: _,
@@ -696,6 +702,13 @@ impl Policy {
         let upload_base =
             upload_base.unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/uploads"));
         let upload_base = soft_canonicalize(&upload_base).unwrap_or(upload_base);
+        let audit_path = audit_path.unwrap_or_else(|| PathBuf::from(DEFAULT_AUDIT_PATH));
+        if !audit_path.is_absolute() {
+            return Err(PolicyError::InvalidValue {
+                field: "agent.audit_path",
+                message: "must be an absolute path".into(),
+            });
+        }
         let tooling = parse_tooling(tooling);
         let exec_mode = parse_exec_mode(exec_mode.as_deref(), exec_strict, exec.enforce_allowlist);
 
@@ -717,6 +730,7 @@ impl Policy {
             exec_timeout_max: exec.timeout_max,
             exec_capture_max_bytes: exec.capture_max_bytes,
             upload_base,
+            audit_path,
             trusted_fetch_hosts,
             file_url_timeout_seconds,
             file_ops_paths,
@@ -841,6 +855,18 @@ mod tests {
     fn parse(text: &str) -> TestResult<Policy> {
         let raw: RawPolicy = yaml_serde::from_str(text).test_value()?;
         Policy::from_raw(raw).test_value()
+    }
+
+    #[test]
+    fn audit_path_is_explicit_and_absolute() -> TestResult {
+        assert_eq!(parse("{}")?.audit_path, PathBuf::from(DEFAULT_AUDIT_PATH));
+        let configured = parse("agent: {audit_path: /tmp/custom-audit.jsonl}")?;
+        assert_eq!(
+            configured.audit_path,
+            PathBuf::from("/tmp/custom-audit.jsonl")
+        );
+        assert!(parse("agent: {audit_path: relative.jsonl}").is_err());
+        Ok(())
     }
 
     #[test]

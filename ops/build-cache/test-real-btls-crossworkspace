@@ -10,11 +10,8 @@ mkdir -p "$HOME/build"
 root=$(mktemp -d "$HOME/build/boringssl-real-crossworkspace-XXXXXXXX")
 trap 'rm -rf -- "$root"' EXIT
 
-export BORING_BSSL_CACHE_ROOT="$root/native-packages"
-export SENTINELX_BORINGSSL_BUILD_ROOT="$root/native-work"
-export SENTINELX_CARGO_WRAPPER_PATH
-SENTINELX_CARGO_WRAPPER_PATH=$(command -v cargo)
-export SENTINELX_RUST_TOOLCHAIN=1.99.0
+cargo_launcher=$(command -v cargo)
+toolchain=1.100.0
 export CARGO_BUILD_EPHEMERAL_INTERMEDIATES=true
 export CARGO_INCREMENTAL=0
 
@@ -44,7 +41,7 @@ RUST
 done
 (
     cd "$root/workspace-a"
-    cargo +1.99.0 generate-lockfile --quiet
+    "$cargo_launcher" +"$toolchain" generate-lockfile --quiet
 )
 cp "$root/workspace-a/Cargo.lock" "$root/workspace-b/Cargo.lock"
 
@@ -52,9 +49,11 @@ for workspace in a b; do
     project="$root/workspace-$workspace"
     export CARGO_TARGET_DIR="$project/target"
     export SCCACHE_CANONICAL_TARGET_ROOT="$CARGO_TARGET_DIR"
-    export BORING_BSSL_VIEW_ROOT="$CARGO_TARGET_DIR"
     export BORING_BSSL_PATH
-    BORING_BSSL_PATH=$("$helper" btls-sys "$project" default)
+    BORING_BSSL_PATH=$("$helper" btls-sys "$project" \
+        --cache-root "$root/native-packages" --build-root "$root/native-work" \
+        --cargo "$cargo_launcher" --toolchain "$toolchain" \
+        --view-root "$CARGO_TARGET_DIR")
     export BORING_BSSL_ASSUME_PATCHED=1
 
     test -f "$BORING_BSSL_PATH/lib/libcrypto.a"
@@ -64,7 +63,7 @@ for workspace in a b; do
         cd "$BORING_BSSL_PATH"
         sha256sum -c --status SHA256SUMS
     )
-    cargo +1.99.0 run --locked --manifest-path "$project/Cargo.toml" --quiet
+    "$cargo_launcher" +"$toolchain" run --locked --manifest-path "$project/Cargo.toml" --quiet
     printf 'crossworkspace %s linked against native package %s\n' "$workspace" "$(basename "$BORING_BSSL_PATH")"
 done
 echo 'ok: keyed BoringSSL package linked and ran in two independent canonical-root Cargo workspaces'
