@@ -21,17 +21,35 @@ def queue_release(repository: str, manifest: dict) -> None:
 
     subprocess.run(
         [
-            "gh", "label", "create", LABEL, "--repo", repository,
-            "--color", "8250df", "--description",
-            "Queued automatically when stable Rust changes", "--force",
+            "gh",
+            "label",
+            "create",
+            LABEL,
+            "--repo",
+            repository,
+            "--color",
+            "8250df",
+            "--description",
+            "Queued automatically when stable Rust changes",
+            "--force",
         ],
         check=True,
     )
     existing = subprocess.run(
         [
-            "gh", "api", "--method", "GET", "--paginate", "--slurp",
-            f"repos/{repository}/issues", "-f", "state=all",
-            "-f", f"labels={LABEL}", "-F", "per_page=100",
+            "gh",
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            f"repos/{repository}/issues",
+            "-f",
+            "state=all",
+            "-f",
+            f"labels={LABEL}",
+            "-F",
+            "per_page=100",
         ],
         check=True,
         capture_output=True,
@@ -40,8 +58,12 @@ def queue_release(repository: str, manifest: dict) -> None:
     # Match the exact marker in the issue inventory, not a delayed search index.
     for page in json.loads(existing.stdout):
         for issue in page:
-            if "pull_request" not in issue and f"<!-- {marker} -->" in (issue["body"] or ""):
-                print(f"Rust {version} review already exists as issue #{issue['number']}")
+            if "pull_request" not in issue and f"<!-- {marker} -->" in (
+                issue["body"] or ""
+            ):
+                print(
+                    f"Rust {version} review already exists as issue #{issue['number']}"
+                )
                 return
 
     body = f"""<!-- {marker} -->
@@ -63,9 +85,17 @@ This issue is generated automatically. A ChatGPT maintenance automation is expec
 """
     subprocess.run(
         [
-            "gh", "issue", "create", "--repo", repository,
-            "--title", f"Rust {version}: full best-practices refresh",
-            "--label", LABEL, "--body", body,
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            repository,
+            "--title",
+            f"Rust {version}: full best-practices refresh",
+            "--label",
+            LABEL,
+            "--body",
+            body,
         ],
         check=True,
     )
