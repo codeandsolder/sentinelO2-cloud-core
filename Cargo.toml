@@ -3,7 +3,6 @@ resolver = "3"
 members = [
   "crates/sentinel0-proto",
   "crates/sentinel0-agent",
-  "ops/build-cache",
 ]
 
 [workspace.package]
