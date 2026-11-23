@@ -51,7 +51,7 @@ supports the native Windows executable suffixes.
 
 ## Build and validation
 
-Windows CI uses the shared sccache workflow on a Windows runner. Local
+Windows CI runs the full native agent and protocol tests using the shared sccache workflow on a Windows runner. Local
 cross-compilation on Acer requires MinGW's cross C/C++ compilers for
 `aws-lc-sys` in addition to Rust's `x86_64-pc-windows-gnu` target.
 The compiler invocations must continue through managed sccache.
@@ -59,3 +59,9 @@ The compiler invocations must continue through managed sccache.
 Native Windows smoke tests should cover process execution, cancellation,
 file operations, host enrollment/Hub handshake, and service control before
 this target is promoted to a release-supported installer.
+
+## Build artifacts
+
+On main, the Windows release job builds a native x86-64 executable, smoke-tests
+its startup, and publishes the executable with its SHA-256 checksum as a CI
+artifact. The job uses the managed sccache action, like the Linux release job.

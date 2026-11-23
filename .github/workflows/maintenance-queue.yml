@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   rust-release-queue:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-release-review.yml@21aa933d276f9193e50d4047ea25da6b467337dc # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-release-review.yml@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
 
   upstream-parity-queue:
     runs-on: ubuntu-26.04

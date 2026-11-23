@@ -25,7 +25,7 @@ jobs:
     name: Rust Linux tests
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
     with:
       runner: ubuntu-26.04
       command: |
@@ -42,18 +42,13 @@ jobs:
     name: Rust Windows native check and smoke
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
     with:
       runner: windows-2025
       command: |
         cargo check --locked -p sentinel0-agent -p sentinel0-proto --all-targets
         cargo test --locked -p sentinel0-proto
-        cargo test --locked -p sentinel0-agent --lib instance_lock::tests::
-        cargo test --locked -p sentinel0-agent --lib fsutil::tests::
-        cargo test --locked -p sentinel0-agent --lib powershell_script_executes_natively
-        cargo test --locked -p sentinel0-agent --lib windows_cmd_runs_in_requested_directory
-        cargo test --locked -p sentinel0-agent --lib windows_service_invocation_uses_native_commands
-        cargo test --locked -p sentinel0-agent --lib remote_argv_escapes_untrusted_shell_metacharacters
+        cargo test --locked -p sentinel0-agent --lib -- --test-threads=4
         cargo run --locked -p sentinel0-agent --bin sentinelx-core -- --help >/dev/null
 
   fuzz-smoke:
@@ -65,14 +60,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Resolve the native quarantined compiler
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
       - name: Install pinned Rust
         run: rustup show active-toolchain
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-fuzz
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Protocol JSON
@@ -81,7 +76,7 @@ jobs:
         run: cargo fuzz run binary_frame --target x86_64-unknown-linux-gnu -- -runs=10000
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
 
   release:
     name: Release binary
@@ -95,11 +90,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Resolve the native quarantined compiler
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
       - name: Install pinned Rust
         run: rustup show active-toolchain
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Build
@@ -108,7 +103,7 @@ jobs:
         run: ./target/release/sentinelx-core --help >/dev/null
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
       - name: Checksum
         run: (cd target/release && sha256sum sentinelx-core > sentinelx-core.sha256)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -117,5 +112,42 @@ jobs:
           path: |
             target/release/sentinelx-core
             target/release/sentinelx-core.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release-windows:
+    name: Release Windows x86_64 binary
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [rust-windows]
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve the native quarantined compiler
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+        with:
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
+      - name: Build native executable
+        run: cargo build --locked --release --bin sentinelx-core
+      - name: Executable startup smoke
+        run: ./target/release/sentinelx-core.exe --help >/dev/null
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+      - name: Checksum
+        run: (cd target/release && sha256sum sentinelx-core.exe > sentinelx-core.exe.sha256)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sentinelx-core-windows-x86_64
+          path: |
+            target/release/sentinelx-core.exe
+            target/release/sentinelx-core.exe.sha256
           if-no-files-found: error
           retention-days: 7
