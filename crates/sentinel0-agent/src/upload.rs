@@ -76,7 +76,10 @@ fn safe_dest(upload_base: &Path, target: &str) -> Result<PathBuf, HandlerError> 
     }
     let mut relative = PathBuf::new();
     let mut has_file_component = false;
+    #[cfg(windows)]
     let mut components = Path::new(target.trim()).components();
+    #[cfg(unix)]
+    let components = Path::new(target.trim()).components();
     // Windows absolute targets may be used as staging labels, never as an
     // authority to write outside upload_base. Hashing the root identifier
     // keeps UNC/device prefixes and drive names separate without illegal
