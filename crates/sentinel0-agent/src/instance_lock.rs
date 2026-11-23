@@ -135,14 +135,21 @@ mod tests {
         let dir = tempfile::tempdir().test_value()?;
         let path = lock_path_for_state(dir.path(), "host_a");
         let held = acquire_path(path.clone()).test_value()?;
+        // Windows exclusive byte-range locks prevent reading the locked file,
+        // including from the process holding the lock. Verify the recorded PID
+        // after the holder is dropped instead.
+        #[cfg(unix)]
         assert_eq!(
             std::fs::read_to_string(&path).test_value()?,
             std::process::id().to_string()
         );
 
-        match acquire_path(path) {
+        match acquire_path(path.clone()) {
             Err(InstanceLockError::AlreadyRunning { holder, .. }) => {
+                #[cfg(unix)]
                 assert_eq!(holder, Some(std::process::id()));
+                #[cfg(windows)]
+                assert_eq!(holder, None);
             }
             other => {
                 return Err(std::io::Error::other(format!(
@@ -152,6 +159,11 @@ mod tests {
             }
         }
         drop(held);
+        #[cfg(windows)]
+        assert_eq!(
+            std::fs::read_to_string(&path).test_value()?,
+            std::process::id().to_string()
+        );
         Ok(())
     }
 

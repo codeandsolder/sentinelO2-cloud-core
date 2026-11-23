@@ -54,6 +54,8 @@ jobs:
         cargo test --locked -p sentinel0-agent --lib windows_cmd_runs_in_requested_directory
         cargo test --locked -p sentinel0-agent --lib windows_service_invocation_uses_native_commands
         cargo test --locked -p sentinel0-agent --lib remote_argv_escapes_untrusted_shell_metacharacters
+        cargo build --locked -p sentinel0-agent --bin sentinelx-core
+        ./target/debug/sentinelx-core.exe --help >/dev/null
 
   fuzz-smoke:
     name: Fuzz smoke
