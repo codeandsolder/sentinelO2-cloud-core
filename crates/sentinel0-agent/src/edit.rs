@@ -1117,7 +1117,7 @@ async fn sudo_replace(
     if let Some(meta) = original_meta {
         install.extend([
             "-m".into(),
-            format!("{:o}", portable_mode(&meta)),
+            format!("{:o}", portable_mode(meta)),
             "-o".into(),
             meta.uid().to_string(),
             "-g".into(),
