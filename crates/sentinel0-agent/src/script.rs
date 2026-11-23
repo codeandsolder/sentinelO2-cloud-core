@@ -161,15 +161,15 @@ fn build_command(
             script.display().to_string(),
         ],
         "pwsh" | "powershell" => {
-            let mut argv = vec![
+            let mut ps_command = vec![
                 policy.tooling.command(interpreter).display().to_string(),
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
             ];
             #[cfg(windows)]
-            argv.extend(["-ExecutionPolicy".into(), "Bypass".into()]);
-            argv.extend(["-File".into(), script.display().to_string()]);
-            argv
+            ps_command.extend(["-ExecutionPolicy".into(), "Bypass".into()]);
+            ps_command.extend(["-File".into(), script.display().to_string()]);
+            ps_command
         },
         _ => Vec::new(),
     };
