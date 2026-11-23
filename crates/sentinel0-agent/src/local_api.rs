@@ -1769,6 +1769,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     #[test]
@@ -1830,6 +1831,7 @@ actions:
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_as_endpoint_remains_usable_and_relay_has_no_shell() -> TestResult {
         let raw: yaml_serde::Value = yaml_serde::from_str(

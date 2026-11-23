@@ -160,20 +160,17 @@ fn build_command(
             "import os,runpy,sys; p=sys.argv[1]; sys.argv=sys.argv[1:]; sys.path.insert(1, os.path.dirname(os.path.abspath(p))); runpy.run_path(p, run_name='__main__')".into(),
             script.display().to_string(),
         ],
-        "pwsh" => vec![
-            policy.tooling.command("pwsh").display().to_string(),
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-File".into(),
-            script.display().to_string(),
-        ],
-        "powershell" => vec![
-            policy.tooling.command("powershell").display().to_string(),
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-File".into(),
-            script.display().to_string(),
-        ],
+        "pwsh" | "powershell" => {
+            let mut argv = vec![
+                policy.tooling.command(interpreter).display().to_string(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+            ];
+            #[cfg(windows)]
+            argv.extend(["-ExecutionPolicy".into(), "Bypass".into()]);
+            argv.extend(["-File".into(), script.display().to_string()]);
+            argv
+        },
         _ => Vec::new(),
     };
     inner.extend(args.iter().cloned());
@@ -607,6 +604,7 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use std::fs;
     use tempfile::tempdir;
 
     #[cfg(unix)]
@@ -636,6 +634,36 @@ mod tests {
         assert!(message.contains("host condition"));
         assert!(message.contains("unstable"));
         assert!(message.contains(&path.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_script_executes_natively() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("powershell".into())),
+                (
+                    "content".into(),
+                    Value::String("Write-Output 'native_windows'; exit 7".into()),
+                ),
+            ]),
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["returncode"], 7);
+        assert!(
+            result["output"]
+                .as_str()
+                .test_value()?
+                .contains("native_windows")
+        );
+        Ok(())
     }
 
     #[test]
@@ -727,6 +755,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn python_script_can_import_staged_runtime() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -762,6 +791,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn python_cwd_is_importable_and_pwd_matches_it() -> TestResult {
         let dir = tempdir().test_value()?;

@@ -7,7 +7,7 @@ use crate::{
     process_runner::{self, ProcessFailure, ProcessGroupKill, ProcessOutcome},
 };
 use serde_json::{Map, Value};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::time::Instant;
 use std::{path::Path, time::Duration};
 

@@ -1502,6 +1502,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn wait_for_path(path: &Path) -> bool {
         for _ in 0..150 {
             if path.exists() {

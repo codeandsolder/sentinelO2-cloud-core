@@ -129,8 +129,10 @@ fn systemd_service_invocation(
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
                 "-Command".into(),
-                "Restart-Service -Name $args[0] -ErrorAction Stop".into(),
-                name,
+                format!(
+                    "Restart-Service -Name '{}' -ErrorAction Stop",
+                    name.replace('\'', "''")
+                ),
             ],
             None,
         )),
@@ -1131,10 +1133,11 @@ impl CoreDispatcher {
             ));
         }
         if spec.backend != "service" {
+            let platform = if cfg!(windows) { "Windows" } else { "Linux" };
             return Err(HandlerError::new(
                 "unsupported_backend",
                 format!(
-                    "service backend {:?} is not supported on this Linux build",
+                    "service backend {:?} is not supported on this {platform} build",
                     spec.backend
                 ),
             ));
@@ -2050,7 +2053,10 @@ mod tests {
             systemd_service_invocation(&Policy::default(), "spooler", &spec, "restart")
                 .test_value()?;
         assert!(restart[0].contains("powershell"));
-        assert_eq!(restart.last().map(String::as_str), Some("Spooler"));
+        assert_eq!(
+            restart.last().map(String::as_str),
+            Some("Restart-Service -Name 'Spooler' -ErrorAction Stop")
+        );
         Ok(())
     }
 

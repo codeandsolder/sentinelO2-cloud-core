@@ -49,6 +49,8 @@ jobs:
         cargo check --locked -p sentinel0-agent -p sentinel0-proto --all-targets
         cargo test --locked -p sentinel0-proto
         cargo test --locked -p sentinel0-agent --lib instance_lock::tests::
+        cargo test --locked -p sentinel0-agent --lib fsutil::tests::
+        cargo test --locked -p sentinel0-agent --lib powershell_script_executes_natively
         cargo test --locked -p sentinel0-agent --lib windows_cmd_runs_in_requested_directory
         cargo test --locked -p sentinel0-agent --lib windows_service_invocation_uses_native_commands
         cargo test --locked -p sentinel0-agent --lib remote_argv_escapes_untrusted_shell_metacharacters
