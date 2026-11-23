@@ -15,4 +15,4 @@ permissions:
 
 jobs:
   duplicates:
-    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
