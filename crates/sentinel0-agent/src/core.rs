@@ -2113,12 +2113,13 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_service_action_does_not_add_sudo() -> TestResult {
+        let action = if cfg!(windows) { "status" } else { "is-active" };
         let mut policy = Policy::default();
         policy.services.insert(
             "fixture".into(),
             ServiceSpec {
                 unit: "definitely-not-real.service".into(),
-                actions: vec!["is-active".into()],
+                actions: vec![action.into()],
                 requires_sudo: true,
                 description: String::new(),
                 domain: "system".into(),
@@ -2131,7 +2132,7 @@ mod tests {
             .service(
                 &Map::from_iter([
                     ("service".into(), Value::String("fixture".into())),
-                    ("action".into(), Value::String("is-active".into())),
+                    ("action".into(), Value::String(action.into())),
                 ]),
                 false,
             )

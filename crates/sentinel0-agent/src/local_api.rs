@@ -2211,18 +2211,29 @@ out({'jsonrpc':'2.0','id':req['id'],'result':result})
 
     #[test]
     fn stdio_config_is_strict_about_protocol_paths_and_options() -> TestResult {
-        let good: yaml_serde::Value = yaml_serde::from_str(
-            "transport: stdio\nprotocol: jsonrpc\npath: /usr/bin/example\nargs: [--stdio, 7]\ncwd: /tmp\nenv: {PORT: 8080}\nhandshake: mcp\nactions:\n  x: {method: x}\n",
-        ).test_value()?;
+        let executable = std::env::current_exe().test_value()?;
+        let executable = serde_json::to_string(&executable.display().to_string()).test_value()?;
+        let cwd =
+            serde_json::to_string(&std::env::temp_dir().display().to_string()).test_value()?;
+        let text = format!(
+            "transport: stdio\nprotocol: jsonrpc\npath: {executable}\nargs: [--stdio, 7]\ncwd: {cwd}\nenv: {{PORT: 8080}}\nhandshake: mcp\nactions:\n  x: {{method: x}}\n"
+        );
+        let good: yaml_serde::Value = yaml_serde::from_str(&text).test_value()?;
         let endpoint = endpoint_from_raw("x", &good).test_value()?;
         assert_eq!(endpoint.args, ["--stdio", "7"]);
         assert_eq!(endpoint.handshake, "mcp");
-        for bad in [
-            "transport: stdio\nprotocol: http\npath: /x\nactions:\n  x: {request: 'GET /'}\n",
-            "transport: stdio\nprotocol: jsonrpc\npath: relative\nactions:\n  x: {method: x}\n",
-            "transport: stdio\nprotocol: jsonrpc\npath: /x\nhandshake: nope\nactions:\n  x: {method: x}\n",
-        ] {
-            let raw: yaml_serde::Value = yaml_serde::from_str(bad).test_value()?;
+        let bad = [
+            format!(
+                "transport: stdio\nprotocol: http\npath: {executable}\nactions:\n  x: {{request: 'GET /'}}\n"
+            ),
+            "transport: stdio\nprotocol: jsonrpc\npath: relative\nactions:\n  x: {method: x}\n"
+                .to_owned(),
+            format!(
+                "transport: stdio\nprotocol: jsonrpc\npath: {executable}\nhandshake: nope\nactions:\n  x: {{method: x}}\n"
+            ),
+        ];
+        for text in bad {
+            let raw: yaml_serde::Value = yaml_serde::from_str(&text).test_value()?;
             assert!(endpoint_from_raw("x", &raw).is_err());
         }
         Ok(())

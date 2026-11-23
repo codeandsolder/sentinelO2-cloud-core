@@ -292,6 +292,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_keeps_output_written_before_deadline() -> TestResult {
         let result = run_shell(
@@ -309,6 +310,24 @@ mod tests {
         assert!(output.contains("err1"));
         assert!(!result.contains_key("left_running"));
 
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cmd_timeout_preserves_stdout_and_stderr() -> TestResult {
+        let result = run_shell(
+            &Policy::default(),
+            "echo step1 & echo err1 1>&2 & powershell -NoProfile -NonInteractive -Command Start-Sleep -Seconds 10",
+            Duration::from_secs(3),
+            None,
+            None,
+        ).await.test_value()?;
+        let output = result["output"].as_str().test_value()?;
+        assert_eq!(result["timed_out"], true);
+        assert!(output.contains("step1"), "{result:?}");
+        assert!(output.contains("err1"), "{result:?}");
+        assert!(!result.contains_key("left_running"), "{result:?}");
         Ok(())
     }
 

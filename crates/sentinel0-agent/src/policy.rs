@@ -866,11 +866,10 @@ mod tests {
     #[test]
     fn audit_path_is_explicit_and_absolute() -> TestResult {
         assert_eq!(parse("{}")?.audit_path, PathBuf::from(DEFAULT_AUDIT_PATH));
-        let configured = parse("agent: {audit_path: /tmp/custom-audit.jsonl}")?;
-        assert_eq!(
-            configured.audit_path,
-            PathBuf::from("/tmp/custom-audit.jsonl")
-        );
+        let absolute = std::env::temp_dir().join("custom-audit.jsonl");
+        let encoded = serde_json::to_string(&absolute.display().to_string()).test_value()?;
+        let configured = parse(&format!("agent: {{audit_path: {encoded}}}"))?;
+        assert_eq!(configured.audit_path, absolute);
         assert!(parse("agent: {audit_path: relative.jsonl}").is_err());
         Ok(())
     }

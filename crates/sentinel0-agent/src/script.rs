@@ -454,26 +454,29 @@ async fn prepare_script(
 
 fn script_spawn_error(error: &std::io::Error, cwd: Option<&Path>) -> HandlerError {
     if let Some(cwd) = cwd {
-        match error.kind() {
-            std::io::ErrorKind::PermissionDenied => {
-                return HandlerError::new(
-                    "permission_denied",
-                    format!(
-                        "cannot enter cwd {:?}: the agent's OS user lacks permission to change into it. Being inside an rw file_ops path does not grant Unix access. Either run with sudo=true -- the directory is then entered after elevation -- or grant the agent's user execute (+x) on it and its parents.",
-                        cwd.display()
-                    ),
-                );
-            }
-            std::io::ErrorKind::NotFound if !cwd.exists() => {
+        match std::fs::metadata(cwd) {
+            Err(cwd_error) if cwd_error.kind() == std::io::ErrorKind::NotFound => {
                 return HandlerError::new(
                     "not_found",
                     format!("cwd {:?} does not exist.", cwd.display()),
                 );
             }
-            std::io::ErrorKind::NotADirectory if !cwd.is_dir() => {
+            Err(cwd_error) if cwd_error.kind() == std::io::ErrorKind::NotADirectory => {
                 return HandlerError::new(
                     "not_a_directory",
                     format!("cwd {:?} is not a directory.", cwd.display()),
+                );
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return HandlerError::new(
+                    "not_a_directory",
+                    format!("cwd {:?} is not a directory.", cwd.display()),
+                );
+            }
+            Err(cwd_error) if cwd_error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return HandlerError::new(
+                    "permission_denied",
+                    format!("cannot access cwd {:?}: {cwd_error}", cwd.display()),
                 );
             }
             _ => {}
@@ -884,10 +887,14 @@ mod tests {
     #[tokio::test]
     async fn missing_interpreter_is_not_mistaken_for_missing_cwd() -> TestResult {
         let dir = tempdir().test_value()?;
-        let policy = Policy {
+        let mut policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
         };
+        policy.tooling.executables.insert(
+            "powershell".into(),
+            dir.path().join("deliberately-missing-powershell.exe"),
+        );
         let error = handle(
             &policy,
             &Map::from_iter([
@@ -906,6 +913,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_script_keeps_flushed_output() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -935,6 +943,71 @@ mod tests {
         assert!(output.contains("err1"));
         assert!(!result.contains_key("left_running"));
 
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_powershell_timeout_preserves_output() -> TestResult {
+        let directory = tempdir().test_value()?;
+        let policy = Policy {
+            upload_base: directory.path().to_owned(),
+            ..Policy::default()
+        };
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("powershell".into())),
+                ("content".into(), Value::String(
+                    "Write-Output 'reached step 1'; [Console]::Error.WriteLine('err1'); Start-Sleep -Seconds 10".into()
+                )),
+                ("timeout".into(), Value::from(3)),
+            ]),
+        ).await.test_value()?;
+        let output = result["output"].as_str().test_value()?;
+        assert_eq!(result["timed_out"], true);
+        assert!(output.contains("reached step 1"), "{result:?}");
+        assert!(output.contains("err1"), "{result:?}");
+        assert!(!result.contains_key("left_running"), "{result:?}");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_powershell_cancellation_kills_child_and_cleans_staging() -> TestResult {
+        let directory = tempdir().test_value()?;
+        let started = directory.path().join("started");
+        let survived = directory.path().join("survived");
+        let escaped = |path: &Path| path.display().to_string().replace('\'', "''");
+        let source = format!(
+            "Set-Content -LiteralPath '{}' -Value started; & powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2; Set-Content -LiteralPath '{}' -Value survived\"",
+            escaped(&started),
+            escaped(&survived)
+        );
+        let policy = Policy {
+            upload_base: directory.path().to_owned(),
+            ..Policy::default()
+        };
+        let payload = Map::from_iter([
+            ("interpreter".into(), Value::String("powershell".into())),
+            ("content".into(), Value::String(source)),
+        ]);
+        let task = tokio::spawn(async move { handle(&policy, &payload).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while !started.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(started.exists(), "PowerShell never reached its body");
+        task.abort();
+        let join_error = task.await.err().test_value()?;
+        assert!(join_error.is_cancelled());
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        assert!(
+            !survived.exists(),
+            "PowerShell descendant survived cancellation"
+        );
+        let staging = directory.path().join(crate::staging::STAGING_DIRNAME);
+        assert_eq!(fs::read_dir(staging).test_value()?.count(), 0);
         Ok(())
     }
 
@@ -969,10 +1042,14 @@ mod tests {
     #[tokio::test]
     async fn missing_interpreter_cleans_workdir_by_default() -> TestResult {
         let dir = tempdir().test_value()?;
-        let policy = Policy {
+        let mut policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
         };
+        policy.tooling.executables.insert(
+            "powershell".into(),
+            dir.path().join("deliberately-missing-powershell.exe"),
+        );
         let error = handle(
             &policy,
             &Map::from_iter([
@@ -1095,10 +1172,14 @@ mod tests {
     #[tokio::test]
     async fn cleanup_false_launch_error_reports_retained_paths() -> TestResult {
         let dir = tempdir().test_value()?;
-        let policy = Policy {
+        let mut policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
         };
+        policy.tooling.executables.insert(
+            "powershell".into(),
+            dir.path().join("deliberately-missing-powershell.exe"),
+        );
         let error = handle(
             &policy,
             &Map::from_iter([
@@ -1131,6 +1212,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_descendants_and_cleans_staging() -> TestResult {
         let dir = tempdir().test_value()?;

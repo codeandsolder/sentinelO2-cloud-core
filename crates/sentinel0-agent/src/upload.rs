@@ -74,29 +74,53 @@ fn safe_dest(upload_base: &Path, target: &str) -> Result<PathBuf, HandlerError> 
             "missing 'target_path'",
         ));
     }
-    // Match the official upload staging semantics: a leading slash does
-    // not grant an absolute write, it is stripped and the path remains rooted
-    // under upload_base. Parent traversal is still refused.
-    let stripped = target.trim().trim_start_matches('/');
-    let relative = Path::new(stripped);
-    if relative.as_os_str().is_empty()
-        || relative.components().any(|part| {
-            matches!(
-                part,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
+    let mut relative = PathBuf::new();
+    let mut has_file_component = false;
+    let mut components = Path::new(target.trim()).components();
+    // Windows absolute targets may be used as staging labels, never as an
+    // authority to write outside upload_base. Hashing the root identifier
+    // keeps UNC/device prefixes and drive names separate without illegal
+    // colon/backslash characters in the destination path.
+    #[cfg(windows)]
+    if let Some(Component::Prefix(prefix)) = components.clone().next() {
+        let encoded = hex_bytes(Sha256::digest(prefix.as_os_str().as_encoded_bytes()));
+        relative.push(format!("windows-root-{encoded}"));
+        components.next();
+    }
+
+    for part in components {
+        match part {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                #[cfg(windows)]
+                if name.to_string_lossy().contains(':') {
+                    return Err(HandlerError::new(
+                        "path_traversal",
+                        "upload target contains an alternate data stream or invalid name",
+                    ));
+                }
+                relative.push(name);
+                has_file_component = true;
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(HandlerError::new(
+                    "path_traversal",
+                    "target_path must remain under upload_base and must not contain '..'",
+                ));
+            }
+        }
+    }
+    if !has_file_component {
         return Err(HandlerError::new(
             "path_traversal",
-            "target_path must remain under upload_base and must not contain '..'",
+            "target_path must name a file under upload_base",
         ));
     }
-    if relative
-        .components()
-        .next()
-        .is_some_and(|part| part.as_os_str() == ".sentinelx_uploads")
-    {
+    if relative.components().next().is_some_and(|part| {
+        part.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".sentinelx_uploads")
+    }) {
         return Err(HandlerError::new(
             "path_not_allowed",
             "target_path must not address the reserved .sentinelx_uploads staging area",
@@ -1065,7 +1089,10 @@ mod tests {
         .test_value()?;
         let meta = upload_meta(&policy, &init)?;
         assert!(meta.landed_in_place);
-        assert_eq!(PathBuf::from(meta.target_path), target);
+        assert_eq!(
+            PathBuf::from(meta.target_path),
+            soft_canonicalize::soft_canonicalize(&target).test_value()?
+        );
 
         Ok(())
     }
@@ -1096,7 +1123,10 @@ mod tests {
         .test_value()?;
         let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
-        assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+        assert!(
+            PathBuf::from(meta.target_path)
+                .starts_with(soft_canonicalize::soft_canonicalize(uploads.path()).test_value()?)
+        );
 
         Ok(())
     }
@@ -1123,7 +1153,10 @@ mod tests {
         .test_value()?;
         let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
-        assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+        assert!(
+            PathBuf::from(meta.target_path)
+                .starts_with(soft_canonicalize::soft_canonicalize(uploads.path()).test_value()?)
+        );
 
         Ok(())
     }
@@ -1150,7 +1183,10 @@ mod tests {
         .test_value()?;
         let meta = upload_meta(&policy, &init)?;
         assert!(!meta.landed_in_place);
-        assert!(PathBuf::from(meta.target_path).starts_with(uploads.path()));
+        assert!(
+            PathBuf::from(meta.target_path)
+                .starts_with(soft_canonicalize::soft_canonicalize(uploads.path()).test_value()?)
+        );
 
         Ok(())
     }
@@ -1198,9 +1234,33 @@ mod tests {
         assert!(!meta.landed_in_place);
         assert_eq!(
             PathBuf::from(meta.target_path),
-            uploads.path().join("srv/elsewhere/x.txt")
+            soft_canonicalize::soft_canonicalize(uploads.path().join("srv/elsewhere/x.txt"))
+                .test_value()?
         );
 
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_target_is_staged_under_upload_root() -> TestResult {
+        let uploads = tempdir().test_value()?;
+        let elsewhere = tempdir().test_value()?;
+        let absolute = elsewhere.path().join("example.txt");
+        let resolved = safe_dest(uploads.path(), &absolute.display().to_string()).test_value()?;
+        assert!(
+            resolved
+                .starts_with(soft_canonicalize::soft_canonicalize(uploads.path()).test_value()?)
+        );
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("example.txt")
+        );
+        let attempt = format!("{}\\..\\escape", absolute.display());
+        assert_eq!(
+            safe_dest(uploads.path(), &attempt).test_error()?.code,
+            "path_traversal"
+        );
         Ok(())
     }
 
@@ -1254,7 +1314,10 @@ mod tests {
         )
         .await
         .test_error()?;
+        #[cfg(unix)]
         assert_eq!(error.code, "io_error");
+        #[cfg(windows)]
+        assert_eq!(error.code, "permission_denied");
 
         let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
         let leaked = fs::read_dir(staging)

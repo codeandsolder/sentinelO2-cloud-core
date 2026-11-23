@@ -422,16 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_record_is_non_fatal_and_clear_none_is_safe() {
-        assert!(
-            record(
-                Path::new("/proc/nonexistent/deep"),
-                "job_abc",
-                &event("job_abc")
-            )
-            .is_none()
-        );
+    fn failed_record_is_non_fatal_and_clear_none_is_safe() -> TestResult {
+        let directory = tempfile::tempdir().test_value()?;
+        let not_a_directory = directory.path().join("file");
+        std::fs::write(&not_a_directory, b"x").test_value()?;
+        assert!(record(&not_a_directory, "job_abc", &event("job_abc")).is_none());
         clear(None);
+        Ok(())
     }
 
     #[test]
