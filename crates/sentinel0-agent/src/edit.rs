@@ -4,15 +4,18 @@ use crate::{
     policy::Policy,
     process_runner::{self, ProcessFailure, ProcessGroupKill, ProcessOutcome, RunOptions},
 };
+#[cfg(unix)]
 use rand::RngExt;
 use regex::RegexBuilder;
 use serde_json::{Map, Value};
 use similar::{ChangeTag, TextDiff};
 #[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -23,11 +26,6 @@ fn portable_mode(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
     meta.permissions().mode() & 0o7777
 }
-#[cfg(windows)]
-fn portable_mode(_meta: &fs::Metadata) -> u32 {
-    0
-}
-
 const MODES: &[&str] = &[
     "replace",
     "regex",
@@ -633,6 +631,7 @@ fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
     ))
 }
 
+#[cfg(unix)]
 fn write_in_place_preserving_metadata(target: &Path, content: &str) -> Result<(), HandlerError> {
     let mut destination = OpenOptions::new()
         .write(true)
@@ -755,6 +754,7 @@ fn ensure_parent_dirs(parent: &Path) -> Result<CreatedParentDirs, HandlerError> 
     Ok(created)
 }
 
+#[cfg(unix)]
 fn require_recovery_backup(recovery_backup: Option<&Path>) -> Result<&Path, HandlerError> {
     recovery_backup.ok_or_else(|| {
         HandlerError::new(
@@ -779,6 +779,9 @@ fn create_replacement_temp(
     );
     let mut builder = tempfile::Builder::new();
     builder.prefix(&prefix).suffix(".tmp");
+    #[cfg(windows)]
+    let _ = original_meta;
+    #[cfg(unix)]
     if original_meta.is_none() {
         // Match OpenOptions::create_new's ordinary creation mode for new files;
         // tempfile defaults to 0600 unless told otherwise. The process umask is
@@ -849,6 +852,7 @@ fn preserve_replacement_metadata(
     }
 }
 
+#[cfg(unix)]
 fn write_with_recovery(
     target: &Path,
     content: &str,
@@ -931,8 +935,10 @@ fn atomic_replace(
     Ok(false)
 }
 
+#[cfg(unix)]
 const SUDO_EDIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[cfg(unix)]
 async fn run_sudo_edit_step(
     policy: &Policy,
     argv: &[String],
@@ -979,6 +985,7 @@ async fn run_sudo_edit_step(
     }
 }
 
+#[cfg(unix)]
 async fn cleanup_sudo_temp(policy: &Policy, temp: &Path, context: &str) -> Option<String> {
     let argv = vec![
         policy.tooling.command("sudo").display().to_string(),
@@ -994,6 +1001,7 @@ async fn cleanup_sudo_temp(policy: &Policy, temp: &Path, context: &str) -> Optio
         .map(|error| error.message)
 }
 
+#[cfg(unix)]
 async fn cleanup_sudo_dirs(policy: &Policy, dirs: &[PathBuf]) {
     for dir in dirs {
         let argv = vec![
@@ -1013,6 +1021,7 @@ async fn cleanup_sudo_dirs(policy: &Policy, dirs: &[PathBuf]) {
     }
 }
 
+#[cfg(unix)]
 async fn run_sudo_commit_new(
     policy: &Policy,
     source: &Path,
@@ -1471,6 +1480,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn in_place_fallback_requires_a_durable_recovery_copy() -> TestResult {
         let error = require_recovery_backup(None).test_error()?;

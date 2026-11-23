@@ -1,34 +1,13 @@
-use std::{
-    fs::{self, OpenOptions},
-    io,
-    path::Path,
-};
+use std::{fs, io, path::Path};
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// Atomically move a file or directory without clobbering an existing
+/// destination, on every platform with native exclusive-rename support.
+///
 /// # Errors
-/// Returns an I/O error when the source cannot be renamed to the destination without replacement.
+/// Returns a filesystem error for an occupied destination, unsupported
+/// filesystems or inaccessible paths.
 pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
-
-    renameat2(AT_FDCWD, src, AT_FDCWD, dst, RenameFlags::RENAME_NOREPLACE)
-        .map_err(|error| io::Error::from_raw_os_error(error as i32))
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-/// # Errors
-/// Returns an I/O error when the source cannot be renamed to the destination without replacement.
-pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(dst) {
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("destination already exists: {}", dst.display()),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    std::fs::rename(src, dst)
+    renamest::rename_exclusive(src, dst)
 }
 
 #[cfg(unix)]
@@ -44,7 +23,7 @@ fn same_empty_file(path: &Path, expected: &fs::Metadata) -> bool {
 
 #[cfg(unix)]
 fn replace_reserved_file(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt as _};
     let reservation = OpenOptions::new()
         .write(true)
         .create_new(true)

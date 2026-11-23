@@ -42,6 +42,7 @@ access. `chmod` and `chown` are Unix-mode operations and report
   stop, status); restart via PowerShell `Restart-Service`.
 - Subprocess timeouts and cancellation: terminate Windows process trees using
   `taskkill.exe /T /F`.
+- Local API: stdio JSON-RPC transport. Unix-domain socket endpoints remain Unix-only.
 - File transfers, structured edits, local audit, WebSocket authentication and
   reconnects: reuse the portable agent code.
 

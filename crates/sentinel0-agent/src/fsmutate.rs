@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
 fn resolve_rw(policy: &Policy, raw: &str, label: &str) -> Result<PathBuf, HandlerError> {
     resolve_checked_rw(policy, raw, label, Policy::resolve_path)
 }

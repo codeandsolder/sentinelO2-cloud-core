@@ -185,10 +185,15 @@ fn persist_rotated_to(
         hub,
     })?;
 
-    let mut options = AtomicOpenOptions::new();
-    options.preserve_mode(false).try_preserve_owner(false);
     #[cfg(unix)]
-    options.mode(0o600);
+    let mut options = AtomicOpenOptions::new();
+    #[cfg(windows)]
+    let options = AtomicOpenOptions::new();
+    #[cfg(unix)]
+    {
+        options.preserve_mode(false).try_preserve_owner(false);
+        options.mode(0o600);
+    }
     let mut file = options.open(path)?;
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;

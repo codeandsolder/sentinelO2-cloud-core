@@ -9,14 +9,13 @@ use serde_json::{Map, Value};
 #[cfg(target_os = "linux")]
 use std::collections::{HashSet, VecDeque};
 use std::{
-    env,
-    ffi::OsString,
-    fmt::Write as _,
-    io,
-    path::{Path, PathBuf},
+    env, io,
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::{ffi::OsString, fmt::Write as _, path::PathBuf};
 use tokio::{io::AsyncWriteExt as _, process::Command, task::JoinHandle};
 
 #[cfg(unix)]
@@ -80,13 +79,13 @@ fn descendant_snapshot(root: Option<u32>) -> Vec<ProcessIdentity> {
     out
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 #[derive(Clone, Copy, Debug)]
 struct ProcessIdentity {
     pid: u32,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn descendant_snapshot(_root: Option<u32>) -> Vec<ProcessIdentity> {
     Vec::new()
 }
@@ -96,11 +95,12 @@ fn identity_is_current(identity: ProcessIdentity) -> bool {
     process_identity(identity.pid).is_some_and(|current| current.start_time == identity.start_time)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 const fn identity_is_current(_identity: ProcessIdentity) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn combine_messages(left: Option<String>, right: Option<String>) -> Option<String> {
     match (left, right) {
         (None, None) => None,
@@ -124,17 +124,32 @@ fn fallback_result(
 #[derive(Clone, Debug)]
 pub enum ProcessGroupKill {
     Direct,
-    Sudo { command: PathBuf, path: OsString },
+    #[cfg(unix)]
+    Sudo {
+        command: PathBuf,
+        path: OsString,
+    },
 }
 
 impl ProcessGroupKill {
     /// # Errors
     /// Returns an error when the configured tool search path cannot be represented safely.
+    #[cfg(unix)]
     pub fn sudo(policy: &Policy) -> Result<Self, HandlerError> {
         Ok(Self::Sudo {
             command: policy.tooling.command("sudo"),
             path: policy.tooling.path_env()?,
         })
+    }
+
+    #[cfg(windows)]
+    /// # Errors
+    /// Elevated process execution is intentionally unsupported on Windows.
+    pub fn sudo(_policy: &Policy) -> Result<Self, HandlerError> {
+        Err(HandlerError::new(
+            "unsupported_platform",
+            "sudo is a Unix-only operation",
+        ))
     }
 
     #[cfg(unix)]
@@ -147,11 +162,6 @@ impl ProcessGroupKill {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => None,
             Err(error) => Some(format!("failed killing process group {pid}: {error}")),
         }
-    }
-
-    #[cfg(not(unix))]
-    fn direct_kill_group(_pid: Option<u32>) -> Option<String> {
-        None
     }
 
     #[cfg(unix)]
@@ -170,11 +180,6 @@ impl ProcessGroupKill {
         }
         (!errors.is_empty())
             .then(|| format!("failed killing descendant PIDs: {}", errors.join(", ")))
-    }
-
-    #[cfg(not(unix))]
-    fn direct_kill_descendants(_descendants: &[ProcessIdentity]) -> Option<String> {
-        None
     }
 
     #[cfg(unix)]
@@ -665,6 +670,7 @@ pub async fn run_argv(
 ///
 /// # Errors
 /// Returns a typed failure for setup, spawn, input/output I/O, or process cleanup failures.
+#[cfg(unix)]
 pub async fn run_bash_argv(
     policy: &Policy,
     argv: &[String],

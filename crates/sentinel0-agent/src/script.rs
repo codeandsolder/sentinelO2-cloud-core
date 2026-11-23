@@ -13,10 +13,11 @@ use crate::{
 };
 use serde_json::{Map, Value};
 #[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -392,6 +393,7 @@ async fn stage_python_runtime(workdir: &Path) -> Result<(), HandlerError> {
     async_fs::write(&path, source)
         .await
         .map_err(|error| staging_oserror(&error, &path))?;
+    #[cfg(unix)]
     async_fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
         .await
         .map_err(|error| staging_oserror(&error, &path))?;

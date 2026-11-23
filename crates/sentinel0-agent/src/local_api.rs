@@ -1,26 +1,55 @@
+#[cfg(unix)]
+use crate::process_output::CapturedOutput;
+#[cfg(unix)]
+use crate::process_runner::{ProcessFailure, ProcessOutcome, RunOptions, run_argv_with_limits};
 use crate::{
     handler_error::{HandlerError, HandlerResult},
     policy::Policy,
-    process_output::CapturedOutput,
-    process_runner::{
-        ProcessFailure, ProcessGroupGuard, ProcessGroupKill, ProcessOutcome, RunOptions,
-        run_argv_with_limits,
-    },
+    process_runner::{ProcessGroupGuard, ProcessGroupKill},
 };
 use serde_json::{Map, Value, json};
+#[cfg(unix)]
+use std::io::{Read as _, Write as _};
 use std::{
     collections::BTreeMap,
-    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     time::timeout,
 };
+
+#[cfg(windows)]
+fn unix_transport_not_supported() -> HandlerError {
+    HandlerError::new(
+        "unsupported_platform",
+        "Unix socket local API transport is unavailable on Windows; use stdio JSON-RPC",
+    )
+}
+
+#[cfg(windows)]
+async fn call_http(
+    _endpoint: &Endpoint,
+    _action: &Action,
+    _params: &Map<String, Value>,
+) -> Result<Value, HandlerError> {
+    Err(unix_transport_not_supported())
+}
+
+#[cfg(windows)]
+async fn call_jsonrpc(
+    _policy: &Policy,
+    _endpoint: &Endpoint,
+    _action: &Action,
+    _params: &Map<String, Value>,
+) -> Result<Value, HandlerError> {
+    Err(unix_transport_not_supported())
+}
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const STDIO_EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -29,6 +58,7 @@ const STDERR_TAIL_BYTES: usize = 8 * 1024;
 const MAX_SKIPPED_MESSAGES: usize = 1000;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
+#[cfg(unix)]
 fn relay_command(
     policy: &Policy,
     endpoint: &Endpoint,
@@ -130,7 +160,7 @@ pub fn run_local_api_relay(path: &Path, timeout_seconds: f64) -> i32 {
 
     #[cfg(not(unix))]
     {
-        drop((path, timeout_seconds));
+        let _ = (path, timeout_seconds);
         eprintln!("local_api relay requires a Unix-domain socket");
         3
     }
@@ -624,6 +654,7 @@ fn param_names(action: &Action) -> Vec<String> {
     names
 }
 
+#[cfg(unix)]
 fn percent_encode(value: &str) -> String {
     value
         .bytes()
@@ -637,6 +668,7 @@ fn percent_encode(value: &str) -> String {
         .collect()
 }
 
+#[cfg(unix)]
 fn render(template: &str, params: &Map<String, Value>) -> Result<String, HandlerError> {
     let mut output = template.to_owned();
     for (key, value) in params {
@@ -691,6 +723,7 @@ fn project(data: Value, select: &[String]) -> Value {
     }
 }
 
+#[cfg(unix)]
 async fn connect(endpoint: &Endpoint) -> Result<UnixStream, HandlerError> {
     if endpoint.transport != "unix" {
         return Err(HandlerError::new(
@@ -751,6 +784,7 @@ where
     }
 }
 
+#[cfg(unix)]
 fn http_error(endpoint: &Endpoint, error: &reqwest::Error) -> HandlerError {
     if error.is_timeout() {
         HandlerError::new(
@@ -767,6 +801,7 @@ fn http_error(endpoint: &Endpoint, error: &reqwest::Error) -> HandlerError {
     }
 }
 
+#[cfg(unix)]
 async fn decode_http_response(
     endpoint: &Endpoint,
     mut response: reqwest::Response,
@@ -818,6 +853,7 @@ async fn decode_http_response(
     }
 }
 
+#[cfg(unix)]
 async fn call_http(
     endpoint: &Endpoint,
     action: &Action,
@@ -863,6 +899,7 @@ async fn call_http(
     decode_http_response(endpoint, response).await
 }
 
+#[cfg(unix)]
 fn interpret_relay_output(
     endpoint: &Endpoint,
     executable: &Path,
@@ -916,6 +953,7 @@ fn interpret_relay_output(
     ))
 }
 
+#[cfg(unix)]
 async fn call_via_run_as(
     policy: &Policy,
     endpoint: &Endpoint,
@@ -992,6 +1030,7 @@ async fn call_via_run_as(
     }
 }
 
+#[cfg(unix)]
 async fn call_jsonrpc(
     policy: &Policy,
     endpoint: &Endpoint,
@@ -1111,6 +1150,8 @@ fn configure_stdio_environment(
 }
 
 fn stdio_binary_problem(path: &Path, run_as: bool) -> Option<(&'static str, String)> {
+    #[cfg(windows)]
+    let _ = run_as;
     if !path.is_absolute() {
         return Some((
             "endpoint_unreachable",
@@ -1949,6 +1990,7 @@ actions:
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_template_param_is_explicit() -> TestResult {
         let error = render("/containers/{id}/json", &Map::new()).test_error()?;
