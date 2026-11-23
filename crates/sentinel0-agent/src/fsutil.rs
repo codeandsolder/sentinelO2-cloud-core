@@ -54,6 +54,7 @@ fn replace_reserved_file(src: &Path, dst: &Path) -> io::Result<()> {
 /// Returns `AlreadyExists` if the destination is occupied, `CrossesDevices` if
 /// the source must first be copied beside the destination, or the underlying I/O
 /// error when the commit cannot be completed.
+#[cfg(unix)]
 pub fn install_file_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
     match fs::hard_link(src, dst) {
         Ok(()) => {
@@ -72,11 +73,21 @@ pub fn install_file_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => Err(error),
-        #[cfg(unix)]
         Err(_) => replace_reserved_file(src, dst),
-        #[cfg(windows)]
-        Err(error) => Err(error),
     }
+}
+
+#[cfg(windows)]
+/// Installs a regular file with a native no-replace rename.
+///
+/// A single exclusive move works on Windows filesystems without hard-link
+/// support and never exposes a destination containing partial bytes.
+///
+/// # Errors
+/// Returns an I/O error if the destination already exists or the filesystem
+/// cannot atomically move the staged file into place.
+pub fn install_file_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
+    rename_no_replace(src, dst)
 }
 
 /// Returns the normal regular-file creation mode after the current process umask.
@@ -129,6 +140,19 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read_to_string(src).test_value()?, "source");
         assert_eq!(std::fs::read_to_string(dst).test_value()?, "destination");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_install_moves_without_leaving_source() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let src = dir.path().join("pending");
+        let dst = dir.path().join("committed");
+        std::fs::write(&src, b"payload").test_value()?;
+        install_file_no_replace(&src, &dst).test_value()?;
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(dst).test_value()?, b"payload");
         Ok(())
     }
 
