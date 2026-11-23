@@ -25,7 +25,7 @@ jobs:
     name: Rust Linux tests
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@e39ba876b351c5ea4bc01ac906305729b2fe7565 # main
     with:
       runner: ubuntu-26.04
       command: |
@@ -47,14 +47,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Resolve the native quarantined compiler
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@e39ba876b351c5ea4bc01ac906305729b2fe7565 # main
       - name: Install pinned Rust
         run: rustup show active-toolchain
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-fuzz
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@e39ba876b351c5ea4bc01ac906305729b2fe7565 # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Protocol JSON
@@ -63,7 +63,7 @@ jobs:
         run: cargo fuzz run binary_frame --target x86_64-unknown-linux-gnu -- -runs=10000
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@e39ba876b351c5ea4bc01ac906305729b2fe7565 # main
 
   release:
     name: Release binary
@@ -77,11 +77,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Resolve the native quarantined compiler
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@e39ba876b351c5ea4bc01ac906305729b2fe7565 # main
       - name: Install pinned Rust
         run: rustup show active-toolchain
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@e39ba876b351c5ea4bc01ac906305729b2fe7565 # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Build
@@ -90,7 +90,7 @@ jobs:
         run: ./target/release/sentinelx-core --help >/dev/null
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7b23cbecfad3c032467c8e31bae2837cff7d18db # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@e39ba876b351c5ea4bc01ac906305729b2fe7565 # main
       - name: Checksum
         run: (cd target/release && sha256sum sentinelx-core > sentinelx-core.sha256)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
