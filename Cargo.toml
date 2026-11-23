@@ -63,3 +63,6 @@ suspicious = "warn"
 complexity = "warn"
 perf = "warn"
 style = "warn"
+
+[patch.crates-io]
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "3ffe503ac2261d625a1fa9a78999fedeb0cdfc92" }
