@@ -83,15 +83,34 @@ pub async fn run_shell(
     cwd: Option<&str>,
     env: Option<&Map<String, Value>>,
 ) -> HandlerResult {
-    let bash = policy.tooling.command("bash").display().to_string();
+    #[cfg(unix)]
     let argv = [
-        bash,
+        policy.tooling.command("bash").display().to_string(),
         "--noprofile".into(),
         "--norc".into(),
         "-c".into(),
         command.into(),
     ];
+    #[cfg(windows)]
+    let argv = [
+        policy.tooling.command("cmd").display().to_string(),
+        "/D".into(),
+        "/S".into(),
+        "/C".into(),
+        command.into(),
+    ];
+    #[cfg(unix)]
     let outcome = process_runner::run_bash_argv(
+        policy,
+        &argv,
+        timeout_duration,
+        cwd.map(Path::new),
+        env,
+        ProcessGroupKill::Direct,
+    )
+    .await;
+    #[cfg(windows)]
+    let outcome = process_runner::run_argv(
         policy,
         &argv,
         timeout_duration,
@@ -119,7 +138,7 @@ pub async fn run_shell(
         Err(ProcessFailure::Setup(error)) => Err(error),
         Err(ProcessFailure::Spawn(error)) => Err(HandlerError::new(
             "exec_failed",
-            format!("failed starting Bash: {error}"),
+            format!("failed starting shell: {error}"),
         )),
         Err(ProcessFailure::Capture {
             error,
@@ -145,6 +164,7 @@ mod tests {
 
     const SUCCESS_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_merges_stdout_and_stderr_like_python_core() -> TestResult {
         let result = run_shell(
@@ -159,6 +179,33 @@ mod tests {
         assert_eq!(result["returncode"], 0);
         assert_eq!(result["output"], "out\nerr");
 
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cmd_runs_in_requested_directory() -> TestResult {
+        let dir = tempfile::tempdir().test_value()?;
+        let result = run_shell(
+            &Policy::default(),
+            "echo native-windows && cd",
+            SUCCESS_TEST_TIMEOUT,
+            dir.path().to_str(),
+            None,
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["returncode"], 0);
+        assert!(
+            result["output"]
+                .as_str()
+                .is_some_and(|s| s.contains("native-windows"))
+        );
+        assert!(
+            result["output"]
+                .as_str()
+                .is_some_and(|s| s.contains(dir.path().to_str().unwrap_or_default()))
+        );
         Ok(())
     }
 
@@ -179,6 +226,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn empty_output_uses_legacy_marker() -> TestResult {
         let result = run_shell(&Policy::default(), "true", SUCCESS_TEST_TIMEOUT, None, None)
@@ -189,6 +237,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_ignores_profiles_bash_env_and_exported_functions() -> TestResult {
         let dir = tempfile::tempdir().test_value()?;

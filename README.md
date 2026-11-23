@@ -40,6 +40,9 @@ that release delta, changed files, release notes and relevant patch excerpts.
 The port/update commit advances that component's baseline and closes its issue.
 This keeps routine upstream ports mechanical and leaves a clean release history.
 
+Native Windows agent support is being added; platform-specific setup and semantics are
+documented in [docs/windows.md](docs/windows.md).
+
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact matched surface,
 intentional deviations, and remaining differential/packaging work. Runtime tool resolution and executable overrides are documented in
 [docs/tooling.md](docs/tooling.md).

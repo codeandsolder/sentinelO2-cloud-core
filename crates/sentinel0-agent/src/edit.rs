@@ -8,14 +8,25 @@ use rand::RngExt;
 use regex::RegexBuilder;
 use serde_json::{Map, Value};
 use similar::{ChangeTag, TextDiff};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+fn portable_mode(meta: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o7777
+}
+#[cfg(windows)]
+fn portable_mode(_meta: &fs::Metadata) -> u32 {
+    0
+}
 
 const MODES: &[&str] = &[
     "replace",
@@ -794,23 +805,31 @@ fn preserve_replacement_metadata(
     recovery_backup: Option<&Path>,
 ) -> Result<bool, HandlerError> {
     temp.as_file()
-        .set_permissions(fs::Permissions::from_mode(meta.mode()))
+        .set_permissions(meta.permissions())
         .map_err(|error| {
             HandlerError::new(
                 "write_failed",
                 format!("failed preserving permissions: {error}"),
             )
         })?;
+    #[cfg(windows)]
+    {
+        let _ = (target, content, recovery_backup);
+        return Ok(false);
+    }
+    #[cfg(unix)]
     let candidate_meta = temp.as_file().metadata().map_err(|error| {
         HandlerError::new(
             "write_failed",
             format!("failed reading replacement metadata: {error}"),
         )
     })?;
+    #[cfg(unix)]
     if candidate_meta.uid() == meta.uid() && candidate_meta.gid() == meta.gid() {
         return Ok(false);
     }
 
+    #[cfg(unix)]
     match nix::unistd::chown(
         temp.path(),
         Some(nix::unistd::Uid::from_raw(meta.uid())),
@@ -1054,6 +1073,19 @@ async fn run_sudo_commit_new(
     }
 }
 
+#[cfg(windows)]
+async fn sudo_replace(
+    _policy: &Policy,
+    _target: &Path,
+    _staged: &Path,
+    _original_meta: Option<&fs::Metadata>,
+) -> Result<(), HandlerError> {
+    Err(HandlerError::new(
+        "unsupported_platform",
+        "sudo edits are Unix-only",
+    ))
+}
+#[cfg(unix)]
 async fn sudo_replace(
     policy: &Policy,
     target: &Path,
@@ -1085,7 +1117,7 @@ async fn sudo_replace(
     if let Some(meta) = original_meta {
         install.extend([
             "-m".into(),
-            format!("{:o}", meta.mode() & 0o7777),
+            format!("{:o}", portable_mode(&meta)),
             "-o".into(),
             meta.uid().to_string(),
             "-g".into(),
@@ -1470,6 +1502,7 @@ mod tests {
         false
     }
 
+    #[cfg(target_os = "linux")]
     async fn wait_for_process_exit(pid: i32) -> bool {
         for _ in 0..150 {
             let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
@@ -1490,6 +1523,7 @@ mod tests {
         false
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cancelling_edit_kills_escaped_validator_descendants_before_any_commit() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -1714,6 +1748,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn in_place_fallback_keeps_inode_and_metadata() -> TestResult {
         let dir = tempdir().test_value()?;

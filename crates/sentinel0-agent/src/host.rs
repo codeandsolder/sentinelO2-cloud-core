@@ -1,6 +1,10 @@
 use sentinel0_proto::HostInfo;
-use std::{fs, path::Path};
+#[cfg(unix)]
+use std::fs;
+#[cfg(any(unix, test))]
+use std::path::Path;
 
+#[cfg(unix)]
 fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path)
         .ok()
@@ -9,6 +13,7 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
 }
 
 #[must_use = "the returned hostname identifies the local machine"]
+#[cfg(unix)]
 pub fn hostname() -> String {
     read_trimmed("/proc/sys/kernel/hostname")
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -16,11 +21,13 @@ pub fn hostname() -> String {
 }
 
 #[must_use = "the result contains the kernel release when it can be determined"]
+#[cfg(unix)]
 pub fn kernel() -> Option<String> {
     read_trimmed("/proc/sys/kernel/osrelease")
 }
 
 #[must_use = "the result identifies the operating system distribution when available"]
+#[cfg(unix)]
 pub fn distro() -> Option<String> {
     let text = fs::read_to_string("/etc/os-release").ok()?;
     text.lines().find_map(|line| {
@@ -31,6 +38,7 @@ pub fn distro() -> Option<String> {
 }
 
 #[must_use = "the result identifies the CPU model when available"]
+#[cfg(unix)]
 pub fn cpu_model() -> Option<String> {
     let text = fs::read_to_string("/proc/cpuinfo").ok()?;
     text.lines().find_map(|line| {
@@ -44,6 +52,7 @@ pub fn cpu_model() -> Option<String> {
 }
 
 #[must_use = "the result reports the total memory capacity when available"]
+#[cfg(unix)]
 pub fn mem_total_bytes() -> Option<u64> {
     let text = fs::read_to_string("/proc/meminfo").ok()?;
     text.lines().find_map(|line| {
@@ -54,6 +63,7 @@ pub fn mem_total_bytes() -> Option<u64> {
 }
 
 #[must_use = "the returned classification describes the machine environment"]
+#[cfg(unix)]
 pub fn machine_type() -> String {
     let osrelease = read_trimmed("/proc/sys/kernel/osrelease")
         .unwrap_or_default()
@@ -124,7 +134,7 @@ pub fn gather_host_info(
     HostInfo {
         id: host_id,
         hostname: hostname(),
-        os: distro().unwrap_or_else(|| "linux".into()),
+        os: distro().unwrap_or_else(|| std::env::consts::OS.into()),
         kernel: kernel(),
         arch: Some(std::env::consts::ARCH.into()),
         cpu_model: cpu_model(),
@@ -142,12 +152,14 @@ pub fn gather_host_info(
 }
 
 #[must_use = "the result reports the elapsed host uptime when available"]
+#[cfg(unix)]
 pub fn uptime_seconds() -> Option<f64> {
     let text = fs::read_to_string("/proc/uptime").ok()?;
     text.split_whitespace().next()?.parse().ok()
 }
 
 #[must_use = "the result reports the host load averages when available"]
+#[cfg(unix)]
 pub fn loadavg() -> Option<[f64; 3]> {
     let text = fs::read_to_string("/proc/loadavg").ok()?;
     let mut fields = text.split_whitespace();
@@ -156,6 +168,47 @@ pub fn loadavg() -> Option<[f64; 3]> {
         fields.next()?.parse().ok()?,
         fields.next()?.parse().ok()?,
     ])
+}
+
+#[cfg(windows)]
+#[must_use]
+pub fn hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into())
+}
+#[cfg(windows)]
+#[must_use]
+pub fn kernel() -> Option<String> {
+    Some("Windows NT".into())
+}
+#[cfg(windows)]
+#[must_use]
+pub fn distro() -> Option<String> {
+    Some("Windows".into())
+}
+#[cfg(windows)]
+#[must_use]
+pub fn cpu_model() -> Option<String> {
+    std::env::var("PROCESSOR_IDENTIFIER").ok()
+}
+#[cfg(windows)]
+#[must_use]
+pub const fn mem_total_bytes() -> Option<u64> {
+    None
+}
+#[cfg(windows)]
+#[must_use]
+pub fn machine_type() -> String {
+    "unknown".into()
+}
+#[cfg(windows)]
+#[must_use]
+pub const fn uptime_seconds() -> Option<f64> {
+    None
+}
+#[cfg(windows)]
+#[must_use]
+pub const fn loadavg() -> Option<[f64; 3]> {
+    None
 }
 
 #[cfg(test)]

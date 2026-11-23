@@ -6,8 +6,9 @@ use crate::{
     },
 };
 use serde_json::{Map, Value};
+#[cfg(target_os = "linux")]
+use std::collections::{HashSet, VecDeque};
 use std::{
-    collections::{HashSet, VecDeque},
     env,
     ffi::OsString,
     fmt::Write as _,
@@ -108,6 +109,7 @@ fn combine_messages(left: Option<String>, right: Option<String>) -> Option<Strin
     }
 }
 
+#[cfg(unix)]
 fn fallback_result(
     primary_error: Option<String>,
     fallback_error: Option<String>,
@@ -279,9 +281,22 @@ impl ProcessGroupKill {
         }
     }
 
-    #[cfg(not(unix))]
-    async fn kill(&self, _pid: Option<u32>) -> Option<String> {
-        None
+    #[cfg(windows)]
+    async fn kill(&self, pid: Option<u32>) -> Option<String> {
+        let Some(pid) = pid else {
+            return Some("child PID was unavailable; process tree could not be terminated".into());
+        };
+        let mut command = Command::new("taskkill.exe");
+        command.args(["/T", "/F", "/PID", &pid.to_string()]);
+        match tokio::time::timeout(POST_TIMEOUT_GRACE, command.output()).await {
+            Ok(Ok(output)) if output.status.success() => None,
+            Ok(Ok(output)) => Some(format!(
+                "taskkill process tree {pid} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Ok(Err(error)) => Some(format!("taskkill process tree {pid}: {error}")),
+            Err(_) => Some(format!("taskkill process tree {pid} timed out")),
+        }
     }
 
     #[cfg(unix)]
@@ -333,9 +348,29 @@ impl ProcessGroupKill {
         }
     }
 
-    #[cfg(not(unix))]
-    fn kill_blocking(&self, _pid: Option<u32>) -> Option<String> {
-        None
+    #[cfg(windows)]
+    fn kill_blocking(&self, pid: Option<u32>) -> Option<String> {
+        let Some(pid) = pid else {
+            return Some("child PID was unavailable; process tree could not be terminated".into());
+        };
+        let mut child = match std::process::Command::new("taskkill.exe")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => return Some(format!("taskkill process tree {pid}: {error}")),
+        };
+        use wait_timeout::ChildExt as _;
+        match child.wait_timeout(POST_TIMEOUT_GRACE) {
+            Ok(Some(status)) if status.success() => None,
+            Ok(Some(status)) => Some(format!("taskkill process tree {pid} exited {status}")),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Some(format!("taskkill process tree {pid} timed out"))
+            }
+            Err(error) => Some(format!("taskkill process tree {pid}: {error}")),
+        }
     }
 }
 

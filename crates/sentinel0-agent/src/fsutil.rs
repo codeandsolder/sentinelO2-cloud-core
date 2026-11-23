@@ -1,7 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
     io,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
 };
 
@@ -32,7 +31,9 @@ pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
     std::fs::rename(src, dst)
 }
 
+#[cfg(unix)]
 fn same_empty_file(path: &Path, expected: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
     fs::symlink_metadata(path).is_ok_and(|current| {
         current.dev() == expected.dev()
             && current.ino() == expected.ino()
@@ -41,7 +42,9 @@ fn same_empty_file(path: &Path, expected: &fs::Metadata) -> bool {
     })
 }
 
+#[cfg(unix)]
 fn replace_reserved_file(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let reservation = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -90,7 +93,10 @@ pub fn install_file_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => Err(error),
+        #[cfg(unix)]
         Err(_) => replace_reserved_file(src, dst),
+        #[cfg(windows)]
+        Err(error) => Err(error),
     }
 }
 
@@ -101,6 +107,7 @@ pub fn install_file_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
 ///
 /// # Errors
 /// Returns an I/O error if the temporary mode probe cannot be created or inspected.
+#[cfg(unix)]
 pub fn regular_create_mode(parent: &Path) -> io::Result<u32> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -146,6 +153,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn reservation_failure_removes_only_its_own_empty_placeholder() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -165,4 +173,12 @@ mod tests {
         assert_ne!(mode, 0);
         Ok(())
     }
+}
+
+#[cfg(windows)]
+/// Windows files do not have POSIX create modes.
+/// # Errors
+/// This never fails.
+pub fn regular_create_mode(_parent: &Path) -> io::Result<u32> {
+    Ok(0o666)
 }

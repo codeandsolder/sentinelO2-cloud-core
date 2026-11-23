@@ -12,10 +12,11 @@ use crate::{
     staging,
 };
 use serde_json::{Map, Value};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -27,6 +28,7 @@ const TIMEOUT_MAX: u64 = 600;
 const PYTHON_RUNTIME_NAME: &str = "sentinelx_runtime.py";
 const PYTHON_RUNTIME_SOURCE: &str = python_runtime_source::SOURCE;
 
+#[cfg(unix)]
 fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
     match error.raw_os_error() {
         Some(code) if code == nix::libc::ENOSPC => HandlerError::new(
@@ -58,6 +60,20 @@ fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
             ),
         ),
     }
+}
+
+#[cfg(windows)]
+fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
+    let code = match error.raw_os_error() {
+        Some(112) => "no_space",
+        Some(19) => "read_only_filesystem",
+        Some(5) => "permission_denied",
+        _ => "staging_failed",
+    };
+    HandlerError::new(
+        code,
+        format!("cannot prepare work area at {}: {error}", path.display()),
+    )
 }
 
 fn with_cleanup_detail(mut error: HandlerError, cleanup: Option<String>) -> HandlerError {
@@ -421,9 +437,11 @@ async fn prepare_script(
         let error = staging_oserror(&error, staged.script_path());
         return Err(staged.finish_error(error, request.cleanup));
     }
-    if let Err(error) =
+    #[cfg(unix)]
+    if let Err(error) = {
+        use std::os::unix::fs::PermissionsExt as _;
         async_fs::set_permissions(staged.script_path(), fs::Permissions::from_mode(0o700)).await
-    {
+    } {
         let error = staging_oserror(&error, staged.script_path());
         return Err(staged.finish_error(error, request.cleanup));
     }
@@ -589,6 +607,7 @@ mod tests {
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
     use tempfile::tempdir;
 
+    #[cfg(unix)]
     #[test]
     fn staging_host_conditions_have_specific_error_codes() {
         let path = Path::new("/var/lib/sentinelx/uploads/.sentinelx_uploads/script_job_x");

@@ -38,6 +38,20 @@ jobs:
         cargo test --locked --workspace --all-targets
       rustflags: "-C target-cpu=x86-64-v2"
 
+  rust-windows:
+    name: Rust Windows native check and smoke
+    permissions:
+      contents: read
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+    with:
+      runner: windows-2025
+      command: |
+        cargo check --locked --workspace --all-targets
+        cargo test --locked -p sentinel0-proto
+        cargo test --locked -p sentinel0-agent --lib instance_lock::tests::
+        cargo test --locked -p sentinel0-agent --lib windows_cmd_runs_in_requested_directory
+        cargo test --locked -p sentinel0-agent --lib windows_service_invocation_uses_native_commands
+
   fuzz-smoke:
     name: Fuzz smoke
     if: startsWith(github.ref, 'refs/tags/')
