@@ -144,7 +144,9 @@ mod tests {
             std::process::id().to_string()
         );
 
-        match acquire_path(path.clone()) {
+        #[cfg(windows)]
+        let path_after_release = path.clone();
+        match acquire_path(path) {
             Err(InstanceLockError::AlreadyRunning { holder, .. }) => {
                 #[cfg(unix)]
                 assert_eq!(holder, Some(std::process::id()));
@@ -161,7 +163,7 @@ mod tests {
         drop(held);
         #[cfg(windows)]
         assert_eq!(
-            std::fs::read_to_string(&path).test_value()?,
+            std::fs::read_to_string(&path_after_release).test_value()?,
             std::process::id().to_string()
         );
         Ok(())
