@@ -959,9 +959,12 @@ mod tests {
             &Map::from_iter([
                 ("interpreter".into(), Value::String("powershell".into())),
                 ("content".into(), Value::String(
-                    "Write-Output 'reached step 1'; [Console]::Error.WriteLine('err1'); Start-Sleep -Seconds 10".into()
+                    // Cold PowerShell startup can exceed a few seconds on a busy
+                    // Windows CI host; test the running script's timeout, not
+                    // whether the interpreter started inside a 3-second window.
+                    "Write-Output 'reached step 1'; [Console]::Error.WriteLine('err1'); Start-Sleep -Seconds 60".into()
                 )),
-                ("timeout".into(), Value::from(3)),
+                ("timeout".into(), Value::from(15)),
             ]),
         ).await.test_value()?;
         let output = result["output"].as_str().test_value()?;
@@ -988,7 +991,10 @@ mod tests {
         ]);
         let task = tokio::spawn(async move { handle(&policy, &payload).await });
         let started = upload_base.join("started");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        // Wait for the script body before asserting cancellation semantics;
+        // interpreter startup on a saturated Windows runner is not bounded
+        // by a few seconds. A longer readiness cap costs nothing on fast hosts.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         while !started.exists() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
