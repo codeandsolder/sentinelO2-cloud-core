@@ -6,16 +6,16 @@ use crate::{
     },
 };
 use serde_json::{Map, Value};
+#[cfg(target_os = "linux")]
+use std::collections::{HashSet, VecDeque};
 use std::{
-    collections::{HashSet, VecDeque},
-    env,
-    ffi::OsString,
-    fmt::Write as _,
-    io,
-    path::{Path, PathBuf},
+    env, io,
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::{ffi::OsString, fmt::Write as _, path::PathBuf};
 use tokio::{io::AsyncWriteExt as _, process::Command, task::JoinHandle};
 
 #[cfg(unix)]
@@ -79,13 +79,13 @@ fn descendant_snapshot(root: Option<u32>) -> Vec<ProcessIdentity> {
     out
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 #[derive(Clone, Copy, Debug)]
 struct ProcessIdentity {
     pid: u32,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn descendant_snapshot(_root: Option<u32>) -> Vec<ProcessIdentity> {
     Vec::new()
 }
@@ -95,11 +95,12 @@ fn identity_is_current(identity: ProcessIdentity) -> bool {
     process_identity(identity.pid).is_some_and(|current| current.start_time == identity.start_time)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 const fn identity_is_current(_identity: ProcessIdentity) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn combine_messages(left: Option<String>, right: Option<String>) -> Option<String> {
     match (left, right) {
         (None, None) => None,
@@ -108,6 +109,7 @@ fn combine_messages(left: Option<String>, right: Option<String>) -> Option<Strin
     }
 }
 
+#[cfg(unix)]
 fn fallback_result(
     primary_error: Option<String>,
     fallback_error: Option<String>,
@@ -122,17 +124,32 @@ fn fallback_result(
 #[derive(Clone, Debug)]
 pub enum ProcessGroupKill {
     Direct,
-    Sudo { command: PathBuf, path: OsString },
+    #[cfg(unix)]
+    Sudo {
+        command: PathBuf,
+        path: OsString,
+    },
 }
 
 impl ProcessGroupKill {
     /// # Errors
     /// Returns an error when the configured tool search path cannot be represented safely.
+    #[cfg(unix)]
     pub fn sudo(policy: &Policy) -> Result<Self, HandlerError> {
         Ok(Self::Sudo {
             command: policy.tooling.command("sudo"),
             path: policy.tooling.path_env()?,
         })
+    }
+
+    #[cfg(windows)]
+    /// # Errors
+    /// Elevated process execution is intentionally unsupported on Windows.
+    pub fn sudo(_policy: &Policy) -> Result<Self, HandlerError> {
+        Err(HandlerError::new(
+            "unsupported_platform",
+            "sudo is a Unix-only operation",
+        ))
     }
 
     #[cfg(unix)]
@@ -145,11 +162,6 @@ impl ProcessGroupKill {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => None,
             Err(error) => Some(format!("failed killing process group {pid}: {error}")),
         }
-    }
-
-    #[cfg(not(unix))]
-    fn direct_kill_group(_pid: Option<u32>) -> Option<String> {
-        None
     }
 
     #[cfg(unix)]
@@ -168,11 +180,6 @@ impl ProcessGroupKill {
         }
         (!errors.is_empty())
             .then(|| format!("failed killing descendant PIDs: {}", errors.join(", ")))
-    }
-
-    #[cfg(not(unix))]
-    fn direct_kill_descendants(_descendants: &[ProcessIdentity]) -> Option<String> {
-        None
     }
 
     #[cfg(unix)]
@@ -279,9 +286,22 @@ impl ProcessGroupKill {
         }
     }
 
-    #[cfg(not(unix))]
-    async fn kill(&self, _pid: Option<u32>) -> Option<String> {
-        None
+    #[cfg(windows)]
+    async fn kill(&self, pid: Option<u32>) -> Option<String> {
+        let Some(pid) = pid else {
+            return Some("child PID was unavailable; process tree could not be terminated".into());
+        };
+        let mut command = Command::new("taskkill.exe");
+        command.args(["/T", "/F", "/PID", &pid.to_string()]);
+        match tokio::time::timeout(POST_TIMEOUT_GRACE, command.output()).await {
+            Ok(Ok(output)) if output.status.success() => None,
+            Ok(Ok(output)) => Some(format!(
+                "taskkill process tree {pid} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Ok(Err(error)) => Some(format!("taskkill process tree {pid}: {error}")),
+            Err(_) => Some(format!("taskkill process tree {pid} timed out")),
+        }
     }
 
     #[cfg(unix)]
@@ -333,9 +353,29 @@ impl ProcessGroupKill {
         }
     }
 
-    #[cfg(not(unix))]
-    fn kill_blocking(&self, _pid: Option<u32>) -> Option<String> {
-        None
+    #[cfg(windows)]
+    fn kill_blocking(&self, pid: Option<u32>) -> Option<String> {
+        let Some(pid) = pid else {
+            return Some("child PID was unavailable; process tree could not be terminated".into());
+        };
+        let mut child = match std::process::Command::new("taskkill.exe")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => return Some(format!("taskkill process tree {pid}: {error}")),
+        };
+        use wait_timeout::ChildExt as _;
+        match child.wait_timeout(POST_TIMEOUT_GRACE) {
+            Ok(Some(status)) if status.success() => None,
+            Ok(Some(status)) => Some(format!("taskkill process tree {pid} exited {status}")),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Some(format!("taskkill process tree {pid} timed out"))
+            }
+            Err(error) => Some(format!("taskkill process tree {pid}: {error}")),
+        }
     }
 }
 
@@ -630,6 +670,7 @@ pub async fn run_argv(
 ///
 /// # Errors
 /// Returns a typed failure for setup, spawn, input/output I/O, or process cleanup failures.
+#[cfg(unix)]
 pub async fn run_bash_argv(
     policy: &Policy,
     argv: &[String],

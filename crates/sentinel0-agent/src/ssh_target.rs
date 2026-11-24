@@ -1,11 +1,18 @@
 use crate::process_output::read_bounded_async;
+#[cfg(unix)]
 use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io, time::Duration};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+#[cfg(windows)]
+use std::process::Stdio;
+use std::{collections::BTreeMap, future::Future, io, process::ExitStatus, time::Duration};
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
+#[cfg(windows)]
+use tokio::process::Command;
 
 const CAPTURE_PER_STREAM: usize = 2 * 1024 * 1024;
+#[cfg(unix)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
 const SERVER_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const LOCAL_TIMEOUT_GRACE: u64 = 15;
 const REMOTE_EXEC: &str = r#"
@@ -224,6 +231,7 @@ fn remote_argv(request: &Request, prepared: &PreparedRequest) -> Result<Vec<Stri
     Ok(prepared.argv.clone())
 }
 
+#[cfg(unix)]
 fn remote_command<'a>(
     session: &'a Session,
     request: &Request,
@@ -252,6 +260,89 @@ fn error_response(id: u64, error: &(impl ToString + ?Sized)) -> Response {
     }
 }
 
+/// Share the framing, bounded stream capture and timeout behavior between
+/// OpenSSH session children on Unix and the native ssh.exe process on Windows.
+async fn capture_ssh<Stdin, Stdout, Stderr, Wait>(
+    request: &Request,
+    stdin: Option<Stdin>,
+    stdout: Option<Stdout>,
+    stderr: Option<Stderr>,
+    input: Option<Vec<u8>>,
+    wait: Wait,
+) -> Response
+where
+    Stdin: AsyncWrite + Unpin + Send + 'static,
+    Stdout: AsyncRead + Unpin + Send + 'static,
+    Stderr: AsyncRead + Unpin + Send + 'static,
+    Wait: Future<Output = Result<ExitStatus, String>>,
+{
+    let Some(stdout) = stdout else {
+        return error_response(request.id, "SSH child stdout was not piped");
+    };
+    let Some(stderr) = stderr else {
+        return error_response(request.id, "SSH child stderr was not piped");
+    };
+
+    let stdout_task = tokio::spawn(read_bounded_async(stdout, CAPTURE_PER_STREAM));
+    let stderr_task = tokio::spawn(read_bounded_async(stderr, CAPTURE_PER_STREAM));
+    let stdin_task = tokio::spawn(async move {
+        match (stdin, input) {
+            (Some(mut stdin), Some(input)) => stdin.write_all(&input).await,
+            (None, Some(_)) => Err(io::Error::other("SSH child stdin was not piped")),
+            (_, None) => Ok(()),
+        }
+    });
+
+    let local_limit =
+        Duration::from_secs(request.timeout_seconds.saturating_add(LOCAL_TIMEOUT_GRACE));
+    let collect = async move {
+        stdin_task
+            .await
+            .map_err(|error| format!("SSH stdin task failed: {error}"))?
+            .map_err(|error| format!("SSH stdin write failed: {error}"))?;
+        let stdout = stdout_task
+            .await
+            .map_err(|error| format!("SSH stdout task failed: {error}"))?
+            .map_err(|error| format!("SSH stdout read failed: {error}"))?;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| format!("SSH stderr task failed: {error}"))?
+            .map_err(|error| format!("SSH stderr read failed: {error}"))?;
+        // Drain both streams before waiting: OpenSSH may close its local process
+        // handles before separately held readers consume their final bytes.
+        let status = wait
+            .await
+            .map_err(|error| format!("SSH child wait failed: {error}"))?;
+        Ok::<_, String>((status, stdout, stderr))
+    };
+    let (status, stdout, stderr) = match tokio::time::timeout(local_limit, collect).await {
+        Ok(Ok(captured)) => captured,
+        Ok(Err(error)) => return error_response(request.id, &error),
+        Err(_) => {
+            return error_response(
+                request.id,
+                &format!(
+                    "SSH command exceeded local timeout after remote timeout of {}s",
+                    request.timeout_seconds
+                ),
+            );
+        }
+    };
+    let returncode = status.code().unwrap_or(-1);
+    Response {
+        id: request.id,
+        ok: returncode == 0,
+        returncode,
+        stdout: String::from_utf8_lossy(&stdout.rendered()).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.rendered()).into_owned(),
+        stdout_bytes: stdout.total_bytes(),
+        stderr_bytes: stderr.total_bytes(),
+        output_truncated: stdout.truncated() || stderr.truncated(),
+        error: None,
+    }
+}
+
+#[cfg(unix)]
 async fn execute(session: &Session, request: &Request) -> Response {
     let prepared = match prepare_request(request) {
         Ok(prepared) => prepared,
@@ -277,72 +368,66 @@ async fn execute(session: &Session, request: &Request) -> Response {
     let stdin = child.stdin().take();
     let stdout = child.stdout().take();
     let stderr = child.stderr().take();
-    let Some(stdout) = stdout else {
-        return error_response(request.id, "SSH child stdout was not piped");
+    capture_ssh(request, stdin, stdout, stderr, prepared.stdin, async move {
+        child.wait().await.map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[cfg(windows)]
+fn escaped_remote_argv(argv: &[String]) -> Result<String, String> {
+    shlex::try_join(argv.iter().map(String::as_str))
+        .map_err(|error| format!("invalid remote SSH argument: {error}"))
+}
+
+#[cfg(windows)]
+async fn execute_windows(destination: &str, request: &Request) -> Response {
+    let prepared = match prepare_request(request) {
+        Ok(prepared) => prepared,
+        Err(error) => return error_response(request.id, &error),
     };
-    let Some(stderr) = stderr else {
-        return error_response(request.id, "SSH child stderr was not piped");
+    let argv = match remote_argv(request, &prepared) {
+        Ok(argv) => argv,
+        Err(error) => return error_response(request.id, &error),
+    };
+    let remote = match escaped_remote_argv(&argv) {
+        Ok(remote) => remote,
+        Err(error) => return error_response(request.id, &error),
     };
 
-    let stdout_task = tokio::spawn(read_bounded_async(stdout, CAPTURE_PER_STREAM));
-    let stderr_task = tokio::spawn(read_bounded_async(stderr, CAPTURE_PER_STREAM));
-    let input_owned = prepared.stdin;
-    let stdin_task = tokio::spawn(async move {
-        match (stdin, input_owned) {
-            (Some(mut stdin), Some(input)) => stdin.write_all(&input).await,
-            (None, Some(_)) => Err(io::Error::other("SSH child stdin was not piped")),
-            (_, None) => Ok(()),
-        }
+    let mut command = Command::new("ssh.exe");
+    command.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=15",
+        destination,
+        &remote,
+    ]);
+    command.stdin(if prepared.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
     });
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.kill_on_drop(true);
 
-    let local_limit =
-        Duration::from_secs(request.timeout_seconds.saturating_add(LOCAL_TIMEOUT_GRACE));
-    let collect = async move {
-        let stdin_result = stdin_task
-            .await
-            .map_err(|error| format!("SSH stdin task failed: {error}"))?
-            .map_err(|error| format!("SSH stdin write failed: {error}"));
-        stdin_result?;
-        let stdout = stdout_task
-            .await
-            .map_err(|error| format!("SSH stdout task failed: {error}"))?
-            .map_err(|error| format!("SSH stdout read failed: {error}"))?;
-        let stderr = stderr_task
-            .await
-            .map_err(|error| format!("SSH stderr task failed: {error}"))?
-            .map_err(|error| format!("SSH stderr read failed: {error}"))?;
-        // openssh documents that wait() can terminate its local ssh process before
-        // separately-held pipe readers consume their final bytes. Drain both pipes
-        // to EOF first, then reap the remote child.
-        let status = child
-            .wait()
-            .await
-            .map_err(|error| format!("SSH child wait failed: {error}"))?;
-        Ok::<_, String>((status, stdout, stderr))
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return error_response(request.id, &error),
     };
-    let (status, stdout, stderr) = match tokio::time::timeout(local_limit, collect).await {
-        Ok(Ok(captured)) => captured,
-        Ok(Err(error)) => return error_response(request.id, &error),
-        Err(_) => {
-            let message = format!(
-                "SSH command exceeded local timeout after remote timeout of {}s",
-                request.timeout_seconds
-            );
-            return error_response(request.id, &message);
-        }
-    };
-    let returncode = status.code().unwrap_or(-1);
-    Response {
-        id: request.id,
-        ok: returncode == 0,
-        returncode,
-        stdout: String::from_utf8_lossy(&stdout.rendered()).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr.rendered()).into_owned(),
-        stdout_bytes: stdout.total_bytes(),
-        stderr_bytes: stderr.total_bytes(),
-        output_truncated: stdout.truncated() || stderr.truncated(),
-        error: None,
-    }
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    capture_ssh(request, stdin, stdout, stderr, prepared.stdin, async move {
+        child.wait().await.map_err(|error| error.to_string())
+    })
+    .await
 }
 
 async fn write_json_line<T: Serialize + Sync>(
@@ -362,12 +447,15 @@ async fn write_json_line<T: Serialize + Sync>(
 /// Returns an error if the OpenSSH session or helper protocol fails.
 pub async fn run_helper(destination: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     validate_destination(destination)?;
+    #[cfg(unix)]
     let mut builder = SessionBuilder::default();
+    #[cfg(unix)]
     builder
         .known_hosts_check(KnownHosts::Add)
         .connect_timeout(CONNECT_TIMEOUT)
         .server_alive_interval(SERVER_ALIVE_INTERVAL)
         .control_persist(ControlPersist::ClosedAfterInitialConnection);
+    #[cfg(unix)]
     let session = builder.connect(destination).await?;
 
     let stdin = tokio::io::stdin();
@@ -393,9 +481,13 @@ pub async fn run_helper(destination: &str) -> Result<(), Box<dyn std::error::Err
                 continue;
             }
         };
+        #[cfg(unix)]
         let response = execute(&session, &request).await;
+        #[cfg(windows)]
+        let response = execute_windows(destination, &request).await;
         write_json_line(&mut stdout, &response).await?;
     }
+    #[cfg(unix)]
     session.close().await?;
     Ok(())
 }
@@ -487,6 +579,19 @@ mod tests {
         }))
         .test_value()?;
         assert!(prepare_request(&request).is_err());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_argv_escapes_untrusted_shell_metacharacters() -> TestResult {
+        let argv = vec![
+            "printf".to_owned(),
+            "%s".to_owned(),
+            r#"spaces ; " ' \ $() backslash"#.to_owned(),
+        ];
+        let encoded = escaped_remote_argv(&argv).test_value()?;
+        assert_eq!(shlex::split(&encoded), Some(argv));
         Ok(())
     }
 

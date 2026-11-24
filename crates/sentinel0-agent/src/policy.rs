@@ -83,7 +83,14 @@ pub struct Policy {
     pub tooling: Tooling,
 }
 
+#[cfg(unix)]
 const DEFAULT_AUDIT_PATH: &str = "/var/lib/sentinelx/audit.jsonl";
+#[cfg(windows)]
+const DEFAULT_AUDIT_PATH: &str = r"C:\ProgramData\SentinelO2\audit.jsonl";
+#[cfg(unix)]
+const DEFAULT_UPLOAD_BASE: &str = "/var/lib/sentinelx/uploads";
+#[cfg(windows)]
+const DEFAULT_UPLOAD_BASE: &str = r"C:\ProgramData\SentinelO2\uploads";
 
 impl Default for Policy {
     fn default() -> Self {
@@ -100,7 +107,7 @@ impl Default for Policy {
             exec_timeout_default: 60,
             exec_timeout_max: 600,
             exec_capture_max_bytes: 4 * 1024 * 1024,
-            upload_base: PathBuf::from("/var/lib/sentinelx/uploads"),
+            upload_base: PathBuf::from(DEFAULT_UPLOAD_BASE),
             audit_path: PathBuf::from(DEFAULT_AUDIT_PATH),
             trusted_fetch_hosts: Vec::new(),
             file_url_timeout_seconds: 15,
@@ -699,8 +706,7 @@ impl Policy {
         let services = parse_services(raw_services);
         let file_ops_paths = parse_file_ops_paths(paths, allowed_read_paths)?;
         let preferred_profile = parse_preferred_profile(preferred_profile.as_deref())?;
-        let upload_base =
-            upload_base.unwrap_or_else(|| PathBuf::from("/var/lib/sentinelx/uploads"));
+        let upload_base = upload_base.unwrap_or_else(|| PathBuf::from(DEFAULT_UPLOAD_BASE));
         let upload_base = soft_canonicalize(&upload_base).unwrap_or(upload_base);
         let audit_path = audit_path.unwrap_or_else(|| PathBuf::from(DEFAULT_AUDIT_PATH));
         if !audit_path.is_absolute() {
@@ -860,11 +866,10 @@ mod tests {
     #[test]
     fn audit_path_is_explicit_and_absolute() -> TestResult {
         assert_eq!(parse("{}")?.audit_path, PathBuf::from(DEFAULT_AUDIT_PATH));
-        let configured = parse("agent: {audit_path: /tmp/custom-audit.jsonl}")?;
-        assert_eq!(
-            configured.audit_path,
-            PathBuf::from("/tmp/custom-audit.jsonl")
-        );
+        let absolute = std::env::temp_dir().join("custom-audit.jsonl");
+        let encoded = serde_json::to_string(&absolute.display().to_string()).test_value()?;
+        let configured = parse(&format!("agent: {{audit_path: {encoded}}}"))?;
+        assert_eq!(configured.audit_path, absolute);
         assert!(parse("agent: {audit_path: relative.jsonl}").is_err());
         Ok(())
     }

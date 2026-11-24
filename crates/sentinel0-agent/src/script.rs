@@ -12,10 +12,12 @@ use crate::{
     staging,
 };
 use serde_json::{Map, Value};
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::{
     collections::BTreeMap,
-    fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -27,6 +29,7 @@ const TIMEOUT_MAX: u64 = 600;
 const PYTHON_RUNTIME_NAME: &str = "sentinelx_runtime.py";
 const PYTHON_RUNTIME_SOURCE: &str = python_runtime_source::SOURCE;
 
+#[cfg(unix)]
 fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
     match error.raw_os_error() {
         Some(code) if code == nix::libc::ENOSPC => HandlerError::new(
@@ -58,6 +61,20 @@ fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
             ),
         ),
     }
+}
+
+#[cfg(windows)]
+fn staging_oserror(error: &std::io::Error, path: &Path) -> HandlerError {
+    let code = match error.raw_os_error() {
+        Some(112) => "no_space",
+        Some(19) => "read_only_filesystem",
+        Some(5) => "permission_denied",
+        _ => "staging_failed",
+    };
+    HandlerError::new(
+        code,
+        format!("cannot prepare work area at {}: {error}", path.display()),
+    )
 }
 
 fn with_cleanup_detail(mut error: HandlerError, cleanup: Option<String>) -> HandlerError {
@@ -143,20 +160,17 @@ fn build_command(
             "import os,runpy,sys; p=sys.argv[1]; sys.argv=sys.argv[1:]; sys.path.insert(1, os.path.dirname(os.path.abspath(p))); runpy.run_path(p, run_name='__main__')".into(),
             script.display().to_string(),
         ],
-        "pwsh" => vec![
-            policy.tooling.command("pwsh").display().to_string(),
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-File".into(),
-            script.display().to_string(),
-        ],
-        "powershell" => vec![
-            policy.tooling.command("powershell").display().to_string(),
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-File".into(),
-            script.display().to_string(),
-        ],
+        "pwsh" | "powershell" => {
+            let mut ps_command = vec![
+                policy.tooling.command(interpreter).display().to_string(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+            ];
+            #[cfg(windows)]
+            ps_command.extend(["-ExecutionPolicy".into(), "Bypass".into()]);
+            ps_command.extend(["-File".into(), script.display().to_string()]);
+            ps_command
+        },
         _ => Vec::new(),
     };
     inner.extend(args.iter().cloned());
@@ -376,6 +390,7 @@ async fn stage_python_runtime(workdir: &Path) -> Result<(), HandlerError> {
     async_fs::write(&path, source)
         .await
         .map_err(|error| staging_oserror(&error, &path))?;
+    #[cfg(unix)]
     async_fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
         .await
         .map_err(|error| staging_oserror(&error, &path))?;
@@ -421,9 +436,11 @@ async fn prepare_script(
         let error = staging_oserror(&error, staged.script_path());
         return Err(staged.finish_error(error, request.cleanup));
     }
-    if let Err(error) =
+    #[cfg(unix)]
+    if let Err(error) = {
+        use std::os::unix::fs::PermissionsExt as _;
         async_fs::set_permissions(staged.script_path(), fs::Permissions::from_mode(0o700)).await
-    {
+    } {
         let error = staging_oserror(&error, staged.script_path());
         return Err(staged.finish_error(error, request.cleanup));
     }
@@ -437,26 +454,29 @@ async fn prepare_script(
 
 fn script_spawn_error(error: &std::io::Error, cwd: Option<&Path>) -> HandlerError {
     if let Some(cwd) = cwd {
-        match error.kind() {
-            std::io::ErrorKind::PermissionDenied => {
-                return HandlerError::new(
-                    "permission_denied",
-                    format!(
-                        "cannot enter cwd {:?}: the agent's OS user lacks permission to change into it. Being inside an rw file_ops path does not grant Unix access. Either run with sudo=true -- the directory is then entered after elevation -- or grant the agent's user execute (+x) on it and its parents.",
-                        cwd.display()
-                    ),
-                );
-            }
-            std::io::ErrorKind::NotFound if !cwd.exists() => {
+        match std::fs::metadata(cwd) {
+            Err(cwd_error) if cwd_error.kind() == std::io::ErrorKind::NotFound => {
                 return HandlerError::new(
                     "not_found",
                     format!("cwd {:?} does not exist.", cwd.display()),
                 );
             }
-            std::io::ErrorKind::NotADirectory if !cwd.is_dir() => {
+            Err(cwd_error) if cwd_error.kind() == std::io::ErrorKind::NotADirectory => {
                 return HandlerError::new(
                     "not_a_directory",
                     format!("cwd {:?} is not a directory.", cwd.display()),
+                );
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return HandlerError::new(
+                    "not_a_directory",
+                    format!("cwd {:?} is not a directory.", cwd.display()),
+                );
+            }
+            Err(cwd_error) if cwd_error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return HandlerError::new(
+                    "permission_denied",
+                    format!("cannot access cwd {:?}: {cwd_error}", cwd.display()),
                 );
             }
             _ => {}
@@ -587,8 +607,10 @@ pub async fn handle(policy: &Policy, payload: &Map<String, Value>) -> HandlerRes
 mod tests {
     use super::*;
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    use std::fs;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
     #[test]
     fn staging_host_conditions_have_specific_error_codes() {
         let path = Path::new("/var/lib/sentinelx/uploads/.sentinelx_uploads/script_job_x");
@@ -615,6 +637,36 @@ mod tests {
         assert!(message.contains("host condition"));
         assert!(message.contains("unstable"));
         assert!(message.contains(&path.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_script_executes_natively() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let policy = Policy {
+            upload_base: dir.path().to_owned(),
+            ..Policy::default()
+        };
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("powershell".into())),
+                (
+                    "content".into(),
+                    Value::String("Write-Output 'native_windows'; exit 7".into()),
+                ),
+            ]),
+        )
+        .await
+        .test_value()?;
+        assert_eq!(result["returncode"], 7);
+        assert!(
+            result["output"]
+                .as_str()
+                .test_value()?
+                .contains("native_windows")
+        );
+        Ok(())
     }
 
     #[test]
@@ -706,6 +758,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn python_script_can_import_staged_runtime() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -741,6 +794,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn python_cwd_is_importable_and_pwd_matches_it() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -833,10 +887,14 @@ mod tests {
     #[tokio::test]
     async fn missing_interpreter_is_not_mistaken_for_missing_cwd() -> TestResult {
         let dir = tempdir().test_value()?;
-        let policy = Policy {
+        let mut policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
         };
+        policy.tooling.executables.insert(
+            "powershell".into(),
+            dir.path().join("deliberately-missing-powershell.exe"),
+        );
         let error = handle(
             &policy,
             &Map::from_iter([
@@ -855,6 +913,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_script_keeps_flushed_output() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -885,6 +944,96 @@ mod tests {
         assert!(!result.contains_key("left_running"));
 
         Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_powershell_timeout_preserves_output() -> TestResult {
+        let directory = tempdir().test_value()?;
+        let policy = Policy {
+            upload_base: directory.path().to_owned(),
+            ..Policy::default()
+        };
+        let result = handle(
+            &policy,
+            &Map::from_iter([
+                ("interpreter".into(), Value::String("powershell".into())),
+                ("content".into(), Value::String(
+                    "Write-Output 'reached step 1'; [Console]::Error.WriteLine('err1'); Start-Sleep -Seconds 10".into()
+                )),
+                ("timeout".into(), Value::from(3)),
+            ]),
+        ).await.test_value()?;
+        let output = result["output"].as_str().test_value()?;
+        assert_eq!(result["timed_out"], true);
+        assert!(output.contains("reached step 1"), "{result:?}");
+        assert!(output.contains("err1"), "{result:?}");
+        assert!(!result.contains_key("left_running"), "{result:?}");
+        Ok(())
+    }
+
+    async fn assert_cancelled_script_cleans_staging(
+        upload_base: &Path,
+        interpreter: &str,
+        content: String,
+        child_wait: Duration,
+    ) -> TestResult {
+        let policy = Policy {
+            upload_base: upload_base.to_owned(),
+            ..Policy::default()
+        };
+        let payload = Map::from_iter([
+            ("interpreter".into(), Value::String(interpreter.to_owned())),
+            ("content".into(), Value::String(content)),
+        ]);
+        let task = tokio::spawn(async move { handle(&policy, &payload).await });
+        let started = upload_base.join("started");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while !started.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(started.exists(), "{interpreter} never reached its body");
+        task.abort();
+        let join_error = task.await.err().test_value()?;
+        assert!(join_error.is_cancelled());
+
+        tokio::time::sleep(child_wait).await;
+        assert!(
+            !upload_base.join("survived").exists(),
+            "{interpreter} descendant survived cancellation"
+        );
+        let staging = upload_base.join(crate::staging::STAGING_DIRNAME);
+        let leftovers = fs::read_dir(staging)
+            .test_value()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "{interpreter} cancellation leaked workdir: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_powershell_cancellation_kills_child_and_cleans_staging() -> TestResult {
+        let directory = tempdir().test_value()?;
+        let started = directory.path().join("started");
+        let survived = directory.path().join("survived");
+        let escaped = |path: &Path| path.display().to_string().replace('\'', "''");
+        let source = format!(
+            "Set-Content -LiteralPath '{}' -Value started; & powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2; Set-Content -LiteralPath '{}' -Value survived\"",
+            escaped(&started),
+            escaped(&survived)
+        );
+        assert_cancelled_script_cleans_staging(
+            directory.path(),
+            "powershell",
+            source,
+            Duration::from_millis(2300),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -918,10 +1067,14 @@ mod tests {
     #[tokio::test]
     async fn missing_interpreter_cleans_workdir_by_default() -> TestResult {
         let dir = tempdir().test_value()?;
-        let policy = Policy {
+        let mut policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
         };
+        policy.tooling.executables.insert(
+            "powershell".into(),
+            dir.path().join("deliberately-missing-powershell.exe"),
+        );
         let error = handle(
             &policy,
             &Map::from_iter([
@@ -1044,10 +1197,14 @@ mod tests {
     #[tokio::test]
     async fn cleanup_false_launch_error_reports_retained_paths() -> TestResult {
         let dir = tempdir().test_value()?;
-        let policy = Policy {
+        let mut policy = Policy {
             upload_base: dir.path().to_owned(),
             ..Policy::default()
         };
+        policy.tooling.executables.insert(
+            "powershell".into(),
+            dir.path().join("deliberately-missing-powershell.exe"),
+        );
         let error = handle(
             &policy,
             &Map::from_iter([
@@ -1080,52 +1237,23 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_descendants_and_cleans_staging() -> TestResult {
         let dir = tempdir().test_value()?;
         let started = dir.path().join("started");
         let survived = dir.path().join("survived");
-        let policy = Policy {
-            upload_base: dir.path().to_owned(),
-            ..Policy::default()
-        };
-        let payload = Map::from_iter([
-            ("interpreter".into(), Value::String("bash".into())),
-            (
-                "content".into(),
-                Value::String(format!(
-                    "touch {}; (sleep 1; touch {}) >/dev/null 2>&1 & wait",
-                    started.display(),
-                    survived.display()
-                )),
-            ),
-        ]);
-        let task = tokio::spawn(async move { handle(&policy, &payload).await });
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while !started.exists() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(started.exists(), "script never reached its body");
-        task.abort();
-        let join_error = task.await.err().test_value()?;
-        assert!(join_error.is_cancelled());
-
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert!(
-            !survived.exists(),
-            "script descendant survived cancellation"
+        let content = format!(
+            "touch {}; (sleep 1; touch {}) >/dev/null 2>&1 & wait",
+            started.display(),
+            survived.display()
         );
-        let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
-        let leftovers = fs::read_dir(staging)
-            .test_value()?
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name())
-            .collect::<Vec<_>>();
-        assert!(
-            leftovers.is_empty(),
-            "cancelled script leaked workdir: {leftovers:?}"
-        );
-        Ok(())
+        assert_cancelled_script_cleans_staging(
+            dir.path(),
+            "bash",
+            content,
+            Duration::from_millis(1200),
+        )
+        .await
     }
 }

@@ -1,12 +1,7 @@
 use crate::rotation;
-use nix::{
-    errno::Errno,
-    fcntl::{Flock, FlockArg},
-};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Seek as _, SeekFrom, Write as _},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -14,7 +9,7 @@ pub const EXIT_ALREADY_RUNNING: i32 = 3;
 
 #[derive(Debug)]
 pub struct InstanceLock {
-    _file: Flock<File>,
+    _file: File,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -27,8 +22,12 @@ pub enum InstanceLockError {
         #[source]
         source: io::Error,
     },
-    #[error("failed locking agent lock {path}: {errno}")]
-    Lock { path: PathBuf, errno: Errno },
+    #[error("failed locking agent lock {path}: {source}")]
+    Lock {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed recording holder PID in agent lock {path}: {source}")]
     Record {
         path: PathBuf,
@@ -74,26 +73,25 @@ fn acquire_path(path: PathBuf) -> Result<InstanceLock, InstanceLockError> {
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
         .open(&path)
         .map_err(|source| InstanceLockError::Open {
             path: path.clone(),
             source,
         })?;
 
-    let mut locked = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(locked) => locked,
-        Err((file, errno)) => {
-            drop(file);
-            if errno == Errno::EWOULDBLOCK {
-                return Err(InstanceLockError::AlreadyRunning {
-                    holder: holder_pid(&path),
-                    path,
-                });
-            }
-            return Err(InstanceLockError::Lock { path, errno });
+    let mut locked = file;
+    match locked.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(InstanceLockError::AlreadyRunning {
+                holder: holder_pid(&path),
+                path,
+            });
         }
-    };
+        Err(std::fs::TryLockError::Error(source)) => {
+            return Err(InstanceLockError::Lock { path, source });
+        }
+    }
 
     let record_pid = (|| -> io::Result<()> {
         locked.set_len(0)?;
@@ -137,14 +135,23 @@ mod tests {
         let dir = tempfile::tempdir().test_value()?;
         let path = lock_path_for_state(dir.path(), "host_a");
         let held = acquire_path(path.clone()).test_value()?;
+        // Windows exclusive byte-range locks prevent reading the locked file,
+        // including from the process holding the lock. Verify the recorded PID
+        // after the holder is dropped instead.
+        #[cfg(unix)]
         assert_eq!(
             std::fs::read_to_string(&path).test_value()?,
             std::process::id().to_string()
         );
 
+        #[cfg(windows)]
+        let path_after_release = path.clone();
         match acquire_path(path) {
             Err(InstanceLockError::AlreadyRunning { holder, .. }) => {
+                #[cfg(unix)]
                 assert_eq!(holder, Some(std::process::id()));
+                #[cfg(windows)]
+                assert_eq!(holder, None);
             }
             other => {
                 return Err(std::io::Error::other(format!(
@@ -154,6 +161,11 @@ mod tests {
             }
         }
         drop(held);
+        #[cfg(windows)]
+        assert_eq!(
+            std::fs::read_to_string(&path_after_release).test_value()?,
+            std::process::id().to_string()
+        );
         Ok(())
     }
 

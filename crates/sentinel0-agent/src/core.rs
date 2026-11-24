@@ -24,6 +24,7 @@ static SCAN_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
 
 type ServiceInvocation = (Vec<String>, Option<Map<String, Value>>);
 
+#[cfg(unix)]
 fn systemd_service_invocation(
     policy: &Policy,
     service_name: &str,
@@ -99,6 +100,46 @@ fn systemd_service_invocation(
         ))
     } else {
         Ok((vec![systemctl, action.into(), spec.unit.clone()], None))
+    }
+}
+
+#[cfg(windows)]
+fn systemd_service_invocation(
+    policy: &Policy,
+    _service_name: &str,
+    spec: &ServiceSpec,
+    action: &str,
+) -> Result<ServiceInvocation, HandlerError> {
+    let name = spec.unit.clone();
+    match action {
+        "start" | "stop" | "status" => {
+            let verb = if action == "status" { "query" } else { action };
+            Ok((
+                vec![
+                    policy.tooling.command("sc").display().to_string(),
+                    verb.into(),
+                    name,
+                ],
+                None,
+            ))
+        }
+        "restart" => Ok((
+            vec![
+                policy.tooling.command("powershell").display().to_string(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!(
+                    "Restart-Service -Name '{}' -ErrorAction Stop",
+                    name.replace('\'', "''")
+                ),
+            ],
+            None,
+        )),
+        _ => Err(HandlerError::new(
+            "invalid_payload",
+            format!("unsupported Windows service action: {action}"),
+        )),
     }
 }
 
@@ -207,7 +248,7 @@ impl CoreDispatcher {
                 "platform".into(),
                 Value::String(format!(
                     "{} {} {}",
-                    host::distro().unwrap_or_else(|| "linux".into()),
+                    host::distro().unwrap_or_else(|| std::env::consts::OS.into()),
                     host::kernel().unwrap_or_default(),
                     std::env::consts::ARCH
                 )),
@@ -1092,10 +1133,11 @@ impl CoreDispatcher {
             ));
         }
         if spec.backend != "service" {
+            let platform = if cfg!(windows) { "Windows" } else { "Linux" };
             return Err(HandlerError::new(
                 "unsupported_backend",
                 format!(
-                    "service backend {:?} is not supported on this Linux build",
+                    "service backend {:?} is not supported on this {platform} build",
                     spec.backend
                 ),
             ));
@@ -1989,6 +2031,36 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_invocation_uses_native_commands() -> TestResult {
+        let spec = ServiceSpec {
+            unit: "Spooler".into(),
+            actions: vec!["status".into(), "restart".into()],
+            requires_sudo: false,
+            description: String::new(),
+            domain: "system".into(),
+            backend: "service".into(),
+            user: String::new(),
+        };
+        let (status, env) =
+            systemd_service_invocation(&Policy::default(), "spooler", &spec, "status")
+                .test_value()?;
+        assert!(status[0].contains("sc"));
+        assert_eq!(status[1..], ["query", "Spooler"]);
+        assert!(env.is_none());
+        let (restart, _) =
+            systemd_service_invocation(&Policy::default(), "spooler", &spec, "restart")
+                .test_value()?;
+        assert!(restart[0].contains("powershell"));
+        assert_eq!(
+            restart.last().map(String::as_str),
+            Some("Restart-Service -Name 'Spooler' -ErrorAction Stop")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[test]
     fn systemd_user_invocation_targets_the_users_manager() -> TestResult {
         let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::effective()).test_value()?
@@ -2022,6 +2094,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_systemd_user_is_a_structured_error() {
         let spec = ServiceSpec {
@@ -2040,12 +2113,13 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_service_action_does_not_add_sudo() -> TestResult {
+        let action = if cfg!(windows) { "status" } else { "is-active" };
         let mut policy = Policy::default();
         policy.services.insert(
             "fixture".into(),
             ServiceSpec {
                 unit: "definitely-not-real.service".into(),
-                actions: vec!["is-active".into()],
+                actions: vec![action.into()],
                 requires_sudo: true,
                 description: String::new(),
                 domain: "system".into(),
@@ -2058,7 +2132,7 @@ mod tests {
             .service(
                 &Map::from_iter([
                     ("service".into(), Value::String("fixture".into())),
-                    ("action".into(), Value::String("is-active".into())),
+                    ("action".into(), Value::String(action.into())),
                 ]),
                 false,
             )

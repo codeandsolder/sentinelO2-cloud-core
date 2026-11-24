@@ -19,12 +19,11 @@ grep-matcher.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
 ignore.workspace = true
-nix.workspace = true
 memchr.workspace = true
 num-traits.workspace = true
-openssh.workspace = true
 rand.workspace = true
 regex.workspace = true
+renamest.workspace = true
 reqwest.workspace = true
 sentinel0-proto = { path = "../sentinel0-proto" }
 serde.workspace = true
@@ -46,6 +45,10 @@ url.workspace = true
 walkdir.workspace = true
 wait-timeout.workspace = true
 yaml_serde.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+openssh.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

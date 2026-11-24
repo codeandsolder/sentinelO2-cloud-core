@@ -4,19 +4,28 @@ use crate::{
     policy::Policy,
     process_runner::{self, ProcessFailure, ProcessGroupKill, ProcessOutcome, RunOptions},
 };
+#[cfg(unix)]
 use rand::RngExt;
 use regex::RegexBuilder;
 use serde_json::{Map, Value};
 use similar::{ChangeTag, TextDiff};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+fn portable_mode(meta: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o7777
+}
 const MODES: &[&str] = &[
     "replace",
     "regex",
@@ -622,6 +631,7 @@ fn backup_path(target: &Path, backup_dir: Option<&str>) -> PathBuf {
     ))
 }
 
+#[cfg(unix)]
 fn write_in_place_preserving_metadata(target: &Path, content: &str) -> Result<(), HandlerError> {
     let mut destination = OpenOptions::new()
         .write(true)
@@ -744,6 +754,7 @@ fn ensure_parent_dirs(parent: &Path) -> Result<CreatedParentDirs, HandlerError> 
     Ok(created)
 }
 
+#[cfg(unix)]
 fn require_recovery_backup(recovery_backup: Option<&Path>) -> Result<&Path, HandlerError> {
     recovery_backup.ok_or_else(|| {
         HandlerError::new(
@@ -768,6 +779,9 @@ fn create_replacement_temp(
     );
     let mut builder = tempfile::Builder::new();
     builder.prefix(&prefix).suffix(".tmp");
+    #[cfg(windows)]
+    let _ = original_meta;
+    #[cfg(unix)]
     if original_meta.is_none() {
         // Match OpenOptions::create_new's ordinary creation mode for new files;
         // tempfile defaults to 0600 unless told otherwise. The process umask is
@@ -794,23 +808,31 @@ fn preserve_replacement_metadata(
     recovery_backup: Option<&Path>,
 ) -> Result<bool, HandlerError> {
     temp.as_file()
-        .set_permissions(fs::Permissions::from_mode(meta.mode()))
+        .set_permissions(meta.permissions())
         .map_err(|error| {
             HandlerError::new(
                 "write_failed",
                 format!("failed preserving permissions: {error}"),
             )
         })?;
+    #[cfg(windows)]
+    {
+        let _ = (target, content, recovery_backup);
+        return Ok(false);
+    }
+    #[cfg(unix)]
     let candidate_meta = temp.as_file().metadata().map_err(|error| {
         HandlerError::new(
             "write_failed",
             format!("failed reading replacement metadata: {error}"),
         )
     })?;
+    #[cfg(unix)]
     if candidate_meta.uid() == meta.uid() && candidate_meta.gid() == meta.gid() {
         return Ok(false);
     }
 
+    #[cfg(unix)]
     match nix::unistd::chown(
         temp.path(),
         Some(nix::unistd::Uid::from_raw(meta.uid())),
@@ -830,6 +852,7 @@ fn preserve_replacement_metadata(
     }
 }
 
+#[cfg(unix)]
 fn write_with_recovery(
     target: &Path,
     content: &str,
@@ -912,8 +935,10 @@ fn atomic_replace(
     Ok(false)
 }
 
+#[cfg(unix)]
 const SUDO_EDIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[cfg(unix)]
 async fn run_sudo_edit_step(
     policy: &Policy,
     argv: &[String],
@@ -960,6 +985,7 @@ async fn run_sudo_edit_step(
     }
 }
 
+#[cfg(unix)]
 async fn cleanup_sudo_temp(policy: &Policy, temp: &Path, context: &str) -> Option<String> {
     let argv = vec![
         policy.tooling.command("sudo").display().to_string(),
@@ -975,6 +1001,7 @@ async fn cleanup_sudo_temp(policy: &Policy, temp: &Path, context: &str) -> Optio
         .map(|error| error.message)
 }
 
+#[cfg(unix)]
 async fn cleanup_sudo_dirs(policy: &Policy, dirs: &[PathBuf]) {
     for dir in dirs {
         let argv = vec![
@@ -994,6 +1021,7 @@ async fn cleanup_sudo_dirs(policy: &Policy, dirs: &[PathBuf]) {
     }
 }
 
+#[cfg(unix)]
 async fn run_sudo_commit_new(
     policy: &Policy,
     source: &Path,
@@ -1054,6 +1082,19 @@ async fn run_sudo_commit_new(
     }
 }
 
+#[cfg(windows)]
+async fn sudo_replace(
+    _policy: &Policy,
+    _target: &Path,
+    _staged: &Path,
+    _original_meta: Option<&fs::Metadata>,
+) -> Result<(), HandlerError> {
+    Err(HandlerError::new(
+        "unsupported_platform",
+        "sudo edits are Unix-only",
+    ))
+}
+#[cfg(unix)]
 async fn sudo_replace(
     policy: &Policy,
     target: &Path,
@@ -1085,7 +1126,7 @@ async fn sudo_replace(
     if let Some(meta) = original_meta {
         install.extend([
             "-m".into(),
-            format!("{:o}", meta.mode() & 0o7777),
+            format!("{:o}", portable_mode(meta)),
             "-o".into(),
             meta.uid().to_string(),
             "-g".into(),
@@ -1439,6 +1480,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn in_place_fallback_requires_a_durable_recovery_copy() -> TestResult {
         let error = require_recovery_backup(None).test_error()?;
@@ -1460,6 +1502,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn wait_for_path(path: &Path) -> bool {
         for _ in 0..150 {
             if path.exists() {
@@ -1470,6 +1513,7 @@ mod tests {
         false
     }
 
+    #[cfg(target_os = "linux")]
     async fn wait_for_process_exit(pid: i32) -> bool {
         for _ in 0..150 {
             let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
@@ -1490,6 +1534,7 @@ mod tests {
         false
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cancelling_edit_kills_escaped_validator_descendants_before_any_commit() -> TestResult {
         let dir = tempdir().test_value()?;
@@ -1714,6 +1759,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn in_place_fallback_keeps_inode_and_metadata() -> TestResult {
         let dir = tempdir().test_value()?;

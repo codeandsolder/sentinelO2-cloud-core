@@ -2,24 +2,31 @@ use crate::{
     AuthToken,
     identity::{Identity, load_identity},
 };
-use atomic_write_file::{OpenOptions as AtomicOpenOptions, unix::OpenOptionsExt as _};
+use atomic_write_file::OpenOptions as AtomicOpenOptions;
+#[cfg(unix)]
+use atomic_write_file::unix::OpenOptionsExt as _;
 use base64::{
     Engine as _,
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
 };
+#[cfg(unix)]
 use nix::unistd::{AccessFlags, access};
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
     io::Write,
-    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 const ROTATED_NAME: &str = "identity.rotated.json";
+#[cfg(unix)]
 const SYSTEM_STATE_DIR: &str = "/var/lib/sentinelx";
+#[cfg(windows)]
+const SYSTEM_STATE_DIR: &str = r"C:\ProgramData\SentinelO2";
 const LEGACY_HALF_LIFE_SECONDS: f64 = 182.0 * 86_400.0;
 
 #[derive(Debug, Clone)]
@@ -42,8 +49,14 @@ pub enum RotationError {
     Persist(#[from] std::io::Error),
 }
 
+#[cfg(unix)]
 fn directory_is_writable(path: &Path) -> bool {
     path.is_dir() && access(path, AccessFlags::W_OK).is_ok()
+}
+
+#[cfg(windows)]
+fn directory_is_writable(path: &Path) -> bool {
+    path.is_dir() && tempfile::tempfile_in(path).is_ok()
 }
 
 pub(crate) fn state_dir(identity_path: &Path) -> Option<PathBuf> {
@@ -172,11 +185,15 @@ fn persist_rotated_to(
         hub,
     })?;
 
+    #[cfg(unix)]
     let mut options = AtomicOpenOptions::new();
-    options
-        .preserve_mode(false)
-        .try_preserve_owner(false)
-        .mode(0o600);
+    #[cfg(windows)]
+    let options = AtomicOpenOptions::new();
+    #[cfg(unix)]
+    {
+        options.preserve_mode(false).try_preserve_owner(false);
+        options.mode(0o600);
+    }
     let mut file = options.open(path)?;
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
@@ -237,6 +254,7 @@ mod tests {
     use crate::test_support::{TestResult, TestValue as _};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
@@ -293,6 +311,7 @@ mod tests {
             load_effective_identity_from(&path, identity("h1", token(300 * 86_400, None)?));
         assert_eq!(effective.token.expose(), new);
         assert_eq!(effective.hub, "https://hub.example");
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).test_value()?.permissions().mode() & 0o777,
             0o600

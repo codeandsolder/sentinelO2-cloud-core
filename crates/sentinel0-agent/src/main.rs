@@ -22,9 +22,17 @@ const AGENT_VERSION: &str = "0.23.1-rust.2";
 struct Args {
     #[arg(long)]
     hub: Option<String>,
-    #[arg(long, default_value = "/etc/sentinelx/identity.json")]
+    #[cfg_attr(unix, arg(long, default_value = "/etc/sentinelx/identity.json"))]
+    #[cfg_attr(
+        windows,
+        arg(long, default_value = r"C:\ProgramData\SentinelO2\identity.json")
+    )]
     identity: PathBuf,
-    #[arg(long, default_value = "/etc/sentinelx/config.yaml")]
+    #[cfg_attr(unix, arg(long, default_value = "/etc/sentinelx/config.yaml"))]
+    #[cfg_attr(
+        windows,
+        arg(long, default_value = r"C:\ProgramData\SentinelO2\config.yaml")
+    )]
     config: PathBuf,
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -45,8 +53,6 @@ struct Args {
 const EXIT_INTERNAL_TARGET_EXISTS: i32 = 17;
 
 fn run_internal_commit_new(paths: &[PathBuf]) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let [source, target] = paths else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -65,8 +71,14 @@ fn run_internal_commit_new(paths: &[PathBuf]) -> std::io::Result<()> {
             "internal commit source must be a regular file",
         ));
     }
-    let mode = sentinel0_agent::fsutil::regular_create_mode(target_parent)?;
-    std::fs::set_permissions(source, std::fs::Permissions::from_mode(mode))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = sentinel0_agent::fsutil::regular_create_mode(target_parent)?;
+        std::fs::set_permissions(source, std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(windows)]
+    let _ = target_parent;
     sentinel0_agent::fsutil::install_file_no_replace(source, target)
 }
 
@@ -328,6 +340,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn internal_commit_is_no_clobber_and_applies_plain_create_mode() -> TestResult {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};

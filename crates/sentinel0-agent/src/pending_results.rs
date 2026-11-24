@@ -422,16 +422,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_record_is_non_fatal_and_clear_none_is_safe() {
-        assert!(
-            record(
-                Path::new("/proc/nonexistent/deep"),
-                "job_abc",
-                &event("job_abc")
-            )
-            .is_none()
-        );
+    fn failed_record_is_non_fatal_and_clear_none_is_safe() -> TestResult {
+        let directory = tempfile::tempdir().test_value()?;
+        let not_a_directory = directory.path().join("file");
+        std::fs::write(&not_a_directory, b"x").test_value()?;
+        // pending_dir uses the *parent* of upload_base, so place that
+        // parent at the regular file to force a real directory-creation error.
+        let upload_base = not_a_directory.join("uploads");
+        assert!(record(&upload_base, "job_abc", &event("job_abc")).is_none());
         clear(None);
+        Ok(())
     }
 
     #[test]

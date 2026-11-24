@@ -22,10 +22,11 @@ impl Default for Tooling {
             .map(|value| env::split_paths(&value).collect())
             .filter(|paths: &Vec<PathBuf>| !paths.is_empty())
             .unwrap_or_else(|| {
-                ["/usr/local/bin", "/usr/bin", "/bin"]
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect()
+                #[cfg(unix)]
+                let dirs = ["/usr/local/bin", "/usr/bin", "/bin"];
+                #[cfg(windows)]
+                let dirs = [r"C:\Windows\System32", r"C:\Windows"];
+                dirs.into_iter().map(PathBuf::from).collect()
             });
         Self {
             search_path,
@@ -79,15 +80,29 @@ impl Tooling {
         if let Some(configured) = self.executables.get(name) {
             return is_executable(configured).then(|| configured.clone());
         }
-        self.search_path
-            .iter()
-            .map(|dir| dir.join(name))
-            .find(|path| is_executable(path))
+        self.search_path.iter().find_map(|dir| {
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+            #[cfg(windows)]
+            if candidate.extension().is_none() {
+                for extension in ["exe", "cmd", "bat", "com"] {
+                    let candidate = candidate.with_extension(extension);
+                    if is_executable(&candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        })
     }
 
     #[must_use = "the returned value describes the available tooling"]
     pub fn report(&self) -> Value {
         let names = [
+            "cmd",
+            "powershell",
             "bash",
             "git",
             "nginx",

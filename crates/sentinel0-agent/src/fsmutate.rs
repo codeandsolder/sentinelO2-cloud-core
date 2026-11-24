@@ -10,10 +10,10 @@ use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
     fs, io,
-    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
 fn resolve_rw(policy: &Policy, raw: &str, label: &str) -> Result<PathBuf, HandlerError> {
     resolve_checked_rw(policy, raw, label, Policy::resolve_path)
 }
@@ -213,7 +213,25 @@ fn remove_existing(path: &Path) -> io::Result<()> {
 
 fn sync_parent(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::File::open(parent)?.sync_all()
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    #[cfg(windows)]
+    let _ = parent;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clone_symlink(_src: &Path, dst: &Path, target: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, dst)
+}
+#[cfg(windows)]
+fn clone_symlink(src: &Path, dst: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+    if src.is_dir() {
+        symlink_dir(target, dst)
+    } else {
+        symlink_file(target, dst)
+    }
 }
 
 fn copy_entry(src: &Path, dst: &Path) -> io::Result<()> {
@@ -221,7 +239,7 @@ fn copy_entry(src: &Path, dst: &Path) -> io::Result<()> {
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
         let target = fs::read_link(src)?;
-        symlink(target, dst)?;
+        clone_symlink(src, dst, &target)?;
         return Ok(());
     }
     if file_type.is_dir() {
@@ -231,6 +249,7 @@ fn copy_entry(src: &Path, dst: &Path) -> io::Result<()> {
             copy_entry(&entry.path(), &dst.join(entry.file_name()))?;
         }
         fs::set_permissions(dst, metadata.permissions())?;
+        #[cfg(unix)]
         fs::File::open(dst)?.sync_all()?;
         return Ok(());
     }
@@ -646,7 +665,9 @@ pub fn delete(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 
 /// # Errors
 /// Returns an error when the mode change is invalid, disallowed, or fails.
+#[cfg(unix)]
 pub fn chmod(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
+    use std::os::unix::fs::PermissionsExt as _;
     let raw = require_str(payload, "path")?;
     let mode_raw = require_str(payload, "mode")?;
     let mode = u32::from_str_radix(mode_raw.trim_start_matches("0o"), 8).map_err(|_| {
@@ -674,6 +695,7 @@ pub fn chmod(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
 
 /// # Errors
 /// Returns an error when the ownership change is invalid, disallowed, or fails.
+#[cfg(unix)]
 pub fn chown(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     use nix::unistd::{Gid, Group, Uid, User};
 
@@ -749,6 +771,25 @@ pub fn chown(policy: &Policy, payload: &Map<String, Value>) -> HandlerResult {
     ]))
 }
 
+#[cfg(windows)]
+/// # Errors
+/// POSIX chmod semantics are not defined for Windows ACLs.
+pub fn chmod(_policy: &Policy, _payload: &Map<String, Value>) -> HandlerResult {
+    Err(HandlerError::new(
+        "unsupported_platform",
+        "chmod uses POSIX modes; Windows uses ACLs",
+    ))
+}
+#[cfg(windows)]
+/// # Errors
+/// POSIX chown semantics are not defined for Windows ACLs.
+pub fn chown(_policy: &Policy, _payload: &Map<String, Value>) -> HandlerResult {
+    Err(HandlerError::new(
+        "unsupported_platform",
+        "chown uses POSIX users and groups; Windows uses ACLs",
+    ))
+}
+
 /// # Errors
 /// Returns an error when the requested filesystem mutation is invalid, disallowed, or fails.
 pub fn handle(
@@ -774,6 +815,8 @@ mod tests {
     use super::*;
     use crate::policy::{FileAccess, FileOpsPath};
     use crate::test_support::{TestError as _, TestResult, TestValue as _};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     fn policy(root: &Path) -> Policy {
@@ -914,6 +957,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn directory_backup_preserves_nested_symlinks_without_reading_targets() -> TestResult {
         use flate2::read::GzDecoder;
@@ -943,6 +987,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn copy_preserves_top_level_symlink_without_reading_its_target() -> TestResult {
         let root = tempdir().test_value()?;
@@ -973,6 +1018,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn failed_staged_copy_does_not_destroy_existing_destination() -> TestResult {
         use std::os::unix::net::UnixListener;
 
@@ -1002,6 +1048,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn deleting_symlink_backs_up_link_not_target() -> TestResult {
         let root = tempdir().test_value()?;
         let outside = tempdir().test_value()?;
@@ -1052,6 +1099,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(unix)]
     fn directory_copy_preserves_nested_symlink_without_reading_target() -> TestResult {
         let root = tempdir().test_value()?;
         let outside = tempdir().test_value()?;
