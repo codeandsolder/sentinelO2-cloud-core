@@ -51,7 +51,7 @@ supports the native Windows executable suffixes.
 
 ## Build and validation
 
-Windows CI runs the full native agent and protocol tests using the shared sccache workflow on a Windows runner. Local
+Windows CI runs the complete native agent library and real-WebSocket integration test suites, plus protocol tests, using the shared sccache workflow on a Windows runner. Local
 cross-compilation on Acer requires MinGW's cross C/C++ compilers for
 `aws-lc-sys` in addition to Rust's `x86_64-pc-windows-gnu` target.
 The compiler invocations must continue through managed sccache.
