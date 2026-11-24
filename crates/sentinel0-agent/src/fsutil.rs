@@ -1,4 +1,6 @@
-use std::{fs, io, path::Path};
+#[cfg(unix)]
+use std::fs;
+use std::{io, path::Path};
 
 /// Atomically move a file or directory without clobbering an existing
 /// destination, on every platform with native exclusive-rename support.

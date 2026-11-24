@@ -972,6 +972,49 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_cancelled_script_cleans_staging(
+        upload_base: &Path,
+        interpreter: &str,
+        content: String,
+        child_wait: Duration,
+    ) -> TestResult {
+        let policy = Policy {
+            upload_base: upload_base.to_owned(),
+            ..Policy::default()
+        };
+        let payload = Map::from_iter([
+            ("interpreter".into(), Value::String(interpreter.to_owned())),
+            ("content".into(), Value::String(content)),
+        ]);
+        let task = tokio::spawn(async move { handle(&policy, &payload).await });
+        let started = upload_base.join("started");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while !started.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(started.exists(), "{interpreter} never reached its body");
+        task.abort();
+        let join_error = task.await.err().test_value()?;
+        assert!(join_error.is_cancelled());
+
+        tokio::time::sleep(child_wait).await;
+        assert!(
+            !upload_base.join("survived").exists(),
+            "{interpreter} descendant survived cancellation"
+        );
+        let staging = upload_base.join(crate::staging::STAGING_DIRNAME);
+        let leftovers = fs::read_dir(staging)
+            .test_value()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "{interpreter} cancellation leaked workdir: {leftovers:?}"
+        );
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_powershell_cancellation_kills_child_and_cleans_staging() -> TestResult {
@@ -984,31 +1027,13 @@ mod tests {
             escaped(&started),
             escaped(&survived)
         );
-        let policy = Policy {
-            upload_base: directory.path().to_owned(),
-            ..Policy::default()
-        };
-        let payload = Map::from_iter([
-            ("interpreter".into(), Value::String("powershell".into())),
-            ("content".into(), Value::String(source)),
-        ]);
-        let task = tokio::spawn(async move { handle(&policy, &payload).await });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-        while !started.exists() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(started.exists(), "PowerShell never reached its body");
-        task.abort();
-        let join_error = task.await.err().test_value()?;
-        assert!(join_error.is_cancelled());
-        tokio::time::sleep(Duration::from_millis(2300)).await;
-        assert!(
-            !survived.exists(),
-            "PowerShell descendant survived cancellation"
-        );
-        let staging = directory.path().join(crate::staging::STAGING_DIRNAME);
-        assert_eq!(fs::read_dir(staging).test_value()?.count(), 0);
-        Ok(())
+        assert_cancelled_script_cleans_staging(
+            directory.path(),
+            "powershell",
+            source,
+            Duration::from_millis(2300),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1218,47 +1243,17 @@ mod tests {
         let dir = tempdir().test_value()?;
         let started = dir.path().join("started");
         let survived = dir.path().join("survived");
-        let policy = Policy {
-            upload_base: dir.path().to_owned(),
-            ..Policy::default()
-        };
-        let payload = Map::from_iter([
-            ("interpreter".into(), Value::String("bash".into())),
-            (
-                "content".into(),
-                Value::String(format!(
-                    "touch {}; (sleep 1; touch {}) >/dev/null 2>&1 & wait",
-                    started.display(),
-                    survived.display()
-                )),
-            ),
-        ]);
-        let task = tokio::spawn(async move { handle(&policy, &payload).await });
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while !started.exists() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(started.exists(), "script never reached its body");
-        task.abort();
-        let join_error = task.await.err().test_value()?;
-        assert!(join_error.is_cancelled());
-
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert!(
-            !survived.exists(),
-            "script descendant survived cancellation"
+        let content = format!(
+            "touch {}; (sleep 1; touch {}) >/dev/null 2>&1 & wait",
+            started.display(),
+            survived.display()
         );
-        let staging = dir.path().join(crate::staging::STAGING_DIRNAME);
-        let leftovers = fs::read_dir(staging)
-            .test_value()?
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name())
-            .collect::<Vec<_>>();
-        assert!(
-            leftovers.is_empty(),
-            "cancelled script leaked workdir: {leftovers:?}"
-        );
-        Ok(())
+        assert_cancelled_script_cleans_staging(
+            dir.path(),
+            "bash",
+            content,
+            Duration::from_millis(1200),
+        )
+        .await
     }
 }
