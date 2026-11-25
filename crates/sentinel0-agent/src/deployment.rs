@@ -176,13 +176,13 @@ fn reconcile_owner(
     Ok(())
 }
 
-fn reconcile_tree(fd: OwnedFd, owner: Owner, report: &mut Report) -> io::Result<()> {
-    let stat = fstat(&fd)?;
+fn reconcile_tree(fd: &OwnedFd, owner: Owner, report: &mut Report) -> io::Result<()> {
+    let stat = fstat(fd)?;
     match kind(&stat) {
-        SFlag::S_IFREG if stat.st_nlink == 1 => reconcile_owner(&fd, &stat, owner, report),
+        SFlag::S_IFREG if stat.st_nlink == 1 => reconcile_owner(fd, &stat, owner, report),
         SFlag::S_IFDIR => {
             let mut directory = Dir::openat(
-                &fd,
+                fd,
                 ".",
                 OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
                 Mode::empty(),
@@ -194,25 +194,25 @@ fn reconcile_tree(fd: OwnedFd, owner: Owner, report: &mut Report) -> io::Result<
                     continue;
                 }
                 let child = open_relative(
-                    &fd,
+                    fd,
                     entry.file_name(),
                     OFlag::O_PATH | OFlag::O_NOFOLLOW,
                     true,
                 );
                 match child {
-                    Ok(child) => reconcile_tree(child, owner, report)?,
+                    Ok(child) => reconcile_tree(&child, owner, report)?,
                     Err(error)
                         if matches!(
                             error.raw_os_error().map(Errno::from_raw),
                             Some(Errno::EXDEV | Errno::ELOOP)
                         ) =>
                     {
-                        report.skipped += 1
+                        report.skipped += 1;
                     }
                     Err(error) => return Err(error),
                 }
             }
-            reconcile_owner(&fd, &stat, owner, report)
+            reconcile_owner(fd, &stat, owner, report)
         }
         _ => {
             // Never follow links or take ownership of an inode also named elsewhere.
@@ -316,7 +316,7 @@ fn register_directory(roots: &mut Vec<(PathBuf, OwnedFd)>, path: &Path) -> io::R
     ensure_owner_permissions(&fd, 0o700)?;
     let covered = roots.iter().any(|(root, parent)| {
         root == path
-            || path.strip_prefix(root).ok().is_some_and(|relative| {
+            || path.strip_prefix(root).is_ok_and(|relative| {
                 open_relative(parent, relative, OFlag::O_PATH | OFlag::O_DIRECTORY, true).is_ok()
             })
     });
@@ -377,7 +377,7 @@ pub fn prepare(
     register_directory(&mut roots, &policy.upload_base)?;
     let mut report = Report::default();
     for (_, fd) in roots {
-        reconcile_tree(fd, owner, &mut report)?;
+        reconcile_tree(&fd, owner, &mut report)?;
     }
     reconcile_identity(identity, owner, &mut report)?;
     // Validate the audit file even in the default state tree, so a skipped
@@ -420,7 +420,7 @@ mod tests {
         fs::hard_link(&outside, state.join("hardlink"))?;
         let original = fs::metadata(&outside)?;
         let mut report = Report::default();
-        reconcile_tree(open_absolute(&state)?, current_owner(), &mut report)?;
+        reconcile_tree(&open_absolute(&state)?, current_owner(), &mut report)?;
         assert_eq!(report.changed, 0);
         assert_eq!(report.skipped, 2);
         assert_eq!(fs::metadata(&outside)?.uid(), original.uid());
@@ -473,7 +473,7 @@ mod tests {
             gid: Gid::from_raw(65534),
         };
         let mut report = Report::default();
-        reconcile_tree(open_absolute(&state)?, owner, &mut report)?;
+        reconcile_tree(&open_absolute(&state)?, owner, &mut report)?;
         reconcile_identity(&identity, owner, &mut report)?;
         reconcile_custom_audit(&audit, owner, &mut report)?;
         assert_eq!(report.changed, 4);
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(fs::metadata(&outside)?.uid(), 0);
         assert_eq!(fs::read_to_string(&outside)?, "project");
         let mut repeated = Report::default();
-        reconcile_tree(open_absolute(&state)?, owner, &mut repeated)?;
+        reconcile_tree(&open_absolute(&state)?, owner, &mut repeated)?;
         reconcile_identity(&identity, owner, &mut repeated)?;
         assert_eq!(repeated.changed, 0);
         Ok(())
