@@ -50,3 +50,48 @@ intentional deviations, and remaining differential/packaging work. Runtime tool 
 ### Local audit configuration
 
 Set `agent.audit_path` in the agent YAML config to an absolute JSONL path. The default is `/var/lib/sentinelx/audit.jsonl`. The audit writer and reader share this configured path and retention state for the lifetime of the dispatcher.
+
+### Linux deployment and ownership migration
+
+The successful main Linux CI artifact contains the binary, installer and
+SHA-256 manifest. Extract all three into a dedicated directory and verify them
+with `sha256sum -c sentinelx-core.sha256`. On an already enrolled Linux systemd
+host, from an independent root shell, run:
+
+```sh
+bash install-linux.sh ./sentinelx-core
+```
+
+The installer resolves the existing service's `User=` and `Group=`, requires
+`KillMode=process` to preserve active jobs, and installs a content-addressed,
+root-owned executable under `/usr/local/libexec/sentinelo2`. It stops only the
+old agent and invokes the Rust `prepare-deployment` command as root to transfer
+ownership of its dedicated state, upload tree, audit log and identity to the
+service account. The policy file stays root-owned and the new agent runs with
+the existing unprivileged account, groups and service settings. The preparer
+skips symlinks, multiply linked files, special files and nested mounts. It does
+not derive managed paths from project/file-operation permissions. The identity
+is kept private (0600). This requires Linux 5.6 or newer (`openat2`) and an
+existing enrollment and service unit.
+
+The defaults preserve the official hosted hub and the usual identity and policy
+paths; supply `--hub`, `--identity` or `--config` for nonstandard deployments.
+Standard managed storage is `/var/lib/sentinelx` and the service user's
+`~/.local/share/sentinelx` (including its upload tree). Explicitly approve any other dedicated
+upload directory with `--managed-upload-dir PATH`, or custom audit file with
+`--managed-audit-path PATH`. A custom audit parent must already be writable by
+the service account; unrelated parent directories are not taken over. Dedicated
+upload parents must exist before installation. This operation is idempotent;
+use it for future upgrades or when the service account changes. It never runs
+as part of routine agent execution.
+
+The installer checks the config and verifies enrollment as the service user,
+then writes a root-owned systemd drop-in. It drops only recognized legacy
+Python/identity pre-start hooks, leaving unrelated hooks alone. A failed switch
+restores the preceding drop-in and restarts the previously active service.
+State ownership is intentionally not rolled back: it was reconciled to the same
+configured service account. Confirm the same host ID reconnects and perform
+read/exec/upload smoke checks before uninstalling the old Python agent. For
+rollback after a successful first migration, remove only the generated
+`99-sentinelo2.conf`, run `systemctl daemon-reload`, and restart the existing
+service from an independent root shell.
