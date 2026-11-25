@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod deployment;
+
 use clap::Parser;
 use sentinel0_agent::{
     Agent, AgentConfig, ReconnectPolicy,
@@ -48,6 +51,16 @@ struct Args {
     ssh_execution_target: Option<String>,
     #[arg(long, hide = true, num_args = 2, value_names = ["SOURCE", "TARGET"])]
     internal_commit_new: Option<Vec<PathBuf>>,
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    deployment: Option<DeploymentCommand>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, clap::Subcommand)]
+enum DeploymentCommand {
+    /// Reconcile agent-owned state before switching the service executable.
+    PrepareDeployment(deployment::PrepareDeployment),
 }
 
 const EXIT_INTERNAL_TARGET_EXISTS: i32 = 17;
@@ -254,6 +267,10 @@ async fn run_agent(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
+    #[cfg(target_os = "linux")]
+    if let Some(DeploymentCommand::PrepareDeployment(deployment)) = &args.deployment {
+        return crate::deployment::prepare(deployment, &args.identity, &args.config);
+    }
     if let Some(path) = args.local_api_relay.as_deref() {
         std::process::exit(sentinel0_agent::local_api::run_local_api_relay(
             path,

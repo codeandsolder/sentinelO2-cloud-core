@@ -30,12 +30,17 @@ jobs:
       runner: ubuntu-26.04
       command: |
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends ripgrep
+        sudo apt-get install -y --no-install-recommends ripgrep shellcheck
         cargo metadata --locked --format-version 1 >/dev/null
         python3 -m unittest discover -s .github/scripts -p 'test_*.py'
         cargo fmt --all -- --check
         cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo test --locked --workspace --all-targets
+        deployment_test=$(cargo test --locked -p sentinel0-agent --bin sentinelx-core --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "sentinelx-core" and .profile.test == true) | .executable // empty')
+        test -n "$deployment_test"
+        sudo -- "$deployment_test" --ignored --exact deployment::tests::root_migrates_agent_state_to_another_account
+        bash -n scripts/install-linux.sh
+        shellcheck scripts/install-linux.sh
       rustflags: "-C target-cpu=x86-64-v2"
 
   rust-windows:
@@ -104,14 +109,17 @@ jobs:
       - name: Finalize mandatory sccache
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
-      - name: Checksum
-        run: (cd target/release && sha256sum sentinelx-core > sentinelx-core.sha256)
+      - name: Package installer and checksum
+        run: |
+          cp scripts/install-linux.sh target/release/install-linux.sh
+          (cd target/release && sha256sum sentinelx-core install-linux.sh > sentinelx-core.sha256)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sentinelx-core-linux-x86_64
           path: |
             target/release/sentinelx-core
             target/release/sentinelx-core.sha256
+            target/release/install-linux.sh
           if-no-files-found: error
           retention-days: 7
 
