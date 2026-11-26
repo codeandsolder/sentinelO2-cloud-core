@@ -24,7 +24,7 @@ fn tls_connector() -> Result<btls::ssl::SslConnector, btls::error::ErrorStack> {
         ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion},
         x509::X509,
     };
-    let mut builder = SslConnector::bare_builder(SslMethod::tls_client())?;
+    let mut builder = SslConnector::bare_builder(SslMethod::tls())?;
     builder.set_verify(SslVerifyMode::PEER);
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     for certificate in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
