@@ -1,13 +1,39 @@
-use std::{collections::VecDeque, io, net::SocketAddr, time::Duration};
-use tokio::{net::TcpStream, task::JoinSet, time::sleep};
+use std::{collections::VecDeque, io, net::SocketAddr, pin::Pin, time::Duration};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+    task::JoinSet,
+    time::sleep,
+};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
+    WebSocketStream, client_async_with_config,
     tungstenite::{
         self,
         handshake::client::{Request, Response},
         protocol::WebSocketConfig,
     },
 };
+
+pub(crate) trait WebSocketIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> WebSocketIo for T {}
+
+pub(crate) type AgentWebSocket = WebSocketStream<Box<dyn WebSocketIo>>;
+
+fn tls_connector() -> Result<btls::ssl::SslConnector, btls::error::ErrorStack> {
+    use btls::{
+        ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion},
+        x509::X509,
+    };
+    let mut builder = SslConnector::bare_builder(SslMethod::tls_client())?;
+    builder.set_verify(SslVerifyMode::PEER);
+    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+    for certificate in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        builder
+            .cert_store_mut()
+            .add_cert(X509::from_der(certificate.as_ref())?)?;
+    }
+    Ok(builder.build())
+}
 
 pub const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 
@@ -68,10 +94,19 @@ async fn race_tcp(addrs: Vec<SocketAddr>) -> io::Result<TcpStream> {
     Err(last_error.unwrap_or_else(|| io::Error::other("all hub addresses failed")))
 }
 
-pub async fn connect(
+pub(crate) async fn connect(
     request: Request,
     config: Option<WebSocketConfig>,
-) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response), tungstenite::Error> {
+) -> Result<(AgentWebSocket, Response), tungstenite::Error> {
+    let secure = match request.uri().scheme_str() {
+        Some("wss") => true,
+        Some("ws") => false,
+        _ => {
+            return Err(tungstenite::Error::Url(
+                tungstenite::error::UrlError::UnsupportedUrlScheme,
+            ));
+        }
+    };
     let host = request
         .uri()
         .host()
@@ -95,7 +130,24 @@ pub async fn connect(
         .map_err(tungstenite::Error::Io)?
         .collect::<Vec<_>>();
     let stream = race_tcp(addrs).await.map_err(tungstenite::Error::Io)?;
-    client_async_tls_with_config(request, stream, config, None).await
+    let stream: Box<dyn WebSocketIo> = if secure {
+        let tls_error =
+            |error: btls::error::ErrorStack| tungstenite::Error::Io(io::Error::other(error));
+        let connector = tls_connector().map_err(tls_error)?;
+        let ssl = connector
+            .configure()
+            .and_then(|configuration| configuration.into_ssl(&host))
+            .map_err(tls_error)?;
+        let mut stream = tokio_btls::SslStream::new(ssl, stream).map_err(tls_error)?;
+        Pin::new(&mut stream)
+            .connect()
+            .await
+            .map_err(|error| tungstenite::Error::Io(io::Error::other(error)))?;
+        Box::new(stream)
+    } else {
+        Box::new(stream)
+    };
+    client_async_with_config(request, stream, config).await
 }
 
 #[cfg(test)]

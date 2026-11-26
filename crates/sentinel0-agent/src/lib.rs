@@ -109,8 +109,7 @@ use tracing::{debug, info, warn};
 
 const MAX_IN_FLIGHT_TASKS: usize = 64;
 
-type AgentWebSocket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+use happy_eyeballs::AgentWebSocket;
 
 fn add_response_time(message: &mut Message) {
     if let Message::Response {

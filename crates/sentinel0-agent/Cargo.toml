@@ -24,7 +24,10 @@ num-traits.workspace = true
 rand.workspace = true
 regex.workspace = true
 renamest.workspace = true
-reqwest.workspace = true
+wreq.workspace = true
+btls.workspace = true
+tokio-btls.workspace = true
+webpki-root-certs.workspace = true
 sentinel0-proto = { path = "../sentinel0-proto" }
 serde.workspace = true
 serde_json.workspace = true

@@ -785,7 +785,7 @@ where
 }
 
 #[cfg(unix)]
-fn http_error(endpoint: &Endpoint, error: &reqwest::Error) -> HandlerError {
+fn http_error(endpoint: &Endpoint, error: &wreq::Error) -> HandlerError {
     if error.is_timeout() {
         HandlerError::new(
             "timeout",
@@ -804,7 +804,7 @@ fn http_error(endpoint: &Endpoint, error: &reqwest::Error) -> HandlerError {
 #[cfg(unix)]
 async fn decode_http_response(
     endpoint: &Endpoint,
-    mut response: reqwest::Response,
+    response: wreq::Response,
 ) -> Result<Value, HandlerError> {
     let status = response.status();
     if response
@@ -817,12 +817,11 @@ async fn decode_http_response(
         ));
     }
 
+    use futures_util::StreamExt as _;
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| http_error(endpoint, &error))?
-    {
+    let mut stream = std::pin::pin!(response.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| http_error(endpoint, &error))?;
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(HandlerError::new(
                 "too_large",
@@ -876,7 +875,7 @@ async fn call_http(
             format!("request must look like 'GET /path', got {request:?}"),
         )
     })?;
-    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|error| {
+    let method = wreq::Method::from_bytes(method.as_bytes()).map_err(|error| {
         HandlerError::new(
             "bad_action",
             format!("invalid HTTP method {method:?}: {error}"),
@@ -884,15 +883,17 @@ async fn call_http(
     })?;
     let target = render(target.trim(), params)?;
     let url = format!("http://localhost{target}");
-    let client = reqwest::Client::builder()
-        .unix_socket(Path::new(&endpoint.path))
+    let client = wreq::Client::builder()
+        .proxy(
+            wreq::Proxy::unix(Path::new(&endpoint.path))
+                .map_err(|error| HandlerError::new("internal_error", error.to_string()))?,
+        )
         .timeout(endpoint.timeout)
-        .no_proxy()
         .build()
         .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
     let response = client
         .request(method, url)
-        .header(reqwest::header::ACCEPT, "application/json")
+        .header(wreq::header::ACCEPT, "application/json")
         .send()
         .await
         .map_err(|error| http_error(endpoint, &error))?;

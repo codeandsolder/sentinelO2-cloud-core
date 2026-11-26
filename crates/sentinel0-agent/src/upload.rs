@@ -6,7 +6,6 @@ use crate::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use reqwest::{Client, redirect::Policy as RedirectPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -20,6 +19,7 @@ use std::{
     time::Duration,
 };
 use tokio::{fs as async_fs, io::AsyncWriteExt, net::lookup_host};
+use wreq::{Client, redirect::Policy as RedirectPolicy};
 
 pub const MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_CHUNK_INDEX: u32 = 100_000_000;
@@ -256,13 +256,13 @@ async fn fetch_to(
         // A proxy would resolve/connect independently and defeat the DNS pin.
         .no_proxy()
         .timeout(Duration::from_secs(policy.file_url_timeout_seconds))
-        // Use the exact public addresses we just vetted. Otherwise reqwest
+        // Use the exact public addresses we just vetted. Otherwise wreq
         // performs a second DNS lookup between the policy check and connect.
-        .resolve_to_addrs(&host, &addresses)
+        .resolve_to_addrs(host, addresses)
         .build()
         .map_err(|e| HandlerError::new("fetch_failed", e.to_string()))?;
     let response = client
-        .get(url)
+        .get(url.as_str())
         .send()
         .await
         .map_err(|e| HandlerError::new("fetch_failed", format!("could not fetch URL: {e}")))?;

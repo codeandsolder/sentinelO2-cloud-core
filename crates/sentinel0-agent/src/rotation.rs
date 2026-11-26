@@ -40,7 +40,7 @@ pub struct RotationConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum RotationError {
     #[error("rotate request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[from] wreq::Error),
     #[error("rotate response JSON failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("rotate response did not contain a well-formed credential")]
@@ -217,8 +217,9 @@ pub async fn maybe_rotate(
         return Ok(false);
     };
 
-    let client = reqwest::Client::builder()
+    let client = wreq::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(wreq::redirect::Policy::limited(10))
         .build()?;
     let url = format!(
         "{}/agent/rotate",
