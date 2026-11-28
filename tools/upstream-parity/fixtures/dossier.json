@@ -1,0 +1,26 @@
+{
+  "release": {
+    "component": "core",
+    "repo": "upstream/core",
+    "previous_version": "1.0.0",
+    "previous_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "1.1.0",
+    "release_sha": "cccccccccccccccccccccccccccccccccccccccc",
+    "subject": "release 1.1.0"
+  },
+  "delta": {
+    "status": "ahead",
+    "total_commits": 2,
+    "commits": [
+      {"sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "commit": {"message": "fix: unreleased prep\nDetails"}},
+      {"sha": "cccccccccccccccccccccccccccccccccccccccc", "commit": {"message": "release 1.1.0"}}
+    ],
+    "files": [
+      {"filename":"src/sentinelx_core/handlers/fileops.py","status":"modified","additions":3,"deletions":1,"patch":"@@ -1 +1 @@\n-old\n+new"},
+      {"filename":"tests/test_windows.py","status":"added","additions":5,"deletions":0,"patch":"@@ -0,0 +1 @@\n+test"},
+      {"filename":"CHANGELOG.md","status":"modified","additions":2,"deletions":0,"patch":"ignored"},
+      {"filename":"other"}
+    ]
+  },
+  "changelog":"## 1.1.0 - first\n- first notes"
+}

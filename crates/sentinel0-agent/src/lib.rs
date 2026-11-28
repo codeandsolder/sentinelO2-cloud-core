@@ -407,7 +407,7 @@ impl<D: Dispatcher> Agent<D> {
     /// # Errors
     /// Returns an error when a hub session cannot be established or a non-recoverable agent failure occurs.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), AgentError> {
-        let client = transport::client_builder().build()?;
+        let client = sentinel0_transport::client_builder().build()?;
         let mut attempt = 0usize;
         let mut retry_hint = None;
         let mut tasks = JoinSet::new();

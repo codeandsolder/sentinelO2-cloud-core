@@ -42,7 +42,7 @@ pub(crate) enum RotationError {
     #[error("rotate request failed: {0}")]
     Request(#[from] wreq::Error),
     #[error("rotate response body failed: {0}")]
-    Body(#[from] crate::transport::BodyError),
+    Body(#[from] sentinel0_transport::BodyError),
     #[error("rotate endpoint returned HTTP {0}")]
     Status(http::StatusCode),
     #[error("rotate response JSON failed: {0}")]
@@ -231,7 +231,7 @@ pub(crate) async fn maybe_rotate(
     if !response.status().is_success() {
         return Err(RotationError::Status(response.status()));
     }
-    let body = crate::transport::read_bounded(response, 64 * 1024).await?;
+    let body = sentinel0_transport::read_bounded(response, 64 * 1024).await?;
     let body: Value = serde_json::from_slice(&body)?;
     let credential = body
         .get("credential")

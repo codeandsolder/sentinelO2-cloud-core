@@ -52,7 +52,7 @@ async fn verify_enrollment_with_timeouts(
         Ok(header) => header,
         Err(error) => return PreflightResult::failed("invalid_token_header", error.to_string()),
     };
-    let client = match transport::client_builder().build() {
+    let client = match sentinel0_transport::client_builder().build() {
         Ok(client) => client,
         Err(error) => return PreflightResult::failed("error", error.to_string()),
     };

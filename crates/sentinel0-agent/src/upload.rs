@@ -3,10 +3,10 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
     staging,
-    transport::{self, BodyError},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
+use sentinel0_transport::BodyError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -261,7 +261,7 @@ async fn fetch_to(
     destination: &Path,
 ) -> Result<(u64, String), HandlerError> {
     let (url, host, addresses) = validate_fetch_url(policy, raw).await?;
-    let client = transport::client_builder()
+    let client = sentinel0_transport::client_builder()
         .https_only(true)
         .timeout(Duration::from_secs(policy.file_url_timeout_seconds))
         // Use the exact public addresses we just vetted. Otherwise the HTTP client
@@ -282,7 +282,7 @@ async fn fetch_to(
     }
 
     let mut stream = std::pin::pin!(
-        transport::bounded_body(response, MAX_UPLOAD_BYTES).map_err(fetch_body_error)?
+        sentinel0_transport::bounded_body(response, MAX_UPLOAD_BYTES).map_err(fetch_body_error)?
     );
     let mut file = async_fs::File::create(destination)
         .await

@@ -23,8 +23,9 @@ memchr.workspace = true
 rand.workspace = true
 regex.workspace = true
 renamest.workspace = true
-wreq.workspace = true
+wreq = { workspace = true, features = ["ws"] }
 sentinel0-proto = { path = "../sentinel0-proto" }
+sentinel0-transport = { path = "../sentinel0-transport" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -47,9 +48,6 @@ yaml_serde.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 openssh.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-wreq = { workspace = true, features = ["static-cxx-runtime"] }
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true
