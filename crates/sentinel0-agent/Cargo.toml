@@ -50,6 +50,9 @@ nix.workspace = true
 openssh.workspace = true
 
 [dev-dependencies]
+# Loopback TLS server for the agent handshake regression tests.
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "f6ae02c80ae54dfd3e59d7d440e616f523449cac" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "f6ae02c80ae54dfd3e59d7d440e616f523449cac" }
 tokio-tungstenite.workspace = true
 tokio.workspace = true
 
