@@ -3,10 +3,10 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
     staging,
+    transport::{self, BodyError},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use reqwest::{Client, redirect::Policy as RedirectPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -245,24 +245,32 @@ async fn validate_fetch_url(
     Ok((url, host, addresses))
 }
 
+fn fetch_body_error(error: BodyError) -> HandlerError {
+    match error {
+        BodyError::TooLarge => HandlerError::new(
+            "file_too_large",
+            format!("file exceeds upload cap of {MAX_UPLOAD_BYTES} bytes"),
+        ),
+        BodyError::Transport(error) => HandlerError::new("fetch_failed", error.to_string()),
+    }
+}
+
 async fn fetch_to(
     policy: &Policy,
     raw: &str,
     destination: &Path,
 ) -> Result<(u64, String), HandlerError> {
     let (url, host, addresses) = validate_fetch_url(policy, raw).await?;
-    let client = Client::builder()
-        .redirect(RedirectPolicy::none())
-        // A proxy would resolve/connect independently and defeat the DNS pin.
-        .no_proxy()
+    let client = transport::client_builder()
+        .https_only(true)
         .timeout(Duration::from_secs(policy.file_url_timeout_seconds))
-        // Use the exact public addresses we just vetted. Otherwise reqwest
+        // Use the exact public addresses we just vetted. Otherwise the HTTP client
         // performs a second DNS lookup between the policy check and connect.
-        .resolve_to_addrs(&host, &addresses)
+        .resolve_to_addrs(host, addresses)
         .build()
         .map_err(|e| HandlerError::new("fetch_failed", e.to_string()))?;
     let response = client
-        .get(url)
+        .get(url.as_str())
         .send()
         .await
         .map_err(|e| HandlerError::new("fetch_failed", format!("could not fetch URL: {e}")))?;
@@ -273,21 +281,17 @@ async fn fetch_to(
         ));
     }
 
+    let mut stream = std::pin::pin!(
+        transport::bounded_body(response, MAX_UPLOAD_BYTES).map_err(fetch_body_error)?
+    );
     let mut file = async_fs::File::create(destination)
         .await
         .map_err(|e| HandlerError::new("io_error", format!("cannot create staged upload: {e}")))?;
-    let mut stream = response.bytes_stream();
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| HandlerError::new("fetch_failed", e.to_string()))?;
-        size = size.saturating_add(chunk.len() as u64);
-        if size > MAX_UPLOAD_BYTES {
-            return Err(HandlerError::new(
-                "file_too_large",
-                format!("file exceeds upload cap of {MAX_UPLOAD_BYTES} bytes"),
-            ));
-        }
+        let chunk = chunk.map_err(fetch_body_error)?;
+        size = size.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(|e| {
             HandlerError::new("io_error", format!("failed writing staged upload: {e}"))

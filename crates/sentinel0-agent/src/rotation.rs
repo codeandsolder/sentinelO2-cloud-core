@@ -38,9 +38,13 @@ pub struct RotationConfig {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum RotationError {
+pub(crate) enum RotationError {
     #[error("rotate request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[from] wreq::Error),
+    #[error("rotate response body failed: {0}")]
+    Body(#[from] crate::transport::BodyError),
+    #[error("rotate endpoint returned HTTP {0}")]
+    Status(http::StatusCode),
     #[error("rotate response JSON failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("rotate response did not contain a well-formed credential")]
@@ -204,7 +208,8 @@ fn persist_rotated_to(
 
 /// # Errors
 /// Returns an error when credential rotation is required but cannot be completed safely.
-pub async fn maybe_rotate(
+pub(crate) async fn maybe_rotate(
+    client: &wreq::Client,
     config: &RotationConfig,
     token: &AuthToken,
 ) -> Result<bool, RotationError> {
@@ -217,9 +222,6 @@ pub async fn maybe_rotate(
         return Ok(false);
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
     let url = format!(
         "{}/agent/rotate",
         config.hub_http_base.trim_end_matches('/')
@@ -227,10 +229,14 @@ pub async fn maybe_rotate(
     let response = client
         .post(url)
         .bearer_auth(token.expose())
+        .timeout(Duration::from_secs(30))
         .send()
-        .await?
-        .error_for_status()?;
-    let body: Value = serde_json::from_str(&response.text().await?)?;
+        .await?;
+    if !response.status().is_success() {
+        return Err(RotationError::Status(response.status()));
+    }
+    let body = crate::transport::read_bounded(response, 64 * 1024).await?;
+    let body: Value = serde_json::from_slice(&body)?;
     let credential = body
         .get("credential")
         .and_then(Value::as_str)
