@@ -7,7 +7,6 @@ use glob::Pattern;
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, sinks::Bytes};
-use ignore::WalkBuilder;
 use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
@@ -161,17 +160,6 @@ fn append_partial_access(
             absence,
         ),
     );
-}
-
-fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
-    match error {
-        ignore::Error::WithPath { path, .. } => Some(path),
-        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
-            ignore_error_path(err)
-        }
-        ignore::Error::Partial(errors) => errors.iter().find_map(ignore_error_path),
-        _ => None,
-    }
 }
 
 fn record_search_error(
@@ -709,6 +697,34 @@ fn list_options(payload: &Map<String, Value>) -> Result<ListOptions, HandlerErro
     })
 }
 
+#[derive(Clone, Copy)]
+enum Traversal {
+    List { depth: usize, hidden: bool },
+    Search,
+}
+
+fn scan_entries(
+    root: &Path,
+    traversal: Traversal,
+) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
+    let mut walk = WalkDir::new(root).follow_root_links(false);
+    if let Traversal::List { depth, .. } = traversal {
+        walk = walk.min_depth(1).max_depth(depth).sort_by_file_name();
+    }
+    walk.into_iter().filter_entry(move |entry| {
+        // An explicitly requested root is never a prunable descendant.
+        if entry.depth() == 0 {
+            return true;
+        }
+        let name = entry.file_name().to_string_lossy();
+        let noise = SKIP_DIRS.contains(&name.as_ref());
+        match traversal {
+            Traversal::List { hidden, .. } => !noise && (hidden || !name.starts_with('.')),
+            Traversal::Search => !entry.file_type().is_dir() || !noise,
+        }
+    })
+}
+
 fn scan_list(
     policy: &Policy,
     root: &Path,
@@ -717,16 +733,13 @@ fn scan_list(
     deadline: Instant,
 ) -> Result<ListScanResult, HandlerError> {
     let mut scan = ListScanResult::default();
-    for entry in WalkDir::new(root)
-        .min_depth(1)
-        .max_depth(options.depth)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !SKIP_DIRS.contains(&name.as_ref()) && (options.hidden || !name.starts_with('.'))
-        })
-    {
+    for entry in scan_entries(
+        root,
+        Traversal::List {
+            depth: options.depth,
+            hidden: options.hidden,
+        },
+    ) {
         if Instant::now() >= deadline {
             scan.timed_out = true;
             break;
@@ -1161,25 +1174,12 @@ fn run_search_walk(
     state: &mut SearchState,
     deadline: Instant,
 ) -> Result<(), HandlerError> {
-    let mut walker = WalkBuilder::new(root);
-    walker
-        .hidden(false)
-        .parents(false)
-        .ignore(false)
-        .git_global(false)
-        .git_ignore(false)
-        .git_exclude(false)
-        .follow_links(false)
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !entry.file_type().is_some_and(|ty| ty.is_dir()) || !SKIP_DIRS.contains(&name.as_ref())
-        });
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::none())
         .build();
 
-    for entry in walker.build() {
+    for entry in scan_entries(root, Traversal::Search) {
         if Instant::now() >= deadline {
             state.timed_out = true;
             break;
@@ -1191,7 +1191,7 @@ fn run_search_walk(
                     .io_error()
                     .is_some_and(|io_error| io_error.kind() == io::ErrorKind::PermissionDenied)
                 {
-                    if let Some(path) = ignore_error_path(&error) {
+                    if let Some(path) = error.path() {
                         if path == root {
                             return Err(cannot_list_error(raw));
                         }
@@ -1215,7 +1215,7 @@ fn run_search_walk(
                 continue;
             }
         };
-        if !entry.file_type().is_some_and(|ty| ty.is_file()) || skip_search_file(entry.path()) {
+        if !entry.file_type().is_file() || skip_search_file(entry.path()) {
             continue;
         }
         if file_glob.is_some_and(|pattern| !pattern.matches(&entry.file_name().to_string_lossy())) {
@@ -1463,6 +1463,38 @@ mod tests {
         assert_eq!(matches[0]["file"], "keep.rs");
         assert_eq!(result["files_searched"], 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn traversal_preserves_distinct_list_and_search_policies() -> TestResult {
+        let dir = tempdir().test_value()?;
+        let root = dir.path().join("target");
+        fs::create_dir(&root).test_value()?;
+        fs::write(root.join(".gitignore"), "ignored.txt\n").test_value()?;
+        fs::write(root.join("ignored.txt"), "needle\n").test_value()?;
+        fs::write(root.join(".hidden"), "needle\n").test_value()?;
+        fs::create_dir(root.join("node_modules")).test_value()?;
+        fs::write(root.join("node_modules/a.txt"), "needle\n").test_value()?;
+
+        let policy = policy(dir.path());
+        let search_result = search(&policy, &search_payload(&root, "needle")).test_value()?;
+        let matches = search_result["matches"].as_array().test_value()?;
+        let mut files: Vec<_> = matches.iter().filter_map(|m| m["file"].as_str()).collect();
+        files.sort_unstable();
+        assert_eq!(files, [".hidden", "ignored.txt"]);
+
+        let mut payload =
+            Map::from_iter([("path".into(), Value::String(root.display().to_string()))]);
+        let visible = list(&policy, &payload).test_value()?;
+        assert_eq!(visible["total"], 1);
+        assert_eq!(visible["entries"][0]["name"], "ignored.txt");
+        payload.insert("show_hidden".into(), Value::Bool(true));
+        let all = list(&policy, &payload).test_value()?;
+        assert_eq!(all["total"], 3);
+        assert_eq!(all["entries"][0]["name"], ".gitignore");
+        assert_eq!(all["entries"][1]["name"], ".hidden");
+        assert_eq!(all["entries"][2]["name"], "ignored.txt");
         Ok(())
     }
 
