@@ -84,7 +84,8 @@ mod tests {
         cert.sign(&key, MessageDigest::sha256())?;
         let cert = cert.build();
 
-        let store = CertStore::builder().add_der_cert(cert.to_der()?).build()?;
+        let der = cert.to_der()?;
+        let store = CertStore::builder().add_der_cert(&der).build()?;
         let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
         acceptor.set_certificate(&cert)?;
         acceptor.set_private_key(&key)?;
