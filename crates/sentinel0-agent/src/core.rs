@@ -1080,7 +1080,7 @@ impl CoreDispatcher {
                 self.validate_allowed_segments(command, ExecMode::Strict, &analysis)?;
             }
             ExecMode::Allowlist => {
-                self.validate_allowed_segments(command, ExecMode::Allowlist, &analysis)?
+                self.validate_allowed_segments(command, ExecMode::Allowlist, &analysis)?;
             }
         }
 
