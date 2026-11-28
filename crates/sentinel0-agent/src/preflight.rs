@@ -100,8 +100,9 @@ async fn verify_enrollment_with_timeouts(
             let Some(frame) = frame else {
                 return PreflightResult::failed("closed", "");
             };
+            let policy_violation = frame.code == CloseCode::POLICY;
             let detail = format!("{}: {}", u16::from(frame.code), frame.reason);
-            if frame.code == CloseCode::POLICY {
+            if policy_violation {
                 PreflightResult::failed("enrollment_rejected", detail)
             } else {
                 PreflightResult::failed("closed", detail)
