@@ -5,7 +5,7 @@ use http::{HeaderValue, StatusCode, Uri, header::AUTHORIZATION};
 use std::{pin::pin, time::Duration};
 use wreq::{Client, ClientBuilder, Response, ws::WebSocket};
 
-pub(crate) fn client_builder() -> ClientBuilder {
+pub fn client_builder() -> ClientBuilder {
     // All outbound destinations are selected explicitly by the operation. Ambient
     // proxies and redirects would bypass that selection (and upload DNS pinning).
     Client::builder()
@@ -25,7 +25,7 @@ pub enum HubConnectError {
     Transport(#[from] wreq::Error),
 }
 
-pub(crate) async fn connect_hub(
+pub async fn connect_hub(
     client: &Client,
     base: &str,
     authorization: HeaderValue,
@@ -52,7 +52,7 @@ pub(crate) async fn connect_hub(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BodyError {
+pub enum BodyError {
     #[error("response exceeded the byte limit")]
     TooLarge,
     #[error(transparent)]
@@ -61,7 +61,7 @@ pub(crate) enum BodyError {
 
 /// Check advertised length before reading, then enforce the limit on actual bytes,
 /// including chunked responses. Callers stop consuming at the first error.
-pub(crate) fn bounded_body(
+pub fn bounded_body(
     response: Response,
     limit: u64,
 ) -> Result<impl Stream<Item = Result<Bytes, BodyError>>, BodyError> {
@@ -80,7 +80,7 @@ pub(crate) fn bounded_body(
     }))
 }
 
-pub(crate) async fn read_bounded(response: Response, limit: u64) -> Result<Vec<u8>, BodyError> {
+pub async fn read_bounded(response: Response, limit: u64) -> Result<Vec<u8>, BodyError> {
     let mut stream = pin!(bounded_body(response, limit)?);
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
