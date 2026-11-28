@@ -56,7 +56,7 @@ mod tests {
     use std::{net::SocketAddr, pin::Pin, time::Duration};
     use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-    use wreq::tls::CertStore;
+    use wreq::tls::trust::CertStore;
 
     const TLS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -158,11 +158,11 @@ mod tests {
             .build()?;
         let url = format!("wss://localhost:{}", addr.port());
         let mut ws = connect_hub(&client, &url, token).await?;
-        ws.send(wreq::ws::Message::Text("encrypted round trip".into()))
+        ws.send(wreq::ws::message::Message::Text("encrypted round trip".into()))
             .await?;
         let echoed = timeout(TLS_TIMEOUT, ws.recv()).await?.test_value()??;
         assert!(
-            matches!(echoed, wreq::ws::Message::Text(text) if text.as_str() == "encrypted round trip")
+            matches!(echoed, wreq::ws::message::Message::Text(text) if text.as_str() == "encrypted round trip")
         );
         timeout(TLS_TIMEOUT, server).await???;
         Ok(())
