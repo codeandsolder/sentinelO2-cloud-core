@@ -8,6 +8,7 @@ pub enum UtcSuffix {
     Compact,
 }
 
+#[must_use = "the returned string is the formatted UTC timestamp"]
 pub fn timestamp(value: UtcDateTime, suffix: UtcSuffix, fractional: bool) -> String {
     let (year, month, day) = (value.year(), u8::from(value.month()), value.day());
     let mut result = format!("{year:04}-{month:02}-{day:02}T{}", clock_time(value));
@@ -30,6 +31,7 @@ pub fn timestamp(value: UtcDateTime, suffix: UtcSuffix, fractional: bool) -> Str
     result
 }
 
+#[must_use = "the returned string is the UTC time of day"]
 pub fn clock_time(value: UtcDateTime) -> String {
     format!(
         "{:02}:{:02}:{:02}",
@@ -39,6 +41,7 @@ pub fn clock_time(value: UtcDateTime) -> String {
     )
 }
 
+#[must_use = "the returned string identifies the backup timestamp"]
 pub fn backup_stamp(value: UtcDateTime) -> String {
     format!(
         "{:04}{:02}{:02}-{:02}{:02}{:02}.{:06}",
@@ -52,14 +55,17 @@ pub fn backup_stamp(value: UtcDateTime) -> String {
     )
 }
 
+#[must_use = "the result is the timestamp in Unix milliseconds"]
 pub fn unix_millis(value: UtcDateTime) -> i64 {
     value.unix_timestamp() * 1_000 + i64::from(value.millisecond())
 }
 
+#[must_use = "the result is the timestamp in Unix seconds"]
 pub fn unix_seconds(value: UtcDateTime) -> f64 {
     (value - UtcDateTime::UNIX_EPOCH).as_seconds_f64()
 }
 
+#[must_use = "the result is the converted UTC timestamp, if representable"]
 pub fn from_system_time(value: std::time::SystemTime) -> Option<UtcDateTime> {
     let nanos = match value.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i128::try_from(duration.as_nanos()).ok()?,
@@ -70,13 +76,17 @@ pub fn from_system_time(value: std::time::SystemTime) -> Option<UtcDateTime> {
 
 pub(crate) mod wire {
     use super::*;
-    use serde::{Deserialize, Deserializer, Serializer, de::Error as _, ser::Error as _};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    fn wire_timestamp<E: serde::ser::Error>(value: UtcDateTime) -> Result<String, E> {
+        if !(0..=9999).contains(&value.year()) {
+            return Err(E::custom("UTC year outside RFC3339 range"));
+        }
+        Ok(timestamp(value, UtcSuffix::Z, true))
+    }
 
     pub fn serialize<S: Serializer>(value: &UtcDateTime, serializer: S) -> Result<S::Ok, S::Error> {
-        if !(0..=9999).contains(&value.year()) {
-            return Err(S::Error::custom("UTC year outside RFC3339 range"));
-        }
-        serializer.serialize_str(&timestamp(*value, UtcSuffix::Z, true))
+        serializer.serialize_str(&wire_timestamp::<S::Error>(*value)?)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
@@ -92,12 +102,7 @@ pub(crate) mod wire {
             serializer: S,
         ) -> Result<S::Ok, S::Error> {
             match value {
-                Some(value) => {
-                    if !(0..=9999).contains(&value.year()) {
-                        return Err(S::Error::custom("UTC year outside RFC3339 range"));
-                    }
-                    serializer.serialize_some(&timestamp(*value, UtcSuffix::Z, true))
-                }
+                Some(value) => serializer.serialize_some(&wire_timestamp::<S::Error>(*value)?),
                 None => serializer.serialize_none(),
             }
         }
