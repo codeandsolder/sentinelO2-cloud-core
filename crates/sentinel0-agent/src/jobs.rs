@@ -1,8 +1,7 @@
-use chrono::{DateTime, Utc};
-use num_traits::ToPrimitive;
 use sentinel0_proto::Message;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
+use time::UtcDateTime;
 
 pub const BACKGROUND_TIMEOUT_MAX_SECS: u64 = 3600;
 pub const MAX_EVENT_OUTPUT_BYTES: usize = 256 * 1024;
@@ -18,13 +17,19 @@ fn truncate_output(text: &str) -> (String, bool) {
     )
 }
 
+#[derive(Clone, Copy)]
+pub struct JobTiming {
+    pub started_at: UtcDateTime,
+    pub finished_at: UtcDateTime,
+    pub elapsed: Duration,
+}
+
 pub fn build_completed_event_data(
     job_id: &str,
     op: &str,
     host: &str,
     dispatch_response: &Message,
-    started_at: DateTime<Utc>,
-    finished_at: DateTime<Utc>,
+    timing: JobTiming,
 ) -> BTreeMap<String, Value> {
     let (ok, result, error) = match dispatch_response {
         Message::Response {
@@ -33,11 +38,7 @@ pub fn build_completed_event_data(
         _ => (false, None, None),
     };
 
-    let elapsed_millis = (finished_at - started_at)
-        .num_milliseconds()
-        .to_f64()
-        .unwrap_or(f64::MAX);
-    let duration_seconds = (elapsed_millis / 10.0).round() / 100.0;
+    let duration_seconds = (timing.elapsed.as_secs_f64() * 100.0).round() / 100.0;
 
     let (status, exit_code, output, error_message) = if ok {
         let timed_out = result
@@ -87,11 +88,19 @@ pub fn build_completed_event_data(
         ),
         (
             "started_at".into(),
-            Value::String(started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false)),
+            Value::String(sentinel0_proto::clock::timestamp(
+                timing.started_at,
+                sentinel0_proto::clock::UtcSuffix::Colon,
+                true,
+            )),
         ),
         (
             "finished_at".into(),
-            Value::String(finished_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false)),
+            Value::String(sentinel0_proto::clock::timestamp(
+                timing.finished_at,
+                sentinel0_proto::clock::UtcSuffix::Colon,
+                true,
+            )),
         ),
         ("duration_s".into(), Value::from(duration_seconds)),
         ("output".into(), Value::String(output)),
@@ -107,20 +116,24 @@ pub fn build_completed_event_data(
 mod tests {
     use super::*;
     use crate::test_support::{TestResult, TestValue as _};
-    use chrono::TimeZone;
     use sentinel0_proto::ResponseError;
 
-    fn times() -> TestResult<(DateTime<Utc>, DateTime<Utc>)> {
-        let start = Utc
-            .with_ymd_and_hms(2026, 9, 21, 21, 0, 0)
-            .single()
-            .test_value()?;
-        let finish = Utc
-            .with_ymd_and_hms(2026, 9, 21, 21, 0, 1)
-            .single()
-            .test_value()?
-            + chrono::Duration::milliseconds(234);
-        Ok((start, finish))
+    fn times() -> TestResult<JobTiming> {
+        let started_at = UtcDateTime::parse(
+            "2026-09-21T21:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .test_value()?;
+        let finished_at = UtcDateTime::parse(
+            "2026-09-21T21:00:01.234Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .test_value()?;
+        Ok(JobTiming {
+            started_at,
+            finished_at,
+            elapsed: Duration::from_millis(1234),
+        })
     }
 
     fn response(ok: bool, result: Option<BTreeMap<String, Value>>) -> Message {
@@ -134,7 +147,7 @@ mod tests {
 
     #[test]
     fn returncode_zero_maps_to_succeeded() -> TestResult {
-        let (start, finish) = times()?;
+        let timing = times()?;
         let data = build_completed_event_data(
             "job",
             "exec",
@@ -146,8 +159,7 @@ mod tests {
                     ("output".into(), Value::String("ok".into())),
                 ])),
             ),
-            start,
-            finish,
+            timing,
         );
         assert_eq!(data["status"], "succeeded");
         assert_eq!(data["exit_code"], 0);
@@ -159,7 +171,7 @@ mod tests {
 
     #[test]
     fn nonzero_and_missing_returncode_map_to_failed() -> TestResult {
-        let (start, finish) = times()?;
+        let timing = times()?;
         for result in [
             BTreeMap::from([("returncode".into(), Value::from(7))]),
             BTreeMap::new(),
@@ -169,8 +181,7 @@ mod tests {
                 "exec",
                 "host",
                 &response(true, Some(result)),
-                start,
-                finish,
+                timing,
             );
             assert_eq!(data["status"], "failed");
         }
@@ -180,7 +191,7 @@ mod tests {
 
     #[test]
     fn timed_out_overrides_returncode() -> TestResult {
-        let (start, finish) = times()?;
+        let timing = times()?;
         let data = build_completed_event_data(
             "job",
             "exec",
@@ -192,8 +203,7 @@ mod tests {
                     ("timed_out".into(), Value::Bool(true)),
                 ])),
             ),
-            start,
-            finish,
+            timing,
         );
         assert_eq!(data["status"], "timeout");
 
@@ -202,7 +212,7 @@ mod tests {
 
     #[test]
     fn handler_error_maps_to_failed_with_message() -> TestResult {
-        let (start, finish) = times()?;
+        let timing = times()?;
         let response = Message::Response {
             id: "req".into(),
             ok: false,
@@ -213,7 +223,7 @@ mod tests {
                 details: None,
             }),
         };
-        let data = build_completed_event_data("job", "exec", "host", &response, start, finish);
+        let data = build_completed_event_data("job", "exec", "host", &response, timing);
         assert_eq!(data["status"], "failed");
         assert_eq!(data["exit_code"], Value::Null);
         assert_eq!(data["error"], "fixture failed");
@@ -223,7 +233,7 @@ mod tests {
 
     #[test]
     fn oversized_output_is_byte_bounded_and_flagged() -> TestResult {
-        let (start, finish) = times()?;
+        let timing = times()?;
         let output = "x".repeat(MAX_EVENT_OUTPUT_BYTES + 100);
         let data = build_completed_event_data(
             "job",
@@ -236,8 +246,7 @@ mod tests {
                     ("output".into(), Value::String(output)),
                 ])),
             ),
-            start,
-            finish,
+            timing,
         );
         assert_eq!(
             data["output"].as_str().test_value()?.len(),
