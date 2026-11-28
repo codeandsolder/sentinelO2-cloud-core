@@ -223,7 +223,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=2ba0a68c4572ab0859c098e56f9ba78e16c5b5a7#2ba0a68c4572ab0859c098e56f9ba78e16c5b5a7"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=f6ae02c80ae54dfd3e59d7d440e616f523449cac#f6ae02c80ae54dfd3e59d7d440e616f523449cac"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -235,7 +235,7 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=2ba0a68c4572ab0859c098e56f9ba78e16c5b5a7#2ba0a68c4572ab0859c098e56f9ba78e16c5b5a7"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=f6ae02c80ae54dfd3e59d7d440e616f523449cac#f6ae02c80ae54dfd3e59d7d440e616f523449cac"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1840,7 +1840,7 @@ dependencies = [
 [[package]]
 name = "tokio-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=2ba0a68c4572ab0859c098e56f9ba78e16c5b5a7#2ba0a68c4572ab0859c098e56f9ba78e16c5b5a7"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=f6ae02c80ae54dfd3e59d7d440e616f523449cac#f6ae02c80ae54dfd3e59d7d440e616f523449cac"
 dependencies = [
  "btls",
  "btls-sys",
@@ -2245,7 +2245,7 @@ dependencies = [
 [[package]]
 name = "wreq"
 version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=3d34b6caf8bd37f2e19c234c129cb0f933789877#3d34b6caf8bd37f2e19c234c129cb0f933789877"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=9aea51315eb7e0a05dc66ac3d4a0a113f7c16213#9aea51315eb7e0a05dc66ac3d4a0a113f7c16213"
 dependencies = [
  "base64",
  "btls",
