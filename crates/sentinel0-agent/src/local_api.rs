@@ -807,16 +807,16 @@ async fn decode_http_response(
     response: wreq::Response,
 ) -> Result<Value, HandlerError> {
     let status = response.status();
-    let body = crate::transport::read_bounded(
+    let body = sentinel0_transport::read_bounded(
         response,
         u64::try_from(MAX_RESPONSE_BYTES).unwrap_or(u64::MAX),
     )
     .await
     .map_err(|error| match error {
-        crate::transport::BodyError::TooLarge => {
+        sentinel0_transport::BodyError::TooLarge => {
             HandlerError::new("too_large", "endpoint response exceeded the cap")
         }
-        crate::transport::BodyError::Transport(error) => http_error(endpoint, &error),
+        sentinel0_transport::BodyError::Transport(error) => http_error(endpoint, &error),
     })?;
 
     if status.is_client_error() || status.is_server_error() {
@@ -879,7 +879,7 @@ async fn call_http(
     let url = format!("http://localhost{target}");
     let proxy = wreq::Proxy::unix(Path::new(&endpoint.path))
         .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
-    let client = crate::transport::client_builder()
+    let client = sentinel0_transport::client_builder()
         .proxy(proxy)
         .http1_only()
         .timeout(endpoint.timeout)

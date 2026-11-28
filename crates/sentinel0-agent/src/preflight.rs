@@ -52,7 +52,7 @@ async fn verify_enrollment_with_timeouts(
         Ok(header) => header,
         Err(error) => return PreflightResult::failed("invalid_token_header", error.to_string()),
     };
-    let client = match transport::client_builder().build() {
+    let client = match sentinel0_transport::client_builder().build() {
         Ok(client) => client,
         Err(error) => return PreflightResult::failed("error", error.to_string()),
     };
@@ -115,7 +115,10 @@ async fn verify_enrollment_with_timeouts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, TestValue as _};
+    use crate::{
+        test_handshake::AssertHeaders,
+        test_support::{TestResult, TestValue as _},
+    };
     use futures_util::SinkExt;
     use http::header::AUTHORIZATION;
     use std::io;
@@ -124,26 +127,10 @@ mod tests {
         accept_async, accept_hdr_async,
         tungstenite::{
             Message as WsMessage,
-            handshake::server::{Callback, ErrorResponse, Request, Response},
+            handshake::server::Request,
             protocol::{CloseFrame, frame::coding::CloseCode},
         },
     };
-
-    struct AssertHeaders<F>(F);
-
-    impl<F> Callback for AssertHeaders<F>
-    where
-        F: FnOnce(&Request),
-    {
-        fn on_request(
-            self,
-            request: &Request,
-            response: Response,
-        ) -> Result<Response, ErrorResponse> {
-            (self.0)(request);
-            Ok(response)
-        }
-    }
 
     #[tokio::test]
     async fn silence_means_accepted_and_request_has_auth() -> TestResult {

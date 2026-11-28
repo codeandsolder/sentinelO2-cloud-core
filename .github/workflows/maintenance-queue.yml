@@ -26,6 +26,16 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Resolve the native quarantined compiler
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
+        with:
+          rust-toolchain: ${{ steps.compiler.outputs.channel }}
+
       - name: Prepare upstream parity label
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,7 +51,7 @@ jobs:
         run: |
           set -uo pipefail
           rm -rf /tmp/upstream-releases
-          if python3 .github/scripts/upstream-parity-report.py \
+          if cargo run --locked -p sentinel0-upstream-parity -- \
               --baseline .github/upstream-parity.json \
               --meta /tmp/upstream-meta.json \
               --out-dir /tmp/upstream-releases \
@@ -115,3 +125,7 @@ jobs:
           else
             gh issue create --repo "$REPO" --title "maintenance detector: upstream parity failed" --label "automation:maintenance-error" --body-file /tmp/upstream-error.md
           fi
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main

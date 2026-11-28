@@ -32,7 +32,6 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends ripgrep shellcheck
         cargo metadata --locked --format-version 1 >/dev/null
-        python3 -m unittest discover -s .github/scripts -p 'test_*.py'
         cargo fmt --all -- --check
         cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo test --locked --workspace --all-targets
@@ -51,8 +50,8 @@ jobs:
     with:
       runner: windows-2025
       command: |
-        cargo check --locked -p sentinel0-agent -p sentinel0-proto --all-targets
-        cargo test --locked -p sentinel0-proto
+        cargo check --locked --workspace --all-targets
+        cargo test --locked -p sentinel0-proto -p sentinel0-transport -p sentinel0-upstream-parity
         cargo test --locked -p sentinel0-agent --lib --tests -- --test-threads=4
         cargo run --locked -p sentinel0-agent --bin sentinelx-core -- --help >/dev/null
 

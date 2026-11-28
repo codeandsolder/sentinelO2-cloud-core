@@ -1459,7 +1459,7 @@ dependencies = [
  "atomic-write-file",
  "base64",
  "brush-parser",
- "bytes",
+ "btls",
  "clap",
  "flate2",
  "futures-util",
@@ -1475,6 +1475,7 @@ dependencies = [
  "regex",
  "renamest",
  "sentinel0-proto",
+ "sentinel0-transport",
  "serde",
  "serde_json",
  "sha2",
@@ -1486,6 +1487,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tokio-btls",
  "tokio-tungstenite",
  "tokio-util",
  "toml",
@@ -1507,6 +1509,34 @@ dependencies = [
  "serde_json",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "sentinel0-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "thiserror",
+ "tokio",
+ "wreq",
+]
+
+[[package]]
+name = "sentinel0-upstream-parity"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "sentinel0-transport",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "url",
+ "wreq",
 ]
 
 [[package]]

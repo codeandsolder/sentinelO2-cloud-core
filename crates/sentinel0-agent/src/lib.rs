@@ -2,6 +2,10 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 #[cfg(test)]
+#[path = "../tests/common/handshake.rs"]
+mod test_handshake;
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use std::{fmt::Debug, io};
 
@@ -407,7 +411,7 @@ impl<D: Dispatcher> Agent<D> {
     /// # Errors
     /// Returns an error when a hub session cannot be established or a non-recoverable agent failure occurs.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), AgentError> {
-        let client = transport::client_builder().build()?;
+        let client = sentinel0_transport::client_builder().build()?;
         let mut attempt = 0usize;
         let mut retry_hint = None;
         let mut tasks = JoinSet::new();
