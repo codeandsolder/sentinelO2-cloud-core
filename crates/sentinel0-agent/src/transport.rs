@@ -158,8 +158,10 @@ mod tests {
             .build()?;
         let url = format!("wss://localhost:{}", addr.port());
         let mut ws = connect_hub(&client, &url, token).await?;
-        ws.send(wreq::ws::message::Message::Text("encrypted round trip".into()))
-            .await?;
+        ws.send(wreq::ws::message::Message::Text(
+            "encrypted round trip".into(),
+        ))
+        .await?;
         let echoed = timeout(TLS_TIMEOUT, ws.recv()).await?.test_value()??;
         assert!(
             matches!(echoed, wreq::ws::message::Message::Text(text) if text.as_str() == "encrypted round trip")
