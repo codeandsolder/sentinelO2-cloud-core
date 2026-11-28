@@ -52,7 +52,8 @@ pub mod fsutil;
 pub mod git_common;
 mod git_ops;
 pub mod handler_error;
-mod happy_eyeballs;
+mod transport;
+pub use transport::HubConnectError;
 pub mod host;
 pub mod identity;
 pub mod instance_lock;
@@ -85,8 +86,8 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-use futures_util::{FutureExt, SinkExt, StreamExt};
-use http::{HeaderValue, header::AUTHORIZATION};
+use futures_util::{FutureExt, StreamExt};
+use http::HeaderValue;
 use rand::RngExt;
 use sentinel0_proto::{HostInfo, Message, Op, PreferredProfile, bounding::bound_response_default};
 use std::{
@@ -98,18 +99,13 @@ use tokio::{
     task::JoinSet,
     time::{Instant, interval, sleep, timeout},
 };
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::{
-    self, Message as WsMessage,
-    protocol::{WebSocketConfig, frame::coding::CloseCode},
-};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use wreq::ws::message::{CloseCode, Message as WsMessage};
 
 const MAX_IN_FLIGHT_TASKS: usize = 64;
 
-type AgentWebSocket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type AgentWebSocket = wreq::ws::WebSocket;
 
 fn add_response_time(message: &mut Message) {
     if let Message::Response {
@@ -353,7 +349,9 @@ pub enum AgentError {
     #[error("bad authorization header: {0}")]
     InvalidHeader(#[from] http::header::InvalidHeaderValue),
     #[error("websocket: {0}")]
-    WebSocket(#[from] tungstenite::Error),
+    WebSocket(#[from] wreq::Error),
+    #[error(transparent)]
+    HubConnect(#[from] HubConnectError),
     #[error("protocol JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("hub rejected agent: {code}: {message}")]
@@ -409,6 +407,7 @@ impl<D: Dispatcher> Agent<D> {
     /// # Errors
     /// Returns an error when a hub session cannot be established or a non-recoverable agent failure occurs.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), AgentError> {
+        let client = transport::client_builder().build()?;
         let mut attempt = 0usize;
         let mut retry_hint = None;
         let mut tasks = JoinSet::new();
@@ -424,7 +423,7 @@ impl<D: Dispatcher> Agent<D> {
                 }
             }
 
-            match self.serve_one(&cancel, &mut tasks).await {
+            match self.serve_one(&client, &cancel, &mut tasks).await {
                 Ok(SessionEnd::Clean) => {
                     attempt = 0;
                 }
@@ -462,19 +461,14 @@ impl<D: Dispatcher> Agent<D> {
         Ok(())
     }
 
-    async fn open_websocket(&self) -> Result<AgentWebSocket, AgentError> {
-        let url = format!(
-            "{}/agent/connect",
-            self.config.hub_ws_base.trim_end_matches('/')
-        );
-        let mut req = url.into_client_request()?;
-        req.headers_mut()
-            .insert(AUTHORIZATION, self.config.token.bearer_header()?);
-        let websocket_config = WebSocketConfig::default()
-            .max_message_size(Some(sentinel0_proto::MAX_BINARY_FRAME_BYTES));
-        let (ws, _) = timeout(
+    async fn open_websocket(&self, client: &wreq::Client) -> Result<AgentWebSocket, AgentError> {
+        let ws = timeout(
             self.config.connect_timeout,
-            happy_eyeballs::connect(req, Some(websocket_config)),
+            transport::connect_hub(
+                client,
+                &self.config.hub_ws_base,
+                self.config.token.bearer_header()?,
+            ),
         )
         .await
         .map_err(|_| AgentError::Timeout("connect"))??;
@@ -497,7 +491,7 @@ impl<D: Dispatcher> Agent<D> {
 
         let first = tokio::select! {
             () = cancel.cancelled() => {
-                if let Err(error) = ws.close(None).await {
+                if let Err(error) = ws.send(WsMessage::Close(None)).await {
                     debug!(?error, "websocket close failed during cancellation");
                 }
                 return Ok(Some(SessionEnd::Clean));
@@ -537,9 +531,9 @@ impl<D: Dispatcher> Agent<D> {
         Ok(true)
     }
 
-    async fn post_welcome(&self) -> Result<(), AgentError> {
+    async fn post_welcome(&self, client: &wreq::Client) -> Result<(), AgentError> {
         if let Some(rotation_config) = self.rotation.as_ref() {
-            match rotation::maybe_rotate(rotation_config, &self.config.token).await {
+            match rotation::maybe_rotate(client, rotation_config, &self.config.token).await {
                 Ok(true) => {
                     info!(
                         "credential rotated; new credential will be preferred on next process start"
@@ -999,7 +993,7 @@ impl<D: Dispatcher> Agent<D> {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
-                    if let Err(error) = ws.close(None).await {
+                    if let Err(error) = ws.send(WsMessage::Close(None)).await {
                         debug!(?error, "websocket close failed during cancellation");
                     }
                     return Ok(SessionEnd::Clean);
@@ -1044,7 +1038,7 @@ impl<D: Dispatcher> Agent<D> {
                             let hint = frame
                                 .as_ref()
                                 .and_then(|frame| parse_retry_after(frame.reason.as_str()));
-                            return Ok(if frame.as_ref().is_some_and(|frame| frame.code == CloseCode::Restart) {
+                            return Ok(if frame.as_ref().is_some_and(|frame| frame.code == CloseCode::RESTART) {
                                 SessionEnd::Restart(hint)
                             } else {
                                 SessionEnd::Lost(hint)
@@ -1086,14 +1080,15 @@ impl<D: Dispatcher> Agent<D> {
 
     async fn serve_one(
         &self,
+        client: &wreq::Client,
         cancel: &CancellationToken,
         tasks: &mut JoinSet<()>,
     ) -> Result<SessionEnd, AgentError> {
-        let mut ws = self.open_websocket().await?;
+        let mut ws = self.open_websocket(client).await?;
         if let Some(end) = self.exchange_welcome(&mut ws, cancel).await? {
             return Ok(end);
         }
-        self.post_welcome().await?;
+        self.post_welcome(client).await?;
         self.session_loop(&mut ws, cancel, tasks).await
     }
 }

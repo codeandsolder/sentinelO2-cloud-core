@@ -785,7 +785,7 @@ where
 }
 
 #[cfg(unix)]
-fn http_error(endpoint: &Endpoint, error: &reqwest::Error) -> HandlerError {
+fn http_error(endpoint: &Endpoint, error: &wreq::Error) -> HandlerError {
     if error.is_timeout() {
         HandlerError::new(
             "timeout",
@@ -804,33 +804,20 @@ fn http_error(endpoint: &Endpoint, error: &reqwest::Error) -> HandlerError {
 #[cfg(unix)]
 async fn decode_http_response(
     endpoint: &Endpoint,
-    mut response: reqwest::Response,
+    response: wreq::Response,
 ) -> Result<Value, HandlerError> {
     let status = response.status();
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-    {
-        return Err(HandlerError::new(
-            "too_large",
-            "endpoint response exceeded the cap",
-        ));
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| http_error(endpoint, &error))?
-    {
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err(HandlerError::new(
-                "too_large",
-                "endpoint response exceeded the cap",
-            ));
+    let body = crate::transport::read_bounded(
+        response,
+        u64::try_from(MAX_RESPONSE_BYTES).unwrap_or(u64::MAX),
+    )
+    .await
+    .map_err(|error| match error {
+        crate::transport::BodyError::TooLarge => {
+            HandlerError::new("too_large", "endpoint response exceeded the cap")
         }
-        body.extend_from_slice(&chunk);
-    }
+        crate::transport::BodyError::Transport(error) => http_error(endpoint, &error),
+    })?;
 
     if status.is_client_error() || status.is_server_error() {
         return Err(HandlerError::new(
@@ -876,23 +863,31 @@ async fn call_http(
             format!("request must look like 'GET /path', got {request:?}"),
         )
     })?;
-    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|error| {
+    let method = http::Method::from_bytes(method.as_bytes()).map_err(|error| {
         HandlerError::new(
             "bad_action",
             format!("invalid HTTP method {method:?}: {error}"),
         )
     })?;
     let target = render(target.trim(), params)?;
+    if !target.starts_with('/') {
+        return Err(HandlerError::new(
+            "bad_action",
+            "HTTP request target must be an absolute path",
+        ));
+    }
     let url = format!("http://localhost{target}");
-    let client = reqwest::Client::builder()
-        .unix_socket(Path::new(&endpoint.path))
+    let proxy = wreq::Proxy::unix(Path::new(&endpoint.path))
+        .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
+    let client = crate::transport::client_builder()
+        .proxy(proxy)
+        .http1_only()
         .timeout(endpoint.timeout)
-        .no_proxy()
         .build()
         .map_err(|error| HandlerError::new("internal_error", error.to_string()))?;
     let response = client
         .request(method, url)
-        .header(reqwest::header::ACCEPT, "application/json")
+        .header(http::header::ACCEPT, "application/json")
         .send()
         .await
         .map_err(|error| http_error(endpoint, &error))?;

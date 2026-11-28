@@ -1,9 +1,11 @@
-use crate::{AuthToken, happy_eyeballs};
+use crate::{
+    AuthToken,
+    transport::{self, HubConnectError},
+};
 use futures_util::StreamExt;
-use http::header::AUTHORIZATION;
 use std::time::Duration;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::{self, Message as WsMessage, client::IntoClientRequest};
+use wreq::ws::message::{CloseCode, Message as WsMessage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreflightResult {
@@ -46,28 +48,29 @@ async fn verify_enrollment_with_timeouts(
     connect_timeout: Duration,
     accept_window: Duration,
 ) -> PreflightResult {
-    let url = format!("{}/agent/connect", hub_ws_base.trim_end_matches('/'));
-    let mut request = match url.into_client_request() {
-        Ok(request) => request,
-        Err(error) => return PreflightResult::failed("invalid_hub_url", error.to_string()),
-    };
     let header = match token.bearer_header() {
         Ok(header) => header,
         Err(error) => return PreflightResult::failed("invalid_token_header", error.to_string()),
     };
-    request.headers_mut().insert(AUTHORIZATION, header);
-
-    let connected = timeout(connect_timeout, happy_eyeballs::connect(request, None)).await;
-    let (mut websocket, _) = match connected {
+    let client = match transport::client_builder().build() {
+        Ok(client) => client,
+        Err(error) => return PreflightResult::failed("error", error.to_string()),
+    };
+    let mut websocket = match timeout(
+        connect_timeout,
+        transport::connect_hub(&client, hub_ws_base, header),
+    )
+    .await
+    {
         Err(_) => return PreflightResult::failed("unreachable", "connection timed out"),
-        Ok(Err(tungstenite::Error::Io(error))) => {
-            return PreflightResult::failed("unreachable", error.to_string());
+        Ok(Err(HubConnectError::InvalidUrl(error))) => {
+            return PreflightResult::failed("invalid_hub_url", error);
         }
-        Ok(Err(tungstenite::Error::Http(response))) => {
-            return PreflightResult::failed(
-                "rejected_by_hub",
-                format!("HTTP {}", response.status()),
-            );
+        Ok(Err(HubConnectError::Status(status))) => {
+            return PreflightResult::failed("rejected_by_hub", format!("HTTP {status}"));
+        }
+        Ok(Err(HubConnectError::Transport(error))) if error.is_connect() || error.is_timeout() => {
+            return PreflightResult::failed("unreachable", error.to_string());
         }
         Ok(Err(error)) => return PreflightResult::failed("error", error.to_string()),
         Ok(Ok(value)) => value,
@@ -97,8 +100,9 @@ async fn verify_enrollment_with_timeouts(
             let Some(frame) = frame else {
                 return PreflightResult::failed("closed", "");
             };
+            let policy_violation = frame.code == CloseCode::POLICY;
             let detail = format!("{}: {}", u16::from(frame.code), frame.reason);
-            if frame.code == tungstenite::protocol::frame::coding::CloseCode::Policy {
+            if policy_violation {
                 PreflightResult::failed("enrollment_rejected", detail)
             } else {
                 PreflightResult::failed("closed", detail)
@@ -113,11 +117,13 @@ mod tests {
     use super::*;
     use crate::test_support::{TestResult, TestValue as _};
     use futures_util::SinkExt;
+    use http::header::AUTHORIZATION;
     use std::io;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{
         accept_async, accept_hdr_async,
         tungstenite::{
+            Message as WsMessage,
             handshake::server::{Callback, ErrorResponse, Request, Response},
             protocol::{CloseFrame, frame::coding::CloseCode},
         },
