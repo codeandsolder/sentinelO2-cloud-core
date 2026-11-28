@@ -401,13 +401,7 @@ fn validator_argv(
             _ => return Ok(None),
         }
     } else if let Some(custom) = custom {
-        if let Some(kind) = policy.tooling.direct_python_violation(custom) {
-            return Err(HandlerError::new(
-                "use_uv",
-                format!("direct {kind} validator is disabled; invoke it through uv"),
-            ));
-        }
-        shlex::split(custom)
+        let argv: Vec<String> = shlex::split(custom)
             .ok_or_else(|| {
                 HandlerError::new("invalid_payload", "validator has invalid shell quoting")
             })?
@@ -419,7 +413,14 @@ fn validator_argv(
                     part
                 }
             })
-            .collect()
+            .collect();
+        if let Some(kind) = policy.tooling.argv_python_violation(&argv) {
+            return Err(HandlerError::new(
+                "use_uv",
+                format!("direct {kind} validator is disabled; invoke it through uv"),
+            ));
+        }
+        argv
     } else {
         return Ok(None);
     };
