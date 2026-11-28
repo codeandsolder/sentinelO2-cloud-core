@@ -1460,7 +1460,6 @@ dependencies = [
  "base64",
  "brush-parser",
  "btls",
- "bytes",
  "clap",
  "flate2",
  "futures-util",

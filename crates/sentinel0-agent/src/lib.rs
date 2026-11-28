@@ -2,6 +2,10 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 #[cfg(test)]
+#[path = "../tests/common/handshake.rs"]
+mod test_handshake;
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use std::{fmt::Debug, io};
 

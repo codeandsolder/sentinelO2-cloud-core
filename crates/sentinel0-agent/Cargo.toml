@@ -8,7 +8,6 @@ rust-version.workspace = true
 [dependencies]
 atomic-write-file.workspace = true
 base64.workspace = true
-bytes.workspace = true
 brush-parser.workspace = true
 clap.workspace = true
 time.workspace = true
@@ -54,7 +53,6 @@ openssh.workspace = true
 btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "f6ae02c80ae54dfd3e59d7d440e616f523449cac" }
 tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "f6ae02c80ae54dfd3e59d7d440e616f523449cac" }
 tokio-tungstenite.workspace = true
-tokio.workspace = true
 
 
 [[bin]]

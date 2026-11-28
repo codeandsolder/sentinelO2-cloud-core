@@ -41,7 +41,10 @@ pub async fn connect_hub(
 #[cfg(test)]
 mod tests {
     use super::{HeaderValue, connect_hub};
-    use crate::test_support::{TestResult, TestValue as _};
+    use crate::{
+        test_handshake::AssertHeaders,
+        test_support::{TestResult, TestValue as _},
+    };
     use btls::{
         asn1::Asn1Time,
         bn::BigNum,
@@ -55,7 +58,7 @@ mod tests {
     use futures_util::{SinkExt as _, StreamExt as _};
     use std::{net::SocketAddr, pin::Pin, time::Duration};
     use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
-    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::tungstenite::handshake::server::Request;
     use wreq::tls::trust::CertStore;
 
     const TLS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -105,14 +108,13 @@ mod tests {
             Pin::new(&mut stream).accept().await.test_value()?;
             let mut ws = tokio_tungstenite::accept_hdr_async(
                 stream,
-                |request: &Request, response: Response| {
+                AssertHeaders(|request: &Request| {
                     assert_eq!(request.uri().path(), "/agent/connect");
                     assert_eq!(
                         request.headers().get("authorization"),
                         Some(&HeaderValue::from_static("Bearer test-token"))
                     );
-                    Ok(response)
-                },
+                }),
             )
             .await?;
             let message = ws.next().await.test_value()??;
