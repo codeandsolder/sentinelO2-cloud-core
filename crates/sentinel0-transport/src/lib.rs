@@ -24,7 +24,7 @@ pub enum BodyError {
 }
 
 /// Check advertised length before reading, then enforce the limit on actual bytes,
-/// including chunked responses. Callers stop consuming at the first error.
+/// including chunked responses. The stream terminates after the first error.
 ///
 /// # Errors
 /// Returns an error if the declared length exceeds the limit. The stream
@@ -39,13 +39,23 @@ pub fn bounded_body(
     {
         return Err(BodyError::TooLarge);
     }
-    let mut remaining = limit;
-    Ok(response.bytes_stream().map(move |chunk| {
+    Ok(limit_stream(response.bytes_stream(), limit))
+}
+
+fn limit_stream<S>(stream: S, limit: u64) -> impl Stream<Item = Result<Bytes, BodyError>>
+where
+    S: Stream<Item = Result<Bytes, wreq::Error>> + Unpin,
+{
+    futures_util::stream::try_unfold((stream, limit), |(mut stream, remaining)| async move {
+        let Some(chunk) = stream.next().await else {
+            return Ok(None);
+        };
         let chunk = chunk?;
         let len = u64::try_from(chunk.len()).map_err(|_| BodyError::TooLarge)?;
-        remaining = remaining.checked_sub(len).ok_or(BodyError::TooLarge)?;
-        Ok(chunk)
-    }))
+        let remaining = remaining.checked_sub(len).ok_or(BodyError::TooLarge)?;
+        Ok(Some((chunk, (stream, remaining))))
+    })
+    .fuse()
 }
 
 /// Collect a response while enforcing the byte limit.
@@ -108,6 +118,27 @@ mod tests {
             }
             server.await??;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_cannot_resume_after_overflow() -> TestResult {
+        let chunks = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cdef")),
+            Ok(Bytes::from_static(b"g")),
+        ]);
+        let mut stream = pin!(limit_stream(chunks, 3));
+        assert_eq!(
+            stream.next().await.transpose()?,
+            Some(Bytes::from_static(b"ab"))
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(BodyError::TooLarge))
+        ));
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
         Ok(())
     }
 
