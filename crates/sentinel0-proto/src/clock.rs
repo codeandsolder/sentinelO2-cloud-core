@@ -159,8 +159,8 @@ mod tests {
             "1969-12-31T23:59:59.999999999Z"
         );
         assert_eq!(
-            from_system_time(std::time::UNIX_EPOCH - std::time::Duration::from_nanos(1)),
-            Some(value)
+            from_system_time(std::time::UNIX_EPOCH - std::time::Duration::from_nanos(100)),
+            Some(UtcDateTime::from_unix_timestamp_nanos(-100)?)
         );
         Ok(())
     }
