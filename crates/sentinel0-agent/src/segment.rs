@@ -107,6 +107,7 @@ impl AssignmentKind {
         !matches!(self, Self::None)
     }
 
+    #[cfg(test)]
     const fn only(self) -> bool {
         matches!(self, Self::Only)
     }
@@ -123,11 +124,20 @@ struct CommandInfo {
 }
 
 #[derive(Debug, Default)]
-struct Analysis {
+pub(crate) struct Analysis {
     commands: Vec<CommandInfo>,
-    substitution: Option<&'static str>,
-    file_redirection: Option<String>,
+    pub(crate) substitution: Option<&'static str>,
+    pub(crate) file_redirection: Option<String>,
     seen_top_level_command: bool,
+}
+
+impl Analysis {
+    pub(crate) fn invocations(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.commands
+            .iter()
+            .filter(|command| !command.program.is_empty())
+            .map(|command| (command.program.as_str(), command.arguments.as_slice()))
+    }
 }
 
 fn parse_program(source: &str) -> Result<Program, UnparseableCommand> {
@@ -762,14 +772,15 @@ fn walk_program(
     Ok(())
 }
 
-fn analyze(command: &str) -> Result<Analysis, UnparseableCommand> {
+pub(crate) fn analyze(command: &str) -> Result<Analysis, UnparseableCommand> {
     let mut analysis = Analysis::default();
     scan_nested_source(command, &mut analysis, 0)?;
     Ok(analysis)
 }
 
 #[must_use = "the returned segments represent top-level command boundaries"]
-pub fn split_top_level(command: &str) -> Vec<String> {
+#[cfg(test)]
+fn split_top_level(command: &str) -> Vec<String> {
     analyze(command).map_or_else(
         |_| vec![command.trim().to_owned()],
         |analysis| {
@@ -784,7 +795,8 @@ pub fn split_top_level(command: &str) -> Vec<String> {
 }
 
 #[must_use = "the result identifies detected shell substitution syntax"]
-pub fn has_substitution(command: &str) -> Option<&'static str> {
+#[cfg(test)]
+fn has_substitution(command: &str) -> Option<&'static str> {
     analyze(command)
         .ok()
         .and_then(|analysis| analysis.substitution)
@@ -798,23 +810,28 @@ pub fn control_character(command: &str) -> Option<char> {
 }
 
 #[must_use = "the result identifies redirection syntax that requires policy evaluation"]
-pub fn file_redirection(command: &str) -> Option<String> {
+#[cfg(test)]
+fn file_redirection(command: &str) -> Option<String> {
     analyze(command)
         .ok()
         .and_then(|analysis| analysis.file_redirection)
 }
 
-fn first_unauthorised(policy: &Policy, analysis: Analysis, chain: bool) -> Option<String> {
-    for command in analysis.commands {
+pub(crate) fn first_unauthorised(
+    policy: &Policy,
+    analysis: &Analysis,
+    chain: bool,
+) -> Option<String> {
+    for command in &analysis.commands {
         // Assignments can affect command resolution directly (PATH), alter what an
         // otherwise allowlisted executable loads (LD_PRELOAD, PYTHONPATH, ...), or
         // persist for later segments. A variable blacklist would always be partial.
         if command.assignment_kind.any() {
-            return Some(command.rendered);
+            return Some(command.rendered.clone());
         }
         let name = command.program.as_str();
         if STATEFUL_OR_META_BUILTINS.contains(&name) {
-            return Some(command.rendered);
+            return Some(command.rendered.clone());
         }
         // Bash printf is normally harmless, but `printf -v NAME ...` writes a
         // shell variable and can therefore mutate PATH or another runtime hook.
@@ -824,24 +841,24 @@ fn first_unauthorised(policy: &Policy, analysis: Analysis, chain: bool) -> Optio
                 .first()
                 .is_some_and(|arg| arg.starts_with("-v"))
         {
-            return Some(command.rendered);
+            return Some(command.rendered.clone());
         }
         if policy.is_command_allowed(&command.rendered) {
             continue;
         }
         if chain && SAFE_BUILTINS.contains(&name) {
             if command.has_unsafe_redirection {
-                return Some(command.rendered);
+                return Some(command.rendered.clone());
             }
             continue;
         }
         if command.filter_position && READ_ONLY_FILTERS.contains(&name) {
             if filter_unsafe(name, &command.arguments, command.has_unsafe_redirection) {
-                return Some(command.rendered);
+                return Some(command.rendered.clone());
             }
             continue;
         }
-        return Some(command.rendered);
+        return Some(command.rendered.clone());
     }
     None
 }
@@ -850,22 +867,24 @@ fn first_unauthorised(policy: &Policy, analysis: Analysis, chain: bool) -> Optio
 ///
 /// # Errors
 /// Returns [`UnparseableCommand`] when shell structure cannot be checked safely.
-pub fn unauthorised_chain(
+#[cfg(test)]
+fn unauthorised_chain(
     policy: &Policy,
     command: &str,
 ) -> Result<Option<String>, UnparseableCommand> {
-    analyze(command).map(|analysis| first_unauthorised(policy, analysis, true))
+    analyze(command).map(|analysis| first_unauthorised(policy, &analysis, true))
 }
 
 /// Returns the first command segment not authorised by strict policy.
 ///
 /// # Errors
 /// Returns [`UnparseableCommand`] when shell structure cannot be checked safely.
-pub fn unauthorised_segment(
+#[cfg(test)]
+fn unauthorised_segment(
     policy: &Policy,
     command: &str,
 ) -> Result<Option<String>, UnparseableCommand> {
-    analyze(command).map(|analysis| first_unauthorised(policy, analysis, false))
+    analyze(command).map(|analysis| first_unauthorised(policy, &analysis, false))
 }
 
 #[cfg(test)]

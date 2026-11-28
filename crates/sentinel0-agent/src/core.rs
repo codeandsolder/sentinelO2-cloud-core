@@ -951,15 +951,24 @@ impl CoreDispatcher {
 
     /// Report parsed allowlist failures consistently while retaining the
     /// strict and chain parsers' distinct authorization semantics and wording.
-    fn validate_allowed_segments(&self, command: &str, mode: ExecMode) -> Result<(), HandlerError> {
+    fn validate_allowed_segments(
+        &self,
+        command: &str,
+        mode: ExecMode,
+        analysis: &Result<segment::Analysis, segment::UnparseableCommand>,
+    ) -> Result<(), HandlerError> {
         let (parsed, segment_prefix, structure_prefix) = match mode {
             ExecMode::Strict => (
-                segment::unauthorised_segment(&self.policy, command),
+                analysis
+                    .as_ref()
+                    .map(|analysis| segment::first_unauthorised(&self.policy, analysis, false)),
                 "strict exec segment",
                 "strict command structure",
             ),
             ExecMode::Allowlist => (
-                segment::unauthorised_chain(&self.policy, command),
+                analysis
+                    .as_ref()
+                    .map(|analysis| segment::first_unauthorised(&self.policy, analysis, true)),
                 "command segment",
                 "command structure",
             ),
@@ -986,13 +995,39 @@ impl CoreDispatcher {
                 format!("{structure_prefix} cannot be checked safely: {reason}"),
                 Map::from_iter([
                     ("command".into(), Value::String(command.into())),
-                    ("reason".into(), Value::String(reason)),
+                    ("reason".into(), Value::String(reason.clone())),
                 ]),
             )),
         }
     }
 
     fn validate_exec_policy(&self, command: &str) -> Result<(), HandlerError> {
+        if self.policy.exec_mode == ExecMode::Unrestricted
+            && !self.policy.tooling.forbid_direct_python
+        {
+            return Ok(());
+        }
+        let analysis = segment::analyze(command);
+        if let Some(kind) = self
+            .policy
+            .tooling
+            .shell_python_violation(command, analysis.as_ref().ok())
+        {
+            let replacement = if kind == "pip" {
+                "uv pip … (or uv sync / uv tool install)"
+            } else {
+                "uv run --no-project python …"
+            };
+            return Err(HandlerError::with_details(
+                "use_uv",
+                format!("direct {kind} invocation is disabled; use {replacement}"),
+                Map::from_iter([
+                    ("command".into(), Value::String(command.into())),
+                    ("replacement".into(), Value::String(replacement.into())),
+                ]),
+            ));
+        }
+
         if self.policy.exec_mode != ExecMode::Unrestricted
             && self.policy.allowed_commands.is_empty()
         {
@@ -1014,7 +1049,11 @@ impl CoreDispatcher {
                         format!("strict exec refuses control character {control:?}"),
                     ));
                 }
-                if let Some(substitution) = segment::has_substitution(command) {
+                if let Some(substitution) = analysis
+                    .as_ref()
+                    .ok()
+                    .and_then(|analysis| analysis.substitution)
+                {
                     return Err(HandlerError::with_details(
                         "command_not_allowed",
                         format!("strict exec refuses {substitution} command substitution"),
@@ -1024,19 +1063,25 @@ impl CoreDispatcher {
                         ]),
                     ));
                 }
-                if let Some(redirection) = segment::file_redirection(command) {
+                if let Some(redirection) = analysis
+                    .as_ref()
+                    .ok()
+                    .and_then(|analysis| analysis.file_redirection.as_deref())
+                {
                     return Err(HandlerError::with_details(
                         "command_not_allowed",
                         format!("strict exec refuses file redirection {redirection:?}"),
                         Map::from_iter([
                             ("command".into(), Value::String(command.into())),
-                            ("redirection".into(), Value::String(redirection)),
+                            ("redirection".into(), Value::String(redirection.into())),
                         ]),
                     ));
                 }
-                self.validate_allowed_segments(command, ExecMode::Strict)?;
+                self.validate_allowed_segments(command, ExecMode::Strict, &analysis)?;
             }
-            ExecMode::Allowlist => self.validate_allowed_segments(command, ExecMode::Allowlist)?,
+            ExecMode::Allowlist => {
+                self.validate_allowed_segments(command, ExecMode::Allowlist, &analysis)?
+            }
         }
 
         Ok(())
@@ -1067,22 +1112,6 @@ impl CoreDispatcher {
             self.policy.exec_timeout_max
         };
         let timeout_secs = timeout_secs.min(ceiling.to_f64().unwrap_or(f64::MAX));
-
-        if let Some(kind) = self.policy.tooling.direct_python_violation(command) {
-            let replacement = if kind == "pip" {
-                "uv pip … (or uv sync / uv tool install)"
-            } else {
-                "uv run --no-project python …"
-            };
-            return Err(HandlerError::with_details(
-                "use_uv",
-                format!("direct {kind} invocation is disabled; use {replacement}"),
-                Map::from_iter([
-                    ("command".into(), Value::String(command.into())),
-                    ("replacement".into(), Value::String(replacement.into())),
-                ]),
-            ));
-        }
 
         self.validate_exec_policy(command)?;
 

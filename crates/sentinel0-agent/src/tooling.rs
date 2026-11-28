@@ -131,43 +131,53 @@ impl Tooling {
         })
     }
 
-    #[must_use = "the result identifies a direct Python invocation policy violation"]
-    pub fn direct_python_violation(&self, command: &str) -> Option<&'static str> {
+    pub(crate) fn shell_python_violation(
+        &self,
+        command: &str,
+        analysis: Option<&crate::segment::Analysis>,
+    ) -> Option<&'static str> {
         if !self.forbid_direct_python {
             return None;
         }
-        for segment in crate::segment::split_top_level(command) {
-            let Some(argv) = shlex::split(&segment) else {
-                continue;
-            };
-            let Some(program) = effective_program(&argv) else {
-                continue;
-            };
-            let name = Path::new(program)
-                .file_name()
-                .and_then(OsStr::to_str)
-                .unwrap_or(program);
-            if matches!(name, "pip" | "pip3") {
-                return Some("pip");
-            }
-            if matches!(name, "python" | "python3") {
-                return Some("python");
-            }
+        if let Some(analysis) = analysis {
+            return analysis
+                .invocations()
+                .find_map(|(program, arguments)| self.python_violation(program, arguments));
         }
-        None
+        // Unrestricted mode may accept constructs outside the checked shell grammar.
+        // Preserve the best-effort literal invocation check for that case.
+        let argv = shlex::split(command)?;
+        let start = argv
+            .iter()
+            .position(|part| !part.contains('=') || part.starts_with('-'))?;
+        self.argv_python_violation(&argv[start..])
+    }
+
+    pub(crate) fn argv_python_violation(&self, argv: &[String]) -> Option<&'static str> {
+        let (program, arguments) = argv.split_first()?;
+        self.python_violation(program, arguments)
+    }
+
+    fn python_violation(&self, program: &str, arguments: &[String]) -> Option<&'static str> {
+        if !self.forbid_direct_python {
+            return None;
+        }
+        let program = effective_program(program, arguments)?;
+        let name = Path::new(program)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or(program);
+        match name {
+            "pip" | "pip3" => Some("pip"),
+            "python" | "python3" => Some("python"),
+            _ => None,
+        }
     }
 }
 
-fn effective_program(argv: &[String]) -> Option<&str> {
+fn effective_program<'a>(program: &'a str, argv: &'a [String]) -> Option<&'a str> {
     let mut index = 0;
-    while argv
-        .get(index)
-        .is_some_and(|part| part.contains('=') && !part.starts_with('-'))
-    {
-        index += 1;
-    }
-    if argv.get(index).map(String::as_str) == Some("sudo") {
-        index += 1;
+    if program == "sudo" {
         while let Some(part) = argv.get(index) {
             if part == "--" {
                 index += 1;
@@ -205,8 +215,10 @@ fn effective_program(argv: &[String]) -> Option<&str> {
             }
             index += 1;
         }
+        argv.get(index).map(String::as_str)
+    } else {
+        Some(program)
     }
-    argv.get(index).map(String::as_str)
 }
 
 #[cfg(unix)]
@@ -228,27 +240,22 @@ mod tests {
     #[test]
     fn direct_python_policy_catches_plain_and_sudo_invocations() {
         let tooling = Tooling::default();
+        let violation = |command: &str| {
+            let analysis = crate::segment::analyze(command);
+            tooling.shell_python_violation(command, analysis.as_ref().ok())
+        };
+        assert_eq!(violation("python3 x.py"), Some("python"));
+        assert_eq!(violation("sudo -n pip install x"), Some("pip"));
+        assert_eq!(violation("sudo -n -u nobody python3 x.py"), Some("python"));
+        assert_eq!(violation("uv run python x.py"), None);
+        assert_eq!(violation("echo python3"), None);
+        assert_eq!(violation("FOO=bar python3 x.py"), Some("python"));
+        assert_eq!(violation("> /tmp/out python3 x.py"), Some("python"));
         assert_eq!(
-            tooling.direct_python_violation("python3 x.py"),
-            Some("python")
+            tooling.argv_python_violation(&["echo".into(), "$(python3 x.py)".into()]),
+            None
         );
-        assert_eq!(
-            tooling.direct_python_violation("sudo -n pip install x"),
-            Some("pip")
-        );
-        assert_eq!(
-            tooling.direct_python_violation("sudo -n -u nobody python3 x.py"),
-            Some("python")
-        );
-        assert_eq!(tooling.direct_python_violation("uv run python x.py"), None);
-        assert_eq!(tooling.direct_python_violation("echo python3"), None);
-        assert_eq!(
-            tooling.direct_python_violation("echo \"$(python3 x.py)\""),
-            Some("python")
-        );
-        assert_eq!(
-            tooling.direct_python_violation("if true; then pip install x; fi"),
-            Some("pip")
-        );
+        assert_eq!(violation("echo \"$(python3 x.py)\""), Some("python"));
+        assert_eq!(violation("if true; then pip install x; fi"), Some("pip"));
     }
 }
