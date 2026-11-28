@@ -2245,7 +2245,7 @@ dependencies = [
 [[package]]
 name = "wreq"
 version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=9aea51315eb7e0a05dc66ac3d4a0a113f7c16213#9aea51315eb7e0a05dc66ac3d4a0a113f7c16213"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=032201ede57f9ff30455e2b4351f6cefb96d9bbd#032201ede57f9ff30455e2b4351f6cefb96d9bbd"
 dependencies = [
  "base64",
  "btls",
