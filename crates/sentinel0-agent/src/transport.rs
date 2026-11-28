@@ -65,7 +65,7 @@ mod tests {
         let key = PKey::from_ec_key(EcKey::generate(&group)?)?;
         let mut name = X509NameBuilder::new()?;
         name.append_entry_by_nid(Nid::COMMONNAME, "localhost")?;
-        let name = name.build();
+        let name = name.build()?;
         let mut cert = X509::builder()?;
         cert.set_version(2)?;
         let serial = BigNum::from_u32(1)?.to_asn1_integer()?;
