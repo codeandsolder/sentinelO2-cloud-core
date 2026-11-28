@@ -75,7 +75,7 @@ pub fn from_system_time(value: std::time::SystemTime) -> Option<UtcDateTime> {
 }
 
 pub(crate) mod wire {
-    use super::*;
+    use super::{Rfc3339, UtcDateTime, UtcSuffix, timestamp};
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
     fn wire_timestamp<E: serde::ser::Error>(value: UtcDateTime) -> Result<String, E> {
@@ -96,7 +96,13 @@ pub(crate) mod wire {
     }
 
     pub mod option {
-        use super::*;
+        use super::{Deserialize, Deserializer, Rfc3339, Serializer, UtcDateTime, wire_timestamp};
+        use serde::de::Error as _;
+
+        #[expect(
+            clippy::ref_option,
+            reason = "Serde with requires a reference to the declared Option field"
+        )]
         pub fn serialize<S: Serializer>(
             value: &Option<UtcDateTime>,
             serializer: S,
