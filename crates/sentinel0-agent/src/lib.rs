@@ -86,15 +86,14 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-use chrono::Utc;
 use futures_util::{FutureExt, StreamExt};
 use http::HeaderValue;
-use num_traits::ToPrimitive;
 use rand::RngExt;
 use sentinel0_proto::{HostInfo, Message, Op, PreferredProfile, bounding::bound_response_default};
 use std::{
     collections::BTreeMap, panic::AssertUnwindSafe, path::PathBuf, sync::Arc, time::Duration,
 };
+use time::UtcDateTime;
 use tokio::{
     sync::{Notify, mpsc},
     task::JoinSet,
@@ -116,7 +115,7 @@ fn add_response_time(message: &mut Message) {
     {
         result.insert(
             "response_time".into(),
-            serde_json::Value::String(Utc::now().format("%H:%M:%S").to_string()),
+            serde_json::Value::String(sentinel0_proto::clock::clock_time(UtcDateTime::now())),
         );
     }
 }
@@ -665,7 +664,8 @@ impl<D: Dispatcher> Agent<D> {
         }
 
         let dispatcher = Arc::clone(&self.dispatcher);
-        let started_at = Utc::now();
+        let started_at = UtcDateTime::now();
+        let started = Instant::now();
         let host_id = self.config.host.id.clone();
         let upload_base = self.config.upload_base.clone();
         let pending_ready = Arc::clone(&self.pending_ready);
@@ -711,19 +711,18 @@ impl<D: Dispatcher> Agent<D> {
                     "failed to encode background completion for bounding"
                 ),
             }
-            let finished_at = Utc::now();
+            let finished_at = UtcDateTime::now();
             let data = jobs::build_completed_event_data(
                 &job_id,
                 op.as_str(),
                 &host_id,
                 &response,
-                started_at,
-                finished_at,
+                jobs::JobTiming { started_at, finished_at, elapsed: started.elapsed() },
             );
             let event = Message::Event {
                 kind: "job_completed".into(),
                 data,
-                timestamp: Utc::now(),
+                timestamp: UtcDateTime::now(),
             };
             let pending_path = match serde_json::to_value(&event) {
                 Ok(value) => record_pending(upload_base, job_id.clone(), value).await,
@@ -842,7 +841,7 @@ impl<D: Dispatcher> Agent<D> {
             let event = Message::Event {
                 kind: "transfer_chunk_ack".into(),
                 data,
-                timestamp: Utc::now(),
+                timestamp: UtcDateTime::now(),
             };
             return Ok(ws
                 .send(WsMessage::Text(serde_json::to_string(&event)?.into()))
@@ -896,7 +895,7 @@ impl<D: Dispatcher> Agent<D> {
                     message: Message::Event {
                         kind: "transfer_chunk_ack".into(),
                         data,
-                        timestamp: Utc::now(),
+                        timestamp: UtcDateTime::now(),
                     },
                     binary_frame: None,
                 })
@@ -930,7 +929,7 @@ impl<D: Dispatcher> Agent<D> {
         match msg {
             Message::Ping { .. } => {
                 let pong = Message::Pong {
-                    timestamp: Utc::now(),
+                    timestamp: UtcDateTime::now(),
                 };
                 if ws
                     .send(WsMessage::Text(serde_json::to_string(&pong)?.into()))
@@ -1006,7 +1005,7 @@ impl<D: Dispatcher> Agent<D> {
                     if !self.replay_pending_results(ws).await? {
                         return Ok(SessionEnd::Lost(None));
                     }
-                    let ping = Message::Ping { timestamp: Utc::now() };
+                    let ping = Message::Ping { timestamp: UtcDateTime::now() };
                     if ws.send(WsMessage::Text(serde_json::to_string(&ping)?.into())).await.is_err() {
                         return Ok(SessionEnd::Lost(None));
                     }
@@ -1172,7 +1171,7 @@ fn decode_transfer_id_hex(value: &str) -> Result<[u8; 16], String> {
 }
 
 fn unix_time_seconds() -> f64 {
-    Utc::now().timestamp_micros().to_f64().unwrap_or(f64::MAX) / 1_000_000.0
+    sentinel0_proto::clock::unix_seconds(UtcDateTime::now())
 }
 
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);

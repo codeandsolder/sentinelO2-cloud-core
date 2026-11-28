@@ -1,5 +1,4 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -9,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
+use time::UtcDateTime;
 
 pub const MAX_LINES: usize = 5000;
 const TRIM_TRIGGER: usize = 5500;
@@ -289,7 +289,7 @@ impl AuditLog {
         let path = self.path();
         let attempt = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut entry = json!({
-                "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "timestamp": sentinel0_proto::clock::timestamp(UtcDateTime::now(), sentinel0_proto::clock::UtcSuffix::Z, false),
                 "op": op,
                 "payload": payload,
                 "ok": dispatch_ok,

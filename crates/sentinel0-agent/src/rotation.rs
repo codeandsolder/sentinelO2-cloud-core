@@ -11,7 +11,6 @@ use base64::{
 };
 #[cfg(unix)]
 use nix::unistd::{AccessFlags, access};
-use num_traits::ToPrimitive;
 use serde::Serialize;
 use serde_json::Value;
 #[cfg(unix)]
@@ -21,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use time::UtcDateTime;
 
 const ROTATED_NAME: &str = "identity.rotated.json";
 #[cfg(unix)]
@@ -91,11 +91,7 @@ fn numeric_claim(claims: &Value, name: &str) -> Option<f64> {
 }
 
 fn now_seconds() -> f64 {
-    chrono::Utc::now()
-        .timestamp_millis()
-        .to_f64()
-        .unwrap_or(f64::MAX)
-        / 1000.0
+    sentinel0_proto::clock::unix_seconds(UtcDateTime::now())
 }
 
 #[must_use = "the result determines whether credential rotation is currently due"]
@@ -265,7 +261,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn token(exp_offset: i64, iat_offset: Option<i64>) -> TestResult<String> {
-        let now = chrono::Utc::now().timestamp();
+        let now = UtcDateTime::now().unix_timestamp();
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
         let mut claims = serde_json::json!({"exp": now + exp_offset});
         if let Some(iat_offset) = iat_offset {

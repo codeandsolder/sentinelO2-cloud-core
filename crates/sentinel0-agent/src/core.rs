@@ -6,8 +6,6 @@ use crate::{
     segment, shell,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::Utc;
-use num_traits::ToPrimitive;
 use sentinel0_proto::{Message, Op};
 use serde_json::{Map, Value, json};
 use std::{
@@ -17,6 +15,7 @@ use std::{
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
+use time::UtcDateTime;
 
 const MAX_CONCURRENT_SCANS: usize = 4;
 static SCAN_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
@@ -253,7 +252,14 @@ impl CoreDispatcher {
                     std::env::consts::ARCH
                 )),
             ),
-            ("now_utc".into(), Value::String(Utc::now().to_rfc3339())),
+            (
+                "now_utc".into(),
+                Value::String(sentinel0_proto::clock::timestamp(
+                    UtcDateTime::now(),
+                    sentinel0_proto::clock::UtcSuffix::Colon,
+                    true,
+                )),
+            ),
             (
                 "uptime_seconds".into(),
                 host::uptime_seconds().map_or(Value::Null, Value::from),
@@ -1048,12 +1054,7 @@ impl CoreDispatcher {
         let timeout_secs = payload
             .get("timeout")
             .and_then(Value::as_f64)
-            .unwrap_or_else(|| {
-                self.policy
-                    .exec_timeout_default
-                    .to_f64()
-                    .unwrap_or(f64::MAX)
-            })
+            .unwrap_or_else(|| Duration::from_secs(self.policy.exec_timeout_default).as_secs_f64())
             .max(0.001);
         let ceiling = if payload
             .get("background")
@@ -1066,7 +1067,7 @@ impl CoreDispatcher {
         } else {
             self.policy.exec_timeout_max
         };
-        let timeout_secs = timeout_secs.min(ceiling.to_f64().unwrap_or(f64::MAX));
+        let timeout_secs = timeout_secs.min(Duration::from_secs(ceiling).as_secs_f64());
 
         if let Some(kind) = self.policy.tooling.direct_python_violation(command) {
             let replacement = if kind == "pip" {
