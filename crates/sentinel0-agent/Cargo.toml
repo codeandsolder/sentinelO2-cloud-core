@@ -18,7 +18,6 @@ http.workspace = true
 grep-matcher.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
-ignore.workspace = true
 memchr.workspace = true
 num-traits.workspace = true
 rand.workspace = true
@@ -51,7 +50,6 @@ nix.workspace = true
 openssh.workspace = true
 
 [dev-dependencies]
-proptest.workspace = true
 tokio.workspace = true
 
 
