@@ -50,8 +50,8 @@ openssh.workspace = true
 
 [dev-dependencies]
 # Loopback TLS server for the agent handshake regression tests.
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "f6ae02c80ae54dfd3e59d7d440e616f523449cac" }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "f6ae02c80ae54dfd3e59d7d440e616f523449cac" }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "c3ef478182838744566c73568aff19ca59accf15" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "c3ef478182838744566c73568aff19ca59accf15" }
 tokio-tungstenite.workspace = true
 
 
