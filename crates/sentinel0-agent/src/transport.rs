@@ -45,7 +45,11 @@ mod tests {
         test_handshake::AssertHeaders,
         test_support::{TestResult, TestValue as _},
     };
-    use btls::{
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use std::{net::SocketAddr, pin::Pin, time::Duration};
+    use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+    use tokio_tungstenite::tungstenite::handshake::server::Request;
+    use wreq::tls::backend::btls::{
         asn1::Asn1Time,
         bn::BigNum,
         ec::{EcGroup, EcKey},
@@ -55,10 +59,6 @@ mod tests {
         ssl::{Ssl, SslAcceptor, SslMethod},
         x509::{X509, X509NameBuilder, extension::SubjectAlternativeName},
     };
-    use futures_util::{SinkExt as _, StreamExt as _};
-    use std::{net::SocketAddr, pin::Pin, time::Duration};
-    use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
-    use tokio_tungstenite::tungstenite::handshake::server::Request;
     use wreq::tls::trust::CertStore;
 
     const TLS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -104,7 +104,7 @@ mod tests {
         let ssl = Ssl::new(acceptor.context())?;
         let task = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await?;
-            let mut stream = tokio_btls::SslStream::new(ssl, tcp)?;
+            let mut stream = wreq::tls::backend::tokio_btls::SslStream::new(ssl, tcp)?;
             Pin::new(&mut stream).accept().await.test_value()?;
             let mut ws = tokio_tungstenite::accept_hdr_async(
                 stream,

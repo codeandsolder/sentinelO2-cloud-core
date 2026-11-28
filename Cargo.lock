@@ -108,7 +108,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.119",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1459,7 +1459,6 @@ dependencies = [
  "atomic-write-file",
  "base64",
  "brush-parser",
- "btls",
  "clap",
  "flate2",
  "futures-util",
@@ -1487,7 +1486,6 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
- "tokio-btls",
  "tokio-tungstenite",
  "tokio-util",
  "toml",
@@ -2262,7 +2260,7 @@ dependencies = [
 [[package]]
 name = "wreq"
 version = "0.16.1"
-source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=032201ede57f9ff30455e2b4351f6cefb96d9bbd#032201ede57f9ff30455e2b4351f6cefb96d9bbd"
+source = "git+https://github.com/codeandsolder/wreq-exp.git?rev=26f75cb2911b935d3ec468ed28de47bef6d6d455#26f75cb2911b935d3ec468ed28de47bef6d6d455"
 dependencies = [
  "base64",
  "btls",
