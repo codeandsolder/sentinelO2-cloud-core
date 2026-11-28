@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   rust-release-queue:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-release-review.yml@5b073b2f545404d05f56ab674e9c4ace7295c525 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-release-review.yml@6beddaa012211f3fbdd57df1f37424b3001b7475 # main
 
   upstream-parity-queue:
     runs-on: ubuntu-26.04
@@ -28,11 +28,11 @@ jobs:
 
       - name: Resolve the native quarantined compiler
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@6beddaa012211f3fbdd57df1f37424b3001b7475 # main
       - name: Install pinned Rust
         run: rustup show active-toolchain
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@6beddaa012211f3fbdd57df1f37424b3001b7475 # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
 
@@ -128,4 +128,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@6beddaa012211f3fbdd57df1f37424b3001b7475 # main
