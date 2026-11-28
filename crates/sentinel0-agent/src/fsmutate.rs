@@ -3,7 +3,6 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
 };
-use chrono::Utc;
 use flate2::{Compression, write::GzEncoder};
 use rand::RngExt;
 use serde_json::{Map, Value};
@@ -12,6 +11,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
 };
+use time::UtcDateTime;
 
 #[cfg(unix)]
 fn resolve_rw(policy: &Policy, raw: &str, label: &str) -> Result<PathBuf, HandlerError> {
@@ -89,7 +89,7 @@ fn backup_file(path: &Path) -> Result<PathBuf, HandlerError> {
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("file"),
-        Utc::now().format("%Y%m%d-%H%M%S%.6f"),
+        sentinel0_proto::clock::backup_stamp(UtcDateTime::now()),
         rand::rng().random::<u64>()
     ));
     let result = (|| -> std::io::Result<()> {
@@ -121,7 +121,7 @@ fn backup_dir(path: &Path) -> Result<PathBuf, HandlerError> {
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("dir"),
-        Utc::now().format("%Y%m%d-%H%M%S%.6f"),
+        sentinel0_proto::clock::backup_stamp(UtcDateTime::now()),
         rand::rng().random::<u64>()
     ));
 

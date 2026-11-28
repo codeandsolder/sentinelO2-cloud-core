@@ -1,13 +1,10 @@
 use crate::MAX_ERROR_CODE_LENGTH;
-use num_traits::ToPrimitive;
 use serde_json::{Map, Value, json};
 
 pub const RESPONSE_SOFT_LIMIT_BYTES: usize = 131_072;
-pub const RESPONSE_HEAD_RATIO: f64 = 0.6;
 pub const TRUNCATION_KEY: &str = "_truncation";
 
 const META_RESERVE: usize = 512;
-const SHRINK_SLACK: f64 = 0.95;
 const MAX_PASSES: usize = 64;
 const MIN_TRUNCATABLE: usize = 256;
 
@@ -71,12 +68,12 @@ fn marker(omitted: usize) -> String {
     format!("\n…[sentinelx: truncated {omitted} bytes]…\n")
 }
 
-fn usize_to_f64(value: usize) -> f64 {
-    value.to_f64().unwrap_or(f64::MAX)
-}
-
-fn nonnegative_f64_to_usize(value: f64) -> usize {
-    value.to_usize().unwrap_or(usize::MAX)
+// floor(count * budget * 19 / (current * 20)), without overflowing usize.
+fn proportional_count(count: usize, budget: usize, current: usize) -> usize {
+    let product = (count as u128) * (budget as u128);
+    let denominator = (current as u128) * 20;
+    usize::try_from((product / denominator) * 19 + (product % denominator) * 19 / denominator)
+        .unwrap_or(usize::MAX)
 }
 
 fn truncate_text(text: &str, keep_bytes: usize) -> String {
@@ -86,7 +83,7 @@ fn truncate_text(text: &str, keep_bytes: usize) -> String {
         return text.to_owned();
     }
 
-    let head_budget = nonnegative_f64_to_usize(usize_to_f64(keep_bytes) * RESPONSE_HEAD_RATIO);
+    let head_budget = keep_bytes / 5 * 3 + keep_bytes % 5 * 3 / 5;
     let tail_budget = keep_bytes - head_budget;
     let head = decode_utf8_ignoring_invalid(&raw[..head_budget.min(original)]);
     let tail = if tail_budget > 0 {
@@ -267,11 +264,7 @@ fn shrink_fields(
             if n_items < 2 {
                 return false;
             }
-            let proportional = nonnegative_f64_to_usize(
-                usize_to_f64(n_items)
-                    * (usize_to_f64(budget) / usize_to_f64(current))
-                    * SHRINK_SLACK,
-            );
+            let proportional = proportional_count(n_items, budget, current);
             let keep = proportional.max(1).min(n_items - 1);
             let Some(target) = value_at_mut(root, &path) else {
                 return false;
@@ -288,9 +281,7 @@ fn shrink_fields(
         let Some((path, raw_len)) = string_ref else {
             return false;
         };
-        let proportional = nonnegative_f64_to_usize(
-            usize_to_f64(raw_len) * (usize_to_f64(budget) / usize_to_f64(current)) * SHRINK_SLACK,
-        );
+        let proportional = proportional_count(raw_len, budget, current);
         let keep = proportional
             .max(MIN_TRUNCATABLE)
             .min(raw_len.saturating_sub(1));
@@ -615,6 +606,16 @@ pub fn bound_response_default(response: &mut Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proportional_count_is_exact_even_near_usize_max() {
+        assert_eq!(proportional_count(100, 25, 100), 23);
+        assert_eq!(proportional_count(20, 1, 1), 19);
+        assert_eq!(
+            proportional_count(usize::MAX, usize::MAX, usize::MAX),
+            usize::MAX / 20 * 19 + usize::MAX % 20 * 19 / 20
+        );
+    }
 
     #[test]
     fn python_json_sizing_matches_known_spacing_and_ascii_escape_rules() {

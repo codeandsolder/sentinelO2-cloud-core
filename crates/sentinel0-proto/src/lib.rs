@@ -8,7 +8,8 @@
 
 pub mod bounding;
 
-use chrono::{DateTime, Utc};
+use time::UtcDateTime;
+pub mod clock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -195,7 +196,8 @@ pub enum Message {
     },
     Welcome {
         session_id: String,
-        server_time: DateTime<Utc>,
+        #[serde(with = "clock::wire")]
+        server_time: UtcDateTime,
         #[serde(default = "default_heartbeat")]
         heartbeat_interval_seconds: u64,
     },
@@ -205,7 +207,8 @@ pub enum Message {
         op: Op,
         #[serde(default)]
         payload: BTreeMap<String, Value>,
-        deadline: Option<DateTime<Utc>>,
+        #[serde(default, with = "clock::wire::option")]
+        deadline: Option<UtcDateTime>,
         #[serde(default, deserialize_with = "deserialize_opaque_ref")]
         opaque_ref: Option<String>,
     },
@@ -217,16 +220,19 @@ pub enum Message {
         error: Option<ResponseError>,
     },
     Ping {
-        timestamp: DateTime<Utc>,
+        #[serde(with = "clock::wire")]
+        timestamp: UtcDateTime,
     },
     Pong {
-        timestamp: DateTime<Utc>,
+        #[serde(with = "clock::wire")]
+        timestamp: UtcDateTime,
     },
     Event {
         kind: String,
         #[serde(default)]
         data: BTreeMap<String, Value>,
-        timestamp: DateTime<Utc>,
+        #[serde(with = "clock::wire")]
+        timestamp: UtcDateTime,
     },
     Error {
         #[serde(deserialize_with = "deserialize_error_code")]

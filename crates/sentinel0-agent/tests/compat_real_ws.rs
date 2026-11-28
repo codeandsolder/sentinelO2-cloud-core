@@ -1,6 +1,5 @@
 mod common;
 
-use chrono::{TimeZone, Utc};
 use common::{AssertHeaders, TestResult, TestValue as _};
 use futures_util::{SinkExt, StreamExt};
 use sentinel0_agent::{
@@ -15,6 +14,7 @@ use sentinel0_proto::{
 };
 use serde_json::{Map, Value, json};
 use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
+use time::UtcDateTime;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -94,7 +94,7 @@ async fn next_non_heartbeat(
             )
         {
             let pong = serde_json::to_string(&Message::Pong {
-                timestamp: Utc::now(),
+                timestamp: UtcDateTime::now(),
             })
             .test_value()?;
             ws.send(WsMessage::Text(pong.into())).await.test_value()?;
@@ -245,10 +245,11 @@ async fn malformed_and_unknown_frames_are_ignored_and_ping_gets_fresh_pong() -> 
         .await
         .test_value()?;
 
-        let stale = Utc
-            .with_ymd_and_hms(2000, 1, 1, 0, 0, 0)
-            .single()
-            .test_value()?;
+        let stale = UtcDateTime::parse(
+            "2000-01-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .test_value()?;
         ws.send(WsMessage::Text(
             serde_json::to_string(&Message::Ping { timestamp: stale })
                 .test_value()?
@@ -373,16 +374,31 @@ async fn official_request_shape_reaches_dispatcher_and_response_returns_on_wire(
         let finished_at = timing["finished_at"].as_f64().test_value()?;
         assert!(received_at <= finished_at);
         let response_at = result["response_time"].as_str().test_value()?;
-        chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").test_value()?;
+        time::Time::parse(
+            response_at,
+            &time::format_description::parse_borrowed::<3>("[hour]:[minute]:[second]")
+                .test_value()?,
+        )
+        .test_value()?;
 
         let second = state_request_roundtrip(&mut ws, "req_state_2", json!({}), None).await?;
         let response_time = second["response_time"].as_str().test_value()?;
-        chrono::NaiveTime::parse_from_str(response_time, "%H:%M:%S").test_value()?;
+        time::Time::parse(
+            response_time,
+            &time::format_description::parse_borrowed::<3>("[hour]:[minute]:[second]")
+                .test_value()?,
+        )
+        .test_value()?;
 
         tokio::time::sleep(Duration::from_millis(60)).await;
         let third = state_request_roundtrip(&mut ws, "req_state_3", json!({}), None).await?;
         let response_at = third["response_time"].as_str().test_value()?;
-        chrono::NaiveTime::parse_from_str(response_at, "%H:%M:%S").test_value()?;
+        time::Time::parse(
+            response_at,
+            &time::format_description::parse_borrowed::<3>("[hour]:[minute]:[second]")
+                .test_value()?,
+        )
+        .test_value()?;
 
         server_cancel.cancel();
         let _ = ws.close(None).await;
@@ -441,7 +457,7 @@ async fn slow_request_does_not_block_ping_handling() -> TestResult {
 
         ws.send(WsMessage::Text(
             serde_json::to_string(&Message::Ping {
-                timestamp: Utc::now(),
+                timestamp: UtcDateTime::now(),
             })
             .test_value()?
             .into(),
@@ -817,7 +833,7 @@ async fn application_pong_keeps_quiet_connection_alive_without_native_keepalive(
                 pings += 1;
                 ws.send(WsMessage::Text(
                     serde_json::to_string(&Message::Pong {
-                        timestamp: Utc::now(),
+                        timestamp: UtcDateTime::now(),
                     })
                     .test_value()?
                     .into(),
@@ -955,7 +971,7 @@ async fn dispatcher_panic_becomes_internal_error_without_killing_socket_loop() -
 
         ws.send(WsMessage::Text(
             serde_json::to_string(&Message::Ping {
-                timestamp: Utc::now(),
+                timestamp: UtcDateTime::now(),
             })
             .test_value()?
             .into(),

@@ -2,7 +2,6 @@ use crate::{
     handler_error::{HandlerError, HandlerResult, require_str},
     policy::Policy,
 };
-use chrono::{DateTime, Utc};
 use glob::Pattern;
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -40,8 +39,12 @@ const SKIP_EXTS: &[&str] = &[
 ];
 
 fn mtime(meta: &fs::Metadata) -> Option<String> {
-    let dt: DateTime<Utc> = DateTime::<Utc>::from(meta.modified().ok()?);
-    Some(dt.format("%Y-%m-%dT%H:%M:%S+0000").to_string())
+    let dt = sentinel0_proto::clock::from_system_time(meta.modified().ok()?)?;
+    Some(sentinel0_proto::clock::timestamp(
+        dt,
+        sentinel0_proto::clock::UtcSuffix::Compact,
+        false,
+    ))
 }
 
 fn kind(meta: &fs::Metadata) -> &'static str {
